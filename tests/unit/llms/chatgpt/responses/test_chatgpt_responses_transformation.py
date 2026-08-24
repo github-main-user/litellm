@@ -124,6 +124,27 @@ class TestChatGPTResponsesAPITransformation:
         assert headers["accept"] == "text/event-stream"
         assert headers["session_id"] == "session-123"
 
+    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
+    def test_validate_environment_uses_deployment_credentials(self, mock_authenticator_class):
+        mock_auth_instance = MagicMock()
+        mock_authenticator_class.return_value = mock_auth_instance
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(
+            api_key="deployment-access",
+            chatgpt_auth_account_id="deployment-account",
+        )
+
+        headers = config.validate_environment(
+            headers={},
+            model="gpt-5.4",
+            litellm_params=litellm_params,
+        )
+
+        assert headers["Authorization"] == "Bearer deployment-access"
+        assert headers["ChatGPT-Account-Id"] == "deployment-account"
+        mock_auth_instance.get_access_token.assert_not_called()
+        mock_auth_instance.get_account_id.assert_not_called()
+
     @pytest.mark.parametrize(
         "model_name",
         [

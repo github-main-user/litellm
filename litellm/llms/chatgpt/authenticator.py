@@ -1,27 +1,23 @@
-import base64
 import json
 import os
 import time
 from collections.abc import Mapping
 from typing import Final, TypeAlias
 
-import httpx
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
-from litellm.llms.custom_httpx.http_handler import _get_httpx_client
 
 from .common_utils import (
     CHATGPT_API_BASE,
-    CHATGPT_AUTH_BASE,
-    CHATGPT_CLIENT_ID,
-    CHATGPT_DEVICE_CODE_URL,
-    CHATGPT_DEVICE_TOKEN_URL,
     CHATGPT_DEVICE_VERIFY_URL,
-    CHATGPT_OAUTH_TOKEN_URL,
     GetAccessTokenError,
-    GetDeviceCodeError,
     RefreshAccessTokenError,
+)
+from .oauth_client import (
+    ChatGPTAuthorizationCode,
+    ChatGPTDeviceCode,
+    ChatGPTOAuthClient,
 )
 
 TOKEN_EXPIRY_SKEW_SECONDS: Final = 60
@@ -41,12 +37,13 @@ def _optional_str(value: JsonValue | None) -> str | None:
 
 
 class Authenticator:
-    def __init__(self) -> None:
+    def __init__(self, oauth_client: ChatGPTOAuthClient | None = None) -> None:
         self.token_dir = os.getenv(
             "CHATGPT_TOKEN_DIR",
             os.path.expanduser("~/.config/litellm/chatgpt"),
         )
         self.auth_file = os.path.join(self.token_dir, os.getenv("CHATGPT_AUTH_FILE", "auth.json"))
+        self.oauth_client = oauth_client or ChatGPTOAuthClient()
         self._ensure_token_dir()
 
     def get_api_base(self) -> str:
@@ -122,33 +119,18 @@ class Authenticator:
         return time.time() >= float(derived_expires_at) - TOKEN_EXPIRY_SKEW_SECONDS
 
     def _get_expires_at(self, token: str) -> int | None:
-        claims: Final = self._decode_jwt_claims(token)
-        exp: Final = claims.get("exp")
-        if isinstance(exp, (int, float)):
-            return int(exp)
-        return None
+        return self.oauth_client.get_expires_at(token)
 
     def _decode_jwt_claims(self, token: str) -> JsonObject:
         try:
-            parts: Final = token.split(".")
-            if len(parts) < 2:
-                return {}
-            payload_b64: Final = parts[1] + "=" * (-len(parts[1]) % 4)
-            payload_bytes: Final = base64.urlsafe_b64decode(payload_b64)
-            return _JSON_OBJECT_ADAPTER.validate_python(json.loads(payload_bytes.decode("utf-8")))
-        except Exception:
+            return _JSON_OBJECT_ADAPTER.validate_python(
+                self.oauth_client.decode_jwt_claims(token)
+            )
+        except ValidationError:
             return {}
 
     def _extract_account_id(self, token: str | None) -> str | None:
-        if not token:
-            return None
-        claims: Final = self._decode_jwt_claims(token)
-        auth_claims: Final = claims.get(OPENAI_AUTH_CLAIM_KEY)
-        if isinstance(auth_claims, dict):
-            account_id: Final = auth_claims.get("chatgpt_account_id")
-            if isinstance(account_id, str) and account_id:
-                return account_id
-        return None
+        return self.oauth_client.extract_account_id(token)
 
     def _login_device_code(self) -> dict[str, str]:
         cooldown_remaining: Final = self._get_device_code_cooldown_remaining(self._read_auth_file())
@@ -157,12 +139,12 @@ class Authenticator:
             if token:
                 return {"access_token": token}
 
-        device_code: Final = self._request_device_code()
+        device_code: Final = self.oauth_client.request_device_code()
         self._record_device_code_request()
         print(  # noqa: T201
             "Sign in with ChatGPT using device code:\n"
             f"1) Visit {CHATGPT_DEVICE_VERIFY_URL}\n"
-            f"2) Enter code: {device_code['user_code']}\n"
+            f"2) Enter code: {device_code.user_code}\n"
             "Device codes are a common phishing target. Never share this code.",
             flush=True,
         )
@@ -173,82 +155,35 @@ class Authenticator:
         return tokens
 
     def _request_device_code(self) -> dict[str, str]:
-        try:
-            client: Final = _get_httpx_client()
-            resp: Final = client.post(
-                CHATGPT_DEVICE_CODE_URL,
-                json={"client_id": CHATGPT_CLIENT_ID},
-            )
-            resp.raise_for_status()
-            data: Final = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
-        except httpx.HTTPStatusError as exc:
-            raise GetDeviceCodeError(
-                message=f"Failed to request device code: {exc}",
-                status_code=exc.response.status_code,
-            )
-        except Exception as exc:
-            raise GetDeviceCodeError(
-                message=f"Failed to request device code: {exc}",
-                status_code=400,
-            )
-
-        device_auth_id: Final = _optional_str(data.get("device_auth_id"))
-        user_code: Final = _optional_str(data.get("user_code") or data.get("usercode"))
-        interval: Final = data.get("interval")
-        if not device_auth_id or not user_code:
-            raise GetDeviceCodeError(
-                message=f"Device code response missing fields: {data}",
-                status_code=400,
-            )
+        device_code: Final = self.oauth_client.request_device_code()
         return {
-            "device_auth_id": device_auth_id,
-            "user_code": user_code,
-            "interval": str(interval or "5"),
+            "device_auth_id": device_code.device_auth_id,
+            "user_code": device_code.user_code,
+            "interval": str(device_code.interval_seconds),
         }
 
-    def _poll_for_authorization_code(self, device_code: dict[str, str]) -> dict[str, str]:
-        client: Final = _get_httpx_client()
-        interval: Final = int(device_code.get("interval", "5"))
+    def _poll_for_authorization_code(
+        self,
+        device_code: ChatGPTDeviceCode | dict[str, str],
+    ) -> dict[str, str]:
+        typed_device_code: Final = (
+            device_code
+            if isinstance(device_code, ChatGPTDeviceCode)
+            else ChatGPTDeviceCode(
+                device_auth_id=device_code["device_auth_id"],
+                user_code=device_code["user_code"],
+                interval_seconds=int(device_code.get("interval", "5")),
+            )
+        )
         start_time: Final = time.time()
         while time.time() - start_time < DEVICE_CODE_TIMEOUT_SECONDS:
-            try:
-                resp = client.post(
-                    CHATGPT_DEVICE_TOKEN_URL,
-                    json={
-                        "device_auth_id": device_code["device_auth_id"],
-                        "user_code": device_code["user_code"],
-                    },
-                )
-                if resp.status_code == 200:
-                    data = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
-                    authorization_code = _optional_str(data.get("authorization_code"))
-                    code_challenge = _optional_str(data.get("code_challenge"))
-                    code_verifier = _optional_str(data.get("code_verifier"))
-                    if authorization_code and code_challenge and code_verifier:
-                        return {
-                            "authorization_code": authorization_code,
-                            "code_challenge": code_challenge,
-                            "code_verifier": code_verifier,
-                        }
-                if resp.status_code in (403, 404):
-                    time.sleep(max(interval, DEVICE_CODE_POLL_SLEEP_SECONDS))
-                    continue
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                status_code = exc.response.status_code if exc.response else None
-                if status_code in (403, 404):
-                    time.sleep(max(interval, DEVICE_CODE_POLL_SLEEP_SECONDS))
-                    continue
-                raise GetAccessTokenError(
-                    message=f"Polling failed: {exc}",
-                    status_code=exc.response.status_code,
-                )
-            except Exception as exc:
-                raise GetAccessTokenError(
-                    message=f"Polling failed: {exc}",
-                    status_code=400,
-                )
-            time.sleep(max(interval, DEVICE_CODE_POLL_SLEEP_SECONDS))
+            authorization: Final = self.oauth_client.poll_authorization(typed_device_code)
+            if authorization is not None:
+                return {
+                    "authorization_code": authorization.authorization_code,
+                    "code_verifier": authorization.code_verifier,
+                }
+            time.sleep(max(typed_device_code.interval_seconds, DEVICE_CODE_POLL_SLEEP_SECONDS))
 
         raise GetAccessTokenError(
             message="Timed out waiting for device authorization",
@@ -256,85 +191,24 @@ class Authenticator:
         )
 
     def _exchange_code_for_tokens(self, code_data: dict[str, str]) -> dict[str, str]:
-        try:
-            client: Final = _get_httpx_client()
-            redirect_uri: Final = f"{CHATGPT_AUTH_BASE}/deviceauth/callback"
-            body: Final = (
-                "grant_type=authorization_code"
-                f"&code={code_data['authorization_code']}"
-                f"&redirect_uri={redirect_uri}"
-                f"&client_id={CHATGPT_CLIENT_ID}"
-                f"&code_verifier={code_data['code_verifier']}"
+        tokens: Final = self.oauth_client.exchange_code(
+            ChatGPTAuthorizationCode(
+                authorization_code=code_data["authorization_code"],
+                code_verifier=code_data["code_verifier"],
             )
-            resp: Final = client.post(
-                CHATGPT_OAUTH_TOKEN_URL,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                content=body,
-            )
-            resp.raise_for_status()
-            data: Final = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
-        except httpx.HTTPStatusError as exc:
-            raise GetAccessTokenError(
-                message=f"Token exchange failed: {exc}",
-                status_code=exc.response.status_code,
-            )
-        except Exception as exc:
-            raise GetAccessTokenError(
-                message=f"Token exchange failed: {exc}",
-                status_code=400,
-            )
-
-        access_token: Final = _optional_str(data.get("access_token"))
-        refresh_token: Final = _optional_str(data.get("refresh_token"))
-        id_token: Final = _optional_str(data.get("id_token"))
-        if not access_token or not refresh_token or not id_token:
-            raise GetAccessTokenError(
-                message=f"Token exchange response missing fields: {data}",
-                status_code=400,
-            )
+        )
         return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "id_token": id_token,
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "id_token": tokens.id_token,
         }
 
     def _refresh_tokens(self, refresh_token: str) -> dict[str, str]:
-        try:
-            client: Final = _get_httpx_client()
-            resp: Final = client.post(
-                CHATGPT_OAUTH_TOKEN_URL,
-                json={
-                    "client_id": CHATGPT_CLIENT_ID,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "scope": "openid profile email",
-                },
-            )
-            resp.raise_for_status()
-            data: Final = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
-        except httpx.HTTPStatusError as exc:
-            raise RefreshAccessTokenError(
-                message=f"Refresh token failed: {exc}",
-                status_code=exc.response.status_code,
-            )
-        except Exception as exc:
-            raise RefreshAccessTokenError(
-                message=f"Refresh token failed: {exc}",
-                status_code=400,
-            )
-
-        access_token: Final = _optional_str(data.get("access_token"))
-        id_token: Final = _optional_str(data.get("id_token"))
-        if not access_token or not id_token:
-            raise RefreshAccessTokenError(
-                message=f"Refresh response missing fields: {data}",
-                status_code=400,
-            )
-
+        tokens: Final = self.oauth_client.refresh(refresh_token)
         refreshed: Final = {
-            "access_token": access_token,
-            "refresh_token": _optional_str(data.get("refresh_token")) or refresh_token,
-            "id_token": id_token,
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "id_token": tokens.id_token,
         }
         auth_data: Final = self._build_auth_record(refreshed)
         self._write_auth_file(auth_data)

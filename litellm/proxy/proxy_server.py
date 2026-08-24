@@ -472,6 +472,8 @@ from litellm.proxy.config_resolvers.settings_rules import (
     JsonValue as SettingsJsonValue,
 )
 from litellm.proxy.container_endpoints.endpoints import router as container_router
+from litellm.proxy.credential_endpoints.chatgpt_oauth import register_chatgpt_oauth_credential_hook
+from litellm.proxy.credential_endpoints.chatgpt_oauth import router as chatgpt_oauth_credential_router
 from litellm.proxy.credential_endpoints.endpoints import router as credential_router
 from litellm.proxy.db.create_views import SupportsRawQueries
 from litellm.proxy.db.db_transaction_queue.pod_lock_manager import PodLockManager
@@ -8604,6 +8606,7 @@ class ProxyConfig:
             credentials = [self.decrypt_credentials(cred) for cred in credentials]
             await self.delete_credentials(credentials)  # delete credentials that are not in the all-up list
             CredentialAccessor.upsert_credentials(credentials)  # upsert credentials that are in the all-up list
+            register_chatgpt_oauth_credential_hook()
         except Exception as e:
             verbose_proxy_logger.exception(
                 "litellm.proxy_server.py::get_credentials() - Error getting credentials from DB - %s", e
@@ -19202,6 +19205,7 @@ app.include_router(image_router)
 app.include_router(fine_tuning_router)
 app.include_router(credential_router)
 app.include_router(openai_passthrough_router)
+app.include_router(chatgpt_oauth_credential_router)
 app.include_router(batches_router)
 app.include_router(openai_files_router)
 reserve_lazy_slot(app, "llm_passthrough")

@@ -47,19 +47,30 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         model: str,
         litellm_params: GenericLiteLLMParams | None,
     ) -> dict:
-        try:
-            access_token: Final = self.authenticator.get_access_token()
-        except GetAccessTokenError as e:
-            raise AuthenticationError(
-                model=model,
-                llm_provider="chatgpt",
-                message=str(e),
-            )
+        access_token: Final = (
+            litellm_params.api_key
+            if litellm_params is not None and litellm_params.api_key
+            else self._get_legacy_access_token(model)
+        )
 
-        account_id: Final = self.authenticator.get_account_id()
+        account_id: Final = (
+            litellm_params.get("chatgpt_auth_account_id")
+            if litellm_params is not None and litellm_params.api_key
+            else self.authenticator.get_account_id()
+        )
         session_id: Final = ensure_chatgpt_session_id(litellm_params)
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
         return {**default_headers, **headers}
+
+    def _get_legacy_access_token(self, model: str) -> str:
+        try:
+            return self.authenticator.get_access_token()
+        except GetAccessTokenError as error:
+            raise AuthenticationError(
+                model=model,
+                llm_provider="chatgpt",
+                message=str(error),
+            ) from error
 
     def transform_responses_api_request(
         self,

@@ -688,7 +688,7 @@ def load_credentials_from_list(kwargs: dict):
         )
         return
     for key, value in credential.credential_values.items():
-        if key not in kwargs:
+        if not key.startswith("litellm_internal_") and key not in kwargs:
             kwargs[key] = value
 
 
