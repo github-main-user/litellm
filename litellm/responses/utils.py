@@ -536,7 +536,8 @@ class ResponsesAPIRequestUtils:
         if not isinstance(request_input, list):
             return request_input
 
-        for item in request_input:
+        restored_input: Final = [item.copy() if isinstance(item, dict) else item for item in request_input]
+        for item in restored_input:
             if isinstance(item, dict):
                 item_id = item.get("id")
                 if item_id and isinstance(item_id, str):
@@ -553,7 +554,7 @@ class ResponsesAPIRequestUtils:
                     if unwrapped != encrypted_content:
                         item["encrypted_content"] = unwrapped
 
-        return request_input
+        return restored_input
 
     @staticmethod
     def strip_encrypted_reasoning_from_input(request_input: object) -> None:

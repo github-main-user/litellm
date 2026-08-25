@@ -5269,6 +5269,7 @@ class Router:
             if model is not None:
                 self.fail_calls[model] += 1
             if deployment is not None:
+                self._set_deployment_num_retries_on_exception(e, deployment)
                 self._stamp_failed_deployment_id_with_effective_model_info(e, deployment, kwargs)
             raise e
 

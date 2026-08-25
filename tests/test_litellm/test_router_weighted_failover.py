@@ -282,6 +282,37 @@ def test_completion_stamps_dynamic_id_for_clientside_credentials():
 
 
 @pytest.mark.asyncio
+async def test_responses_failure_records_failed_deployment_id():
+    deployment = _make_dep("dep-a")
+    router = Router(model_list=[deployment])
+    error = Exception("response failed")
+    request = AsyncMock(side_effect=error)
+
+    with (
+        patch.object(
+            router,
+            "async_get_available_deployment",
+            AsyncMock(return_value=deployment),
+        ),
+        patch.object(
+            router,
+            "async_routing_strategy_pre_call_checks",
+            AsyncMock(),
+        ),
+        pytest.raises(Exception) as exc_info,
+    ):
+        await router._ageneric_api_call_with_fallbacks_helper(
+            model="test-model",
+            original_generic_function=request,
+            input="hello",
+            litellm_metadata={},
+        )
+
+    assert exc_info.value is error
+    assert error.failed_deployment_id == "dep-a"
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_weighted_failover_returns_none_without_failed_id():
     router = Router(
         model_list=[

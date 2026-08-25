@@ -217,6 +217,9 @@ class TestRestoreEncryptedContentItemIds:
         restored = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input(request_input)
         assert restored[0]["id"] == "msg_abc123"
         assert restored[1]["id"] == original_id
+        assert request_input[1]["id"] == encoded_id
+        assert restored is not request_input
+        assert restored[1] is not request_input[1]
 
     def test_unwraps_encrypted_content(self):
         """Test that wrapped encrypted_content is unwrapped before forwarding."""
@@ -229,6 +232,7 @@ class TestRestoreEncryptedContentItemIds:
         ]
         restored = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input(request_input)
         assert restored[0]["encrypted_content"] == original_content
+        assert request_input[0]["encrypted_content"] == wrapped_content
 
     def test_no_op_for_plain_string_input(self):
         result = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input("Hello world")
