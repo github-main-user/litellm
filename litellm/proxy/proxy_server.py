@@ -8601,12 +8601,12 @@ class ProxyConfig:
             litellm.credential_list.pop(idx)
 
     async def get_credentials(self, prisma_client: PrismaClient):
+        register_chatgpt_oauth_credential_hook()
         try:
             credentials = await CredentialsRepository(WriterPinnedClient(prisma_client.db)).find_all()
             credentials = [self.decrypt_credentials(cred) for cred in credentials]
             await self.delete_credentials(credentials)  # delete credentials that are not in the all-up list
             CredentialAccessor.upsert_credentials(credentials)  # upsert credentials that are in the all-up list
-            register_chatgpt_oauth_credential_hook()
         except Exception as e:
             verbose_proxy_logger.exception(
                 "litellm.proxy_server.py::get_credentials() - Error getting credentials from DB - %s", e
@@ -10219,6 +10219,17 @@ class ProxyStartupEvent:
             redis_cache=redis_usage_cache,
             user_api_key_cache=user_api_key_cache,
         )
+
+        scheduler.add_job(
+            proxy_config.get_credentials,
+            "interval",
+            seconds=config_reload_interval_seconds,
+            args=[prisma_client],
+            id="get_credentials_job",
+            replace_existing=True,
+            misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
+        )
+        await proxy_config.get_credentials(prisma_client=prisma_client)
 
         if store_model_in_db is True:
             # MEMORY LEAK FIX: Increase interval from 10s to 30s minimum

@@ -12,6 +12,7 @@ from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     CHATGPT_CREDENTIAL_VALUE_KEY,
     ChatGPTOAuthCredentialHook,
 )
+from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.utils import load_credentials_from_list
 
 
@@ -62,6 +63,64 @@ async def test_hook_resolves_each_deployment_subscription_independently() -> Non
     assert resolved_b is not None
     assert resolved_b["api_key"] == "access-b"
     assert resolved_b["chatgpt_auth_account_id"] == "account-b"
+
+
+@pytest.mark.asyncio
+async def test_hook_ignores_non_oauth_chatgpt_credential() -> None:
+    previous = litellm.credential_list
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="chatgpt-api-key",
+            credential_info={"provider": "chatgpt", "auth_type": "api_key"},
+            credential_values={"api_key": "regular-api-key"},
+        )
+    ]
+    try:
+        resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
+            {
+                "model": "chatgpt/gpt-5.4",
+                "litellm_credential_name": "chatgpt-api-key",
+            },
+            None,
+        )
+    finally:
+        litellm.credential_list = previous
+
+    assert resolved is None
+
+
+@pytest.mark.asyncio
+async def test_hook_loads_oauth_credential_from_database_on_cache_miss() -> None:
+    previous = litellm.credential_list
+    litellm.credential_list = []
+    stored = _credential("subscription-a", "account-a", "access-a")
+    prisma_client = MagicMock()
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", prisma_client),
+            patch.object(
+                CredentialsRepository,
+                "find_by_name",
+                AsyncMock(return_value=stored),
+            ),
+            patch(
+                "litellm.proxy.credential_endpoints.chatgpt_oauth.decrypt_value_helper",
+                side_effect=lambda value, key: value,
+            ),
+        ):
+            resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
+                {
+                    "model": "chatgpt/gpt-5.4",
+                    "litellm_credential_name": "subscription-a",
+                },
+                None,
+            )
+    finally:
+        litellm.credential_list = previous
+
+    assert resolved is not None
+    assert resolved["api_key"] == "access-a"
+    assert resolved["chatgpt_auth_account_id"] == "account-a"
 
 
 def test_internal_token_bundle_is_not_copied_into_request_kwargs() -> None:

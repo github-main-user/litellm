@@ -3852,6 +3852,7 @@ all_litellm_params = (
         "mock_timeout",
         "disable_add_transform_inline_image_block",
         "api_key",
+        "chatgpt_auth_account_id",
         "api_version",
         "prompt_id",
         "prompt_variables",

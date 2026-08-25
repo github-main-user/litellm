@@ -5517,6 +5517,7 @@ def completion(
         litellm_params = get_litellm_params(
             acompletion=acompletion,
             api_key=api_key,
+            chatgpt_auth_account_id=kwargs.get("chatgpt_auth_account_id"),
             force_timeout=force_timeout,
             logger_fn=logger_fn,
             verbose=verbose,

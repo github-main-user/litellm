@@ -930,6 +930,7 @@ async def test_periodic_reload_job_scheduled_without_store_model_in_db(monkeypat
             )
 
         assert scheduler.get_job("periodic_reload_job") is not None
+        assert scheduler.get_job("get_credentials_job") is not None
         assert scheduler.get_job("add_deployment_job") is None
     finally:
         scheduler.shutdown(wait=False)

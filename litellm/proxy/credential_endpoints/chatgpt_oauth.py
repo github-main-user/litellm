@@ -139,6 +139,24 @@ def _tokens_from_encrypted_credential(credential: CredentialItem) -> ChatGPTToke
         return None
 
 
+def _is_chatgpt_oauth_credential(credential: CredentialItem) -> bool:
+    return (
+        credential.credential_info.get("provider") == CHATGPT_CREDENTIAL_PROVIDER
+        and credential.credential_info.get("auth_type") == CHATGPT_CREDENTIAL_AUTH_TYPE
+    )
+
+
+def _decrypt_credential(credential: CredentialItem) -> CredentialItem:
+    return CredentialItem(
+        credential_name=credential.credential_name,
+        credential_info=credential.credential_info,
+        credential_values={
+            key: decrypt_value_helper(value=value, key=key) or value
+            for key, value in credential.credential_values.items()
+        },
+    )
+
+
 def _find_credential(credential_name: str) -> CredentialItem | None:
     return next(
         (credential for credential in litellm.credential_list if credential.credential_name == credential_name),
@@ -302,6 +320,9 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         credential_name: Final = kwargs.get("litellm_credential_name")
         if not isinstance(credential_name, str) or not credential_name:
             return None
+        credential: Final = await self._find_or_load_credential(credential_name)
+        if credential is None or not _is_chatgpt_oauth_credential(credential):
+            return None
         try:
             tokens: Final = await self._get_tokens(credential_name)
         except Exception as error:
@@ -315,6 +336,21 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             "api_key": tokens.access_token,
             "chatgpt_auth_account_id": tokens.account_id,
         }
+
+    async def _find_or_load_credential(self, credential_name: str) -> CredentialItem | None:
+        cached: Final = _find_credential(credential_name)
+        if cached is not None:
+            return cached
+        from litellm.proxy.proxy_server import prisma_client
+
+        if prisma_client is None:
+            return None
+        stored: Final = await CredentialsRepository(prisma_client).find_by_name(credential_name)
+        if stored is None:
+            return None
+        credential: Final = _decrypt_credential(stored)
+        CredentialAccessor.upsert_credentials([credential])
+        return credential
 
     async def _get_tokens(self, credential_name: str) -> ChatGPTTokens:
         cached: Final = self._read_cached_tokens(credential_name)

@@ -78,6 +78,10 @@ class TestGetLitellmParamsKwargsExtraction:
         result = get_litellm_params(some_random_kwarg="value")
         assert "some_random_kwarg" not in result
 
+    def test_chatgpt_account_id_is_preserved(self):
+        result = get_litellm_params(chatgpt_auth_account_id="account-a")
+        assert result["chatgpt_auth_account_id"] == "account-a"
+
     def test_all_optional_kwargs_extractable(self):
         """Every key in _OPTIONAL_KWARGS_KEYS can be extracted."""
         kwargs = {key: f"val_{key}" for key in _OPTIONAL_KWARGS_KEYS}
