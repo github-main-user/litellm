@@ -136,6 +136,28 @@ def test_key_request_router_settings_keeps_enable_tag_filtering():
     assert dumped["num_retries"] == 2
 
 
+def test_key_request_keeps_failover_and_affinity_settings():
+    from litellm.proxy._types import GenerateKeyRequest
+
+    affinity = {
+        "shared-model": [
+            "responses_api_deployment_check",
+            "encrypted_content_affinity",
+        ]
+    }
+    req = GenerateKeyRequest(
+        router_settings={
+            "enable_weighted_failover": True,
+            "model_group_affinity_config": affinity,
+        }
+    )
+
+    assert req.router_settings is not None
+    dumped = req.router_settings.model_dump(exclude_none=True)
+    assert dumped["enable_weighted_failover"] is True
+    assert dumped["model_group_affinity_config"] == affinity
+
+
 def test_update_key_request_requires_key_or_key_alias():
     """``/key/update`` can be addressed by ``key`` or by ``key_alias``;
     a request with neither has no way to identify the target key and must

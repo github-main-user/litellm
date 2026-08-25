@@ -254,6 +254,22 @@ ROUTER_SETTINGS_FIELDS: Final[list[RouterSettingsField]] = [
         link="https://docs.litellm.ai/docs/proxy/tag_routing",
     ),
     RouterSettingsField(
+        field_name="enable_weighted_failover",
+        field_type="Boolean",
+        field_value=None,
+        field_description="Retry a failed request on another deployment in the same model group",
+        field_default=False,
+        ui_field_name="Enable Weighted Failover",
+    ),
+    RouterSettingsField(
+        field_name="model_group_affinity_config",
+        field_type="Dictionary",
+        field_value=None,
+        field_description="Affinity checks enabled for each model group",
+        field_default={},
+        ui_field_name="Model Group Affinity",
+    ),
+    RouterSettingsField(
         field_name="tag_filtering_match_any",
         field_type="Boolean",
         field_value=None,

@@ -26,6 +26,7 @@ RUNTIME_UPDATABLE_ROUTER_SETTINGS: Final[frozenset[str]] = frozenset(
         "retry_policy",
         "model_group_retry_policy",
         "model_group_alias",
+        "model_group_affinity_config",
         "enable_weighted_failover",
         "enable_tag_filtering",
         "tag_routing_prefix",

@@ -185,6 +185,68 @@ def test_router_model_group_encrypted_content_affinity_callback_registration():
         litellm.callbacks = original_callbacks
 
 
+def test_update_settings_hot_applies_failover_and_affinity():
+    from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
+        DeploymentAffinityCheck,
+    )
+    from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import (
+        EncryptedContentAffinityCheck,
+    )
+
+    model_group = "shared-model"
+    affinity = {
+        model_group: [
+            "responses_api_deployment_check",
+            "encrypted_content_affinity",
+        ]
+    }
+    original_callbacks = list(litellm.callbacks)
+    litellm.callbacks = []
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": model_group,
+                "litellm_params": {
+                    "model": "openai/gpt-5.4",
+                    "api_key": "mock-api-key",
+                },
+            }
+        ]
+    )
+
+    try:
+        router.update_settings(
+            enable_weighted_failover=True,
+            model_group_affinity_config=affinity,
+        )
+
+        settings = router.get_settings()
+        callbacks = router.optional_callbacks or []
+        deployment_callback = next(
+            callback
+            for callback in callbacks
+            if isinstance(callback, DeploymentAffinityCheck)
+        )
+        encrypted_callback = next(
+            callback
+            for callback in callbacks
+            if isinstance(callback, EncryptedContentAffinityCheck)
+        )
+        assert settings["enable_weighted_failover"] is True
+        assert settings["model_group_affinity_config"] == affinity
+        assert deployment_callback.model_group_affinity_config == affinity
+        assert encrypted_callback.model_group_affinity_config == affinity
+        assert callbacks.index(encrypted_callback) < callbacks.index(deployment_callback)
+
+        router.update_settings(model_group_affinity_config={})
+
+        assert deployment_callback.model_group_affinity_config == {}
+        assert encrypted_callback.model_group_affinity_config == {}
+    finally:
+        router.discard()
+        litellm.callbacks = original_callbacks
+
+
 @pytest.mark.asyncio
 async def test_encrypted_content_affinity_model_group_config_is_additive():
     from litellm.responses.utils import ResponsesAPIRequestUtils

@@ -2231,6 +2231,20 @@ class Router:
         self.optional_callbacks.append(affinity_callback)
         litellm.logging_callback_manager.add_litellm_callback(affinity_callback)
 
+    def _update_model_group_affinity_config(self, config: dict[str, list[str]] | None) -> None:
+        from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import (
+            EncryptedContentAffinityCheck,
+        )
+
+        self.model_group_affinity_config = config
+        callback_config: Final = config or {}
+        for callback in self.optional_callbacks or []:
+            if isinstance(callback, (DeploymentAffinityCheck, EncryptedContentAffinityCheck)):
+                callback.model_group_affinity_config = callback_config
+        if config:
+            self._ensure_deployment_affinity_callback()
+            self._add_encrypted_content_affinity_check(enable_global_affinity=False)
+
     def add_optional_pre_call_checks(self, optional_pre_call_checks: OptionalPreCallChecks | None):
         if optional_pre_call_checks is None:
             return
@@ -11984,6 +11998,7 @@ class Router:
             "model_group_retry_policy",
             "retry_policy",
             "model_group_alias",
+            "model_group_affinity_config",
             "enable_weighted_failover",
             "enable_tag_filtering",
             "tag_routing_prefix",
@@ -12032,6 +12047,10 @@ class Router:
                         value = RetryPolicy(**value)
                     if value is None or isinstance(value, RetryPolicy):
                         setattr(self, var, value)
+                elif var == "model_group_affinity_config":
+                    value = kwargs[var]
+                    if value is None or isinstance(value, dict):
+                        self._update_model_group_affinity_config(value)
                 else:
                     value = kwargs[var]
                     # only run routing strategy init if it has changed

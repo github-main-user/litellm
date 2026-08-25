@@ -151,6 +151,7 @@ class UpdateRouterConfig(BaseModel):
     weights: RouterWeights | None = None
     tag_routing_prefix: str | None = None
     optional_pre_call_checks: OptionalPreCallChecks | None = None
+    enable_weighted_failover: bool | None = None
 
     model_config = ConfigDict(protected_namespaces=())
 

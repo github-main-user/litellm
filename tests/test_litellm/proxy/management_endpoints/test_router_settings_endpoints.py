@@ -75,6 +75,10 @@ class TestRouterSettingsEndpoints:
         assert isinstance(routing_strategy_field["options"], list)
         assert len(routing_strategy_field["options"]) > 0
 
+        field_names = {field["field_name"] for field in response_data["fields"]}
+        assert "enable_weighted_failover" in field_names
+        assert "model_group_affinity_config" in field_names
+
     @pytest.mark.asyncio
     async def test_get_router_settings_includes_routing_groups_from_live_router(
         self, monkeypatch
