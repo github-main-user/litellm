@@ -30,6 +30,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     encrypt_value_helper,
 )
 from litellm.proxy.credential_endpoints.endpoints import CredentialHelperUtils
+from litellm.proxy.utils import jsonify_object
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.types.utils import CallTypes
 
@@ -225,7 +226,7 @@ async def _store_tokens(
         credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
     )
     encrypted: Final = CredentialHelperUtils.encrypt_credential_values(plaintext)
-    data: Final = encrypted.model_dump()
+    data: Final = jsonify_object(encrypted.model_dump())
     repository: Final = CredentialsRepository(prisma_client)
     if existing is None:
         await repository.create(data={**data, "created_by": actor, "updated_by": actor})
