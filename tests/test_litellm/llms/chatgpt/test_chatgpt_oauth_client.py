@@ -15,6 +15,7 @@ from litellm.llms.chatgpt.oauth_client import (
     ChatGPTOAuthClient,
     ChatGPTTokens,
 )
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
 
 def _jwt(payload: dict[str, object]) -> str:
@@ -65,6 +66,13 @@ def test_device_code_and_token_exchange() -> None:
 
 def test_pending_device_authorization_returns_none() -> None:
     client = ChatGPTOAuthClient(httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(403))))
+
+    assert client.poll_authorization(ChatGPTDeviceCode("device", "CODE", 5)) is None
+
+
+def test_pending_device_authorization_with_http_handler_returns_none() -> None:
+    http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(403)))
+    client = ChatGPTOAuthClient(HTTPHandler(client=http_client))
 
     assert client.poll_authorization(ChatGPTDeviceCode("device", "CODE", 5)) is None
 

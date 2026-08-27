@@ -223,8 +223,9 @@ class ChatGPTOAuthClient:
             error_type=RefreshAccessTokenError,
         )
 
-    def _client(self) -> SyncHTTPClient | HTTPHandler:
-        return self._http_client or _get_httpx_client()
+    def _client(self) -> SyncHTTPClient:
+        client = self._http_client or _get_httpx_client()
+        return client.client if isinstance(client, HTTPHandler) else client
 
     @staticmethod
     def _parse_interval(value: object) -> int:
