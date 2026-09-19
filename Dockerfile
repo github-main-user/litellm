@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 # Base image for building
-ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:e624c5d5e42382ce7165ddafcbbf8e6769a24cbd02ea6114b880b05ae5ba2a8d
+ARG LITELLM_BUILD_IMAGE=python:3.13-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
 
 # Runtime image
-ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:e624c5d5e42382ce7165ddafcbbf8e6769a24cbd02ea6114b880b05ae5ba2a8d
+ARG LITELLM_RUNTIME_IMAGE=python:3.13-slim-bookworm@sha256:2325bb286ec344af3e5898cc224b5844e2707ac6e26b1632516fd3edc84a5e26
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
 # Pinned by digest like the other base images; bump explicitly on Node upgrades.
 ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
@@ -12,13 +12,17 @@ ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516
 ARG PGBOUNCER_VERSION=1.25.2
 ARG PGBOUNCER_SHA256=924ad35113fd0a71c8e2dbe85b5d03445532e2b7b37a9f8a48983beea238b332
 
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS rustbin
+
 FROM $UV_IMAGE AS uvbin
 
 FROM $LITELLM_BUILD_IMAGE AS pgbouncer-builder
 ARG PGBOUNCER_VERSION
 ARG PGBOUNCER_SHA256
 USER root
-RUN apk add --no-cache build-base pkgconf libevent-dev openssl-dev curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkgconf libevent-dev libssl-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 RUN curl -fsSL -o pgbouncer.tar.gz "https://www.pgbouncer.org/downloads/files/${PGBOUNCER_VERSION}/pgbouncer-${PGBOUNCER_VERSION}.tar.gz" && \
     echo "${PGBOUNCER_SHA256}  pgbouncer.tar.gz" | sha256sum -c - && \
@@ -52,23 +56,25 @@ USER root
 
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
+COPY --from=rustbin /usr/local/cargo /usr/local/cargo
+COPY --from=rustbin /usr/local/rustup /usr/local/rustup
 
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
-    gcc \
-    python-3.13 \
-    python-3.13-dev \
-    rust \
+    build-essential \
     openssl \
-    openssl-dev \
+    libssl-dev \
     nodejs \
     npm \
-    libsndfile
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=0 \
-    PATH="/app/.venv/bin:${PATH}"
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
 
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
@@ -119,14 +125,10 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 
 USER root
 
-# The base image only configures Chainguard's authenticated apk repo, which
-# requires an enterprise subscription. Add the public Wolfi repo so `apk add`
-# also works for anyone installing extra packages into a running container.
-# https://github.com/BerriAI/litellm/issues/33518
-RUN echo "https://packages.wolfi.dev/os" >> /etc/apk/repositories
-
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile libevent
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash openssl tzdata nodejs libsndfile1 libevent-2.1-7 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=pgbouncer-builder /usr/local/bin/pgbouncer /usr/local/bin/pgbouncer
 
 WORKDIR /app
@@ -156,8 +158,7 @@ COPY --from=builder /app/litellm-proxy-extras /app/litellm-proxy-extras
 # database needs no npm and no network access (#33650, #24554).
 COPY --from=builder /opt/prisma /opt/prisma
 
-RUN find /app/.venv -type f -path "*/tornado/test/*" -delete && \
-    find /app/.venv -type d -path "*/tornado/test" -delete && \
+RUN find /app/.venv -depth \( -path "*/tornado/test/*" -o -path "*/tornado/test" \) -delete && \
     chmod -R a+rX /opt/prisma && \
     test -x /opt/prisma/binaries/node_modules/.bin/prisma && \
     test -f /opt/prisma/binaries/node_modules/prisma/build/index.js && \
