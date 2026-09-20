@@ -472,6 +472,8 @@ from litellm.proxy.config_resolvers.settings_rules import (
     JsonValue as SettingsJsonValue,
 )
 from litellm.proxy.container_endpoints.endpoints import router as container_router
+from litellm.proxy.credential_endpoints.anthropic_oauth import register_anthropic_oauth_credential_hook
+from litellm.proxy.credential_endpoints.anthropic_oauth import router as anthropic_oauth_credential_router
 from litellm.proxy.credential_endpoints.chatgpt_oauth import register_chatgpt_oauth_credential_hook
 from litellm.proxy.credential_endpoints.chatgpt_oauth import router as chatgpt_oauth_credential_router
 from litellm.proxy.credential_endpoints.endpoints import router as credential_router
@@ -8601,6 +8603,7 @@ class ProxyConfig:
             litellm.credential_list.pop(idx)
 
     async def get_credentials(self, prisma_client: PrismaClient):
+        register_anthropic_oauth_credential_hook()
         register_chatgpt_oauth_credential_hook()
         try:
             credentials = await CredentialsRepository(WriterPinnedClient(prisma_client.db)).find_all()
@@ -19216,6 +19219,7 @@ app.include_router(image_router)
 app.include_router(fine_tuning_router)
 app.include_router(credential_router)
 app.include_router(openai_passthrough_router)
+app.include_router(anthropic_oauth_credential_router)
 app.include_router(chatgpt_oauth_credential_router)
 app.include_router(batches_router)
 app.include_router(openai_files_router)
