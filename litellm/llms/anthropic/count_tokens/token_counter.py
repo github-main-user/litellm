@@ -3,12 +3,19 @@ Anthropic Token Counter implementation using the CountTokens API.
 """
 
 import os
+from collections.abc import Mapping
 from typing import Any, Final, Protocol
+
+from pydantic import Field
 
 from litellm._logging import verbose_logger
 from litellm.exceptions import AuthenticationError
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
-from litellm.llms.anthropic.oauth_client import AnthropicOAuthError, recover_managed_anthropic_oauth_headers
+from litellm.llms.anthropic.oauth_client import (
+    AnthropicOAuthError,
+    recover_managed_anthropic_oauth_headers,
+    sanitize_retry_after,
+)
 from litellm.llms.base_llm.base_utils import BaseTokenCounter
 from litellm.types.utils import CallTypes, LlmProviders, TokenCountResponse
 
@@ -22,6 +29,10 @@ class _OAuthCredentialHook(Protocol):
         kwargs: dict[str, object],
         call_type: CallTypes | None,
     ) -> dict[str, object] | None: ...
+
+
+class AnthropicTokenCountResponse(TokenCountResponse):
+    retry_after: str | None = Field(default=None, exclude=True)
 
 
 class AnthropicTokenCounter(BaseTokenCounter):
@@ -63,14 +74,24 @@ class AnthropicTokenCounter(BaseTokenCounter):
         return AnthropicOAuthCredentialHook()
 
     @staticmethod
+    def _retry_after(headers: object) -> str | None:
+        if not isinstance(headers, Mapping):
+            return None
+        for name, value in headers.items():
+            if isinstance(name, str) and name.lower() == "retry-after":
+                return sanitize_retry_after(value) if isinstance(value, str) else None
+        return None
+
+    @staticmethod
     def _error_response(
         *,
         request_model: str,
         model_to_use: str,
         message: str,
         status_code: int,
+        retry_after: str | None = None,
     ) -> TokenCountResponse:
-        return TokenCountResponse(
+        return AnthropicTokenCountResponse(
             total_tokens=0,
             request_model=request_model,
             model_used=model_to_use,
@@ -78,6 +99,7 @@ class AnthropicTokenCounter(BaseTokenCounter):
             error=True,
             error_message=message,
             status_code=status_code,
+            retry_after=retry_after,
         )
 
     async def count_tokens(
@@ -188,6 +210,7 @@ class AnthropicTokenCounter(BaseTokenCounter):
                 model_to_use=model_to_use,
                 message=str(error),
                 status_code=error.status_code,
+                retry_after=error.retry_after,
             )
         except AuthenticationError as error:
             verbose_logger.warning("Anthropic managed credential error: %s", error.message)
@@ -196,6 +219,7 @@ class AnthropicTokenCounter(BaseTokenCounter):
                 model_to_use=model_to_use,
                 message=error.message,
                 status_code=error.status_code,
+                retry_after=self._retry_after(getattr(error.response, "headers", None)),
             )
         except AnthropicError as error:
             verbose_logger.warning(
@@ -206,6 +230,7 @@ class AnthropicTokenCounter(BaseTokenCounter):
                 model_to_use=model_to_use,
                 message=error.message,
                 status_code=error.status_code,
+                retry_after=self._retry_after(error.headers),
             )
         except Exception as error:  # noqa: BLE001  # convert unexpected provider failures to the response contract
             verbose_logger.warning("Error calling Anthropic CountTokens API: %s", error)

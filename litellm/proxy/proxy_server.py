@@ -13219,18 +13219,25 @@ from litellm.repositories.user_repository import UserRepository
 
 
 def _get_provider_token_counter(
-    deployment: dict, model_to_use: str
+    deployment: dict[str, Any] | None, model_to_use: str
 ) -> tuple[BaseTokenCounter | None, str | None, str | None]:
     """
     Auto-route to the correct provider's token counter based on model/deployment.
     Uses the existing get_provider_model_info infrastructure with switch-case pattern.
     """
     if deployment is None:
-        return None
+        return None, None, None
 
     from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 
-    full_model: Final = deployment.get("litellm_params", {}).get("model", "")
+    raw_params: Final = deployment.get("litellm_params", {})
+    if not isinstance(raw_params, dict):
+        return None, None, None
+    full_model_value: Final = raw_params.get("model", "")
+    if not isinstance(full_model_value, str):
+        return None, None, None
+    full_model: Final = full_model_value
+    configured_provider: Final = raw_params.get("custom_llm_provider")
     model: str | None = None
     custom_llm_provider: str | None = None
 
@@ -13238,9 +13245,9 @@ def _get_provider_token_counter(
         # Use existing LiteLLM logic to determine provider
         model, custom_llm_provider, dynamic_api_key, api_base = get_llm_provider(
             model=full_model,
-            custom_llm_provider=deployment.get("litellm_params", {}).get("custom_llm_provider"),
-            api_base=deployment.get("litellm_params", {}).get("api_base"),
-            api_key=deployment.get("litellm_params", {}).get("api_key"),
+            custom_llm_provider=configured_provider,
+            api_base=raw_params.get("api_base"),
+            api_key=raw_params.get("api_key"),
         )
 
         # Switch case pattern using existing get_provider_model_info
@@ -13264,11 +13271,16 @@ def _get_provider_token_counter(
 
     except Exception:
         # If provider detection fails, fall back to manual checks
-        if full_model.startswith("anthropic/") or "anthropic" in full_model.lower():
+        if configured_provider == "anthropic" or (
+            configured_provider is None and full_model.startswith("anthropic/")
+        ):
             from litellm.llms.anthropic.common_utils import AnthropicModelInfo
 
             anthropic_model_info: Final = AnthropicModelInfo()
-            return anthropic_model_info.get_token_counter(), model, custom_llm_provider
+            resolved_model: Final = (
+                full_model.split("/", 1)[1] if full_model.startswith("anthropic/") else model_to_use
+            )
+            return anthropic_model_info.get_token_counter(), resolved_model, "anthropic"
 
     return None, None, None
 
@@ -13285,6 +13297,8 @@ async def _try_provider_token_count(
     system: str | None = None,
 ) -> Optional["TokenCountResponse"]:
     """Attempt provider-specific token counting. Returns result on success, None to fall through to local counting."""
+    from litellm.llms.anthropic.oauth_client import sanitize_retry_after
+
     if not provider_counter.should_use_token_counting_api(custom_llm_provider=custom_llm_provider):
         return None
     try:
@@ -13300,23 +13314,28 @@ async def _try_provider_token_count(
     except httpx.HTTPStatusError as e:
         error_message: Final = getattr(e, "message", None) or str(e)
         status_code: Final = getattr(e, "status_code", None) or e.response.status_code
+        http_retry_after: Final = sanitize_retry_after(e.response.headers.get("retry-after"))
         raise ProxyException(
             message=error_message,
             type="token_counting_error",
             param="model",
             code=status_code,
+            headers={"Retry-After": http_retry_after} if http_retry_after is not None else None,
         )
     if result is not None and result.error is True:
-        named_anthropic_connection: Final = (
-            custom_llm_provider == "anthropic"
-            and bool((deployment or {}).get("litellm_params", {}).get("litellm_credential_name"))
+        deployment_params: Final = (deployment or {}).get("litellm_params", {})
+        named_anthropic_connection: Final = custom_llm_provider == "anthropic" and bool(
+            deployment_params.get("litellm_credential_name") if isinstance(deployment_params, dict) else None
         )
         if litellm.disable_token_counter is True or named_anthropic_connection:
+            raw_retry_after: Final = getattr(result, "retry_after", None)
+            result_retry_after: Final = sanitize_retry_after(raw_retry_after) if isinstance(raw_retry_after, str) else None
             raise ProxyException(
                 message=result.error_message or "Token counting failed",
                 type="token_counting_error",
                 param="model",
                 code=result.status_code or 500,
+                headers={"Retry-After": result_retry_after} if isinstance(result_retry_after, str) else None,
             )
         verbose_proxy_logger.warning(
             "Provider token counting failed (%s): %s. Falling back to local tokenizer.",

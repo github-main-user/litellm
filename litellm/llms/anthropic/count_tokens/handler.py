@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Final
 
 import httpx
-from pydantic import JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, ValidationError
 
 import litellm
 from litellm._logging import verbose_logger
@@ -18,7 +18,10 @@ from litellm.llms.anthropic.count_tokens.transformation import (
 )
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 
-_COUNT_RESPONSE: Final = TypeAdapter(dict[str, JsonValue])
+
+class _CountTokensResponse(BaseModel):
+    input_tokens: StrictInt = Field(ge=0)
+    model_config = ConfigDict(extra="allow")
 
 
 class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
@@ -102,9 +105,17 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
                 raise AnthropicError(
                     status_code=response.status_code,
                     message=error_text,
+                    headers=response.headers,
                 )
 
-            anthropic_response: Final = _COUNT_RESPONSE.validate_json(response.content)
+            try:
+                anthropic_response: Final = _CountTokensResponse.model_validate_json(response.content).model_dump()
+            except ValidationError:
+                raise AnthropicError(
+                    status_code=502,
+                    message="Anthropic CountTokens API returned an invalid response",
+                    headers=response.headers,
+                ) from None
 
             verbose_logger.debug("Anthropic response: %s", anthropic_response)
 
@@ -120,8 +131,16 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
             raise AnthropicError(
                 status_code=e.response.status_code,
                 message=e.response.text,
-            )
-        except Exception as e:  # noqa: BLE001  # normalize transport and response parsing failures
+                headers=e.response.headers,
+            ) from e
+        except httpx.TimeoutException:
+            raise AnthropicError(status_code=504, message="Anthropic CountTokens request timed out") from None
+        except httpx.RequestError:
+            raise AnthropicError(status_code=502, message="Anthropic CountTokens request failed") from None
+        except (TypeError, ValueError) as e:
+            verbose_logger.error("Invalid CountTokens request: %s", e)
+            raise AnthropicError(status_code=400, message=f"Invalid CountTokens request: {e}") from e
+        except Exception as e:  # noqa: BLE001  # normalize unexpected failures
             verbose_logger.error("Error in CountTokens handler: %s", e)
             raise AnthropicError(
                 status_code=500,

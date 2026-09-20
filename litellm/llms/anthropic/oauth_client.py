@@ -182,7 +182,7 @@ class AnthropicOAuthClient:
             response.raise_for_status()
             payload: Final = _OAUTH_OBJECT_ADAPTER.validate_json(response.content)
         except httpx.HTTPStatusError as error:
-            retry_after: Final = _safe_retry_after(cast(str | None, error.response.headers.get("retry-after")))
+            retry_after: Final = sanitize_retry_after(cast(str | None, error.response.headers.get("retry-after")))
             raise AnthropicOAuthError(operation, error.response.status_code, retry_after) from None
         except (httpx.TimeoutException, TimeoutError):
             raise AnthropicOAuthError(operation, 504) from None
@@ -302,11 +302,11 @@ def _recovery_error(error: Exception) -> AnthropicOAuthError:
         else None
     )
     return AnthropicOAuthError(
-        "token refresh", status_code, _safe_retry_after(retry_after) if isinstance(retry_after, str) else None
+        "token refresh", status_code, sanitize_retry_after(retry_after) if isinstance(retry_after, str) else None
     )
 
 
-def _safe_retry_after(value: str | None) -> str | None:
+def sanitize_retry_after(value: str | None) -> str | None:
     if value is None or len(value) > 128:
         return None
     if value.isascii() and value.isdigit() and len(value) <= 10:

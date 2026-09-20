@@ -1362,6 +1362,29 @@ async def test_anthropic_endpoint_429_rate_limit_error_format():
         proxy_server.token_counter = original_token_counter
 
 
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"model": "openai/my-anthropic-compatible-model"},
+        {"model": "anthropic/custom-alias", "custom_llm_provider": "openai"},
+    ],
+)
+def test_provider_detection_does_not_guess_anthropic_from_model_substring(monkeypatch, params):
+    from litellm.proxy.proxy_server import _get_provider_token_counter
+
+    monkeypatch.setattr(
+        "litellm.litellm_core_utils.get_llm_provider_logic.get_llm_provider",
+        MagicMock(side_effect=ValueError("provider lookup failed")),
+    )
+
+    counter, model, provider = _get_provider_token_counter(
+        {"litellm_params": params},
+        "my-anthropic-compatible-model",
+    )
+
+    assert (counter, model, provider) == (None, None, None)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 403, 429, 503])
 async def test_named_anthropic_token_count_errors_never_become_local_estimates(monkeypatch, status_code):
@@ -1382,3 +1405,44 @@ async def test_named_anthropic_token_count_errors_never_become_local_estimates(m
             request_model="subscription",
         )
     assert int(error.value.code) == status_code
+
+
+def test_missing_deployment_returns_no_provider_counter():
+    from litellm.proxy.proxy_server import _get_provider_token_counter
+
+    assert _get_provider_token_counter(None, "unknown-model") == (None, None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_after,expected", [("13", {"Retry-After": "13"}), ("unsafe\r\nheader", {})])
+async def test_named_anthropic_token_count_propagates_retry_after(monkeypatch, retry_after, expected):
+    from litellm.llms.anthropic.count_tokens.token_counter import AnthropicTokenCountResponse
+    from litellm.proxy.proxy_server import _try_provider_token_count
+
+    monkeypatch.setattr(litellm, "disable_token_counter", False)
+    counter = MagicMock()
+    counter.should_use_token_counting_api.return_value = True
+    counter.count_tokens = AsyncMock(return_value=AnthropicTokenCountResponse(
+        total_tokens=0,
+        request_model="subscription",
+        model_used="claude-sonnet-5",
+        tokenizer_type="anthropic_api",
+        error=True,
+        error_message="Rate limited",
+        status_code=429,
+        retry_after=retry_after,
+    ))
+
+    with pytest.raises(ProxyException) as error:
+        await _try_provider_token_count(
+            provider_counter=counter,
+            custom_llm_provider="anthropic",
+            model_to_use="claude-sonnet-5",
+            messages=[{"role": "user", "content": "Hello"}],
+            contents=None,
+            deployment={"litellm_params": {"litellm_credential_name": "subscription"}},
+            request_model="subscription",
+        )
+
+    assert error.value.code == "429"
+    assert error.value.headers == expected
