@@ -13307,7 +13307,11 @@ async def _try_provider_token_count(
             code=status_code,
         )
     if result is not None and result.error is True:
-        if litellm.disable_token_counter is True:
+        named_anthropic_connection: Final = (
+            custom_llm_provider == "anthropic"
+            and bool((deployment or {}).get("litellm_params", {}).get("litellm_credential_name"))
+        )
+        if litellm.disable_token_counter is True or named_anthropic_connection:
             raise ProxyException(
                 message=result.error_message or "Token counting failed",
                 type="token_counting_error",

@@ -1,4 +1,6 @@
+import copy
 
+from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
 )
@@ -88,3 +90,30 @@ def test_transform_no_system_no_tools():
 
     assert "system" not in result
     assert "tools" not in result
+
+
+def test_subscription_transform_canonicalizes_identity_and_tools_without_mutating_request():
+    config = AnthropicCountTokensConfig()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-1", "name": "read", "input": {}}],
+        }
+    ]
+    tools = [{"name": "read", "description": "Read a file", "input_schema": {"type": "object"}}]
+    original_messages = copy.deepcopy(messages)
+    original_tools = copy.deepcopy(tools)
+
+    result = config.transform_request_to_count_tokens(
+        model="claude-test",
+        messages=messages,
+        tools=tools,
+        system="Keep the user context",
+        subscription_request=True,
+    )
+
+    assert result["system"][0]["text"] == ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+    assert result["tools"][0]["name"] == "Read"
+    assert result["messages"][0]["content"][0]["name"] == "Read"
+    assert messages == original_messages
+    assert tools == original_tools

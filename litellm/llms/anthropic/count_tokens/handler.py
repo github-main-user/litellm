@@ -12,7 +12,7 @@ from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm._logging import verbose_logger
-from litellm.llms.anthropic.common_utils import AnthropicError
+from litellm.llms.anthropic.common_utils import AnthropicError, is_anthropic_oauth_key
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
 )
@@ -68,6 +68,7 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
                 tools=tools,
                 system=system,
                 optional_params=optional_params,
+                subscription_request=is_anthropic_oauth_key(api_key),
             )
 
             verbose_logger.debug("Transformed request: %s", request_body)
@@ -120,7 +121,7 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
                 status_code=e.response.status_code,
                 message=e.response.text,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # normalize transport and response parsing failures
             verbose_logger.error("Error in CountTokens handler: %s", e)
             raise AnthropicError(
                 status_code=500,

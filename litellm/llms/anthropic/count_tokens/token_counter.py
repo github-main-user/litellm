@@ -3,25 +3,82 @@ Anthropic Token Counter implementation using the CountTokens API.
 """
 
 import os
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from litellm._logging import verbose_logger
+from litellm.exceptions import AuthenticationError
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
+from litellm.llms.anthropic.oauth_client import AnthropicOAuthError, recover_managed_anthropic_oauth_headers
 from litellm.llms.base_llm.base_utils import BaseTokenCounter
-from litellm.types.utils import LlmProviders, TokenCountResponse
+from litellm.types.utils import CallTypes, LlmProviders, TokenCountResponse
 
 # Global handler instance - reuse across all token counting requests
 anthropic_count_tokens_handler: Final = AnthropicCountTokensHandler()
 
 
+class _OAuthCredentialHook(Protocol):
+    async def async_pre_call_deployment_hook(
+        self,
+        kwargs: dict[str, object],
+        call_type: CallTypes | None,
+    ) -> dict[str, object] | None: ...
+
+
 class AnthropicTokenCounter(BaseTokenCounter):
     """Token counter implementation for Anthropic provider using the CountTokens API."""
+
+    def __init__(
+        self,
+        oauth_credential_hook: _OAuthCredentialHook | None = None,
+        count_tokens_handler: AnthropicCountTokensHandler | None = None,
+    ) -> None:
+        self._oauth_credential_hook = oauth_credential_hook
+        self._count_tokens_handler = count_tokens_handler
 
     def should_use_token_counting_api(
         self,
         custom_llm_provider: str | None = None,
     ) -> bool:
         return custom_llm_provider == LlmProviders.ANTHROPIC.value
+
+    async def _resolve_named_credential(
+        self,
+        *,
+        model: str,
+        litellm_params: dict[str, Any],
+    ) -> dict[str, object] | None:
+        hook: Final = self._oauth_credential_hook or self._default_oauth_credential_hook()
+        provider: Final = litellm_params.get("custom_llm_provider") or LlmProviders.ANTHROPIC.value
+        hook_kwargs: Final[dict[str, object]] = {
+            **litellm_params,
+            "model": model,
+            "custom_llm_provider": provider,
+        }
+        return await hook.async_pre_call_deployment_hook(hook_kwargs, None)
+
+    @staticmethod
+    def _default_oauth_credential_hook() -> _OAuthCredentialHook:
+        from litellm.proxy.credential_endpoints.anthropic_oauth import AnthropicOAuthCredentialHook
+
+        return AnthropicOAuthCredentialHook()
+
+    @staticmethod
+    def _error_response(
+        *,
+        request_model: str,
+        model_to_use: str,
+        message: str,
+        status_code: int,
+    ) -> TokenCountResponse:
+        return TokenCountResponse(
+            total_tokens=0,
+            request_model=request_model,
+            model_used=model_to_use,
+            tokenizer_type="anthropic_api",
+            error=True,
+            error_message=message,
+            status_code=status_code,
+        )
 
     async def count_tokens(
         self,
@@ -48,59 +105,113 @@ class AnthropicTokenCounter(BaseTokenCounter):
         """
         from litellm.llms.anthropic.common_utils import AnthropicError
 
-        if not messages:
+        if messages is None and system is None and tools is None:
             return None
 
-        deployment = deployment or {}
-        litellm_params: Final = deployment.get("litellm_params", {})
-
-        # Get Anthropic API key from deployment config or environment
-        api_key = litellm_params.get("api_key")
-        if not api_key:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-
-        if not api_key:
-            verbose_logger.warning("No Anthropic API key found for token counting")
-            return None
+        deployment_params: Final = (deployment or {}).get("litellm_params", {})
+        litellm_params: Final[dict[str, Any]] = deployment_params if isinstance(deployment_params, dict) else {}
+        credential_name: Final = litellm_params.get("litellm_credential_name")
 
         try:
-            result: Final = await anthropic_count_tokens_handler.handle_count_tokens_request(
-                model=model_to_use,
-                messages=messages,
-                api_key=api_key,
-                tools=tools,
-                system=system,
+            resolved: Final = (
+                await self._resolve_named_credential(model=model_to_use, litellm_params=litellm_params)
+                if isinstance(credential_name, str) and credential_name
+                else None
             )
-
-            if result is not None:
-                return TokenCountResponse(
-                    total_tokens=result.get("input_tokens", 0),
+            # Get Anthropic API key from deployment config or environment
+            resolved_api_key: Final = resolved.get("api_key") if resolved is not None else litellm_params.get("api_key")
+            api_key: Final = (
+                resolved_api_key
+                if isinstance(resolved_api_key, str) and resolved_api_key
+                else None
+                if credential_name
+                else os.getenv("ANTHROPIC_API_KEY")
+            )
+            if api_key is None:
+                if not credential_name:
+                    verbose_logger.warning("No Anthropic API key found for token counting")
+                    return None
+                message: Final = f"Anthropic credential '{credential_name}' is unavailable"
+                verbose_logger.warning(message)
+                return self._error_response(
                     request_model=request_model,
-                    model_used=model_to_use,
-                    tokenizer_type="anthropic_api",
-                    original_response=result,
+                    model_to_use=model_to_use,
+                    message=message,
+                    status_code=401,
                 )
-        except AnthropicError as e:
-            verbose_logger.warning("Anthropic CountTokens API error: status=%s, message=%s", e.status_code, e.message)
+
+            handler: Final = self._count_tokens_handler or anthropic_count_tokens_handler
+            try:
+                result = await handler.handle_count_tokens_request(
+                    model=model_to_use,
+                    messages=messages or [],
+                    api_key=api_key,
+                    tools=tools,
+                    system=system,
+                )
+            except AnthropicError as error:
+                if error.status_code != 401 or resolved is None:
+                    raise
+                recovered: Final = await recover_managed_anthropic_oauth_headers(
+                    headers={"authorization": f"Bearer {api_key}"}, litellm_params=resolved
+                )
+                if recovered is None:
+                    raise
+                authorization: Final = recovered.get("authorization")
+                if not isinstance(authorization, str):
+                    raise
+                result = await handler.handle_count_tokens_request(
+                    model=model_to_use,
+                    messages=messages or [],
+                    api_key=authorization.removeprefix("Bearer "),
+                    tools=tools,
+                    system=system,
+                )
+            input_tokens: Final = result.get("input_tokens")
+            if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or input_tokens < 0:
+                return self._error_response(
+                    request_model=request_model,
+                    model_to_use=model_to_use,
+                    message="Anthropic CountTokens API returned an invalid input_tokens value",
+                    status_code=502,
+                )
             return TokenCountResponse(
-                total_tokens=0,
+                total_tokens=input_tokens,
                 request_model=request_model,
                 model_used=model_to_use,
                 tokenizer_type="anthropic_api",
-                error=True,
-                error_message=e.message,
-                status_code=e.status_code,
+                original_response=result,
             )
-        except Exception as e:
-            verbose_logger.warning("Error calling Anthropic CountTokens API: %s", e)
-            return TokenCountResponse(
-                total_tokens=0,
+        except AnthropicOAuthError as error:
+            return self._error_response(
                 request_model=request_model,
-                model_used=model_to_use,
-                tokenizer_type="anthropic_api",
-                error=True,
-                error_message=str(e),
+                model_to_use=model_to_use,
+                message=str(error),
+                status_code=error.status_code,
+            )
+        except AuthenticationError as error:
+            verbose_logger.warning("Anthropic managed credential error: %s", error.message)
+            return self._error_response(
+                request_model=request_model,
+                model_to_use=model_to_use,
+                message=error.message,
+                status_code=error.status_code,
+            )
+        except AnthropicError as error:
+            verbose_logger.warning(
+                "Anthropic CountTokens API error: status=%s, message=%s", error.status_code, error.message
+            )
+            return self._error_response(
+                request_model=request_model,
+                model_to_use=model_to_use,
+                message=error.message,
+                status_code=error.status_code,
+            )
+        except Exception as error:  # noqa: BLE001  # convert unexpected provider failures to the response contract
+            verbose_logger.warning("Error calling Anthropic CountTokens API: %s", error)
+            return self._error_response(
+                request_model=request_model,
+                model_to_use=model_to_use,
+                message=str(error),
                 status_code=500,
             )
-
-        return None

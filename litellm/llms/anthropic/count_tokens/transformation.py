@@ -11,6 +11,8 @@ from typing import Final
 from pydantic import JsonValue, TypeAdapter
 
 from litellm.constants import ANTHROPIC_TOKEN_COUNTING_BETA_VERSION
+from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
+from litellm.llms.anthropic.subscription_tools import prepare_subscription_tools
 
 _COUNT_REQUEST: Final = TypeAdapter(dict[str, JsonValue])
 COUNT_TOKEN_OPTION_NAMES: Final = ("thinking", "tool_choice", "output_config")
@@ -42,6 +44,7 @@ class AnthropicCountTokensConfig:
         tools: list[dict[str, JsonValue]] | None = None,
         system: JsonValue = None,
         optional_params: Mapping[str, JsonValue] | None = None,
+        subscription_request: bool = False,
     ) -> dict[str, JsonValue]:  # mutable-ok: provider transport requires JSON dictionaries
         """
         Transform request to Anthropic CountTokens format.
@@ -49,7 +52,7 @@ class AnthropicCountTokensConfig:
         Includes optional system and tools fields for accurate token counting.
         """
         options: Final[Mapping[str, JsonValue]] = optional_params or MappingProxyType({})
-        return _COUNT_REQUEST.validate_python(
+        request: Final = _COUNT_REQUEST.validate_python(
             MappingProxyType(
                 {
                     "model": model,
@@ -63,6 +66,14 @@ class AnthropicCountTokensConfig:
                 }
             )
         )
+        if not subscription_request:
+            return request
+        request_with_identity: Final = {
+            **request,
+            "system": prepare_anthropic_subscription_system(request.get("system")),
+        }
+        subscription_body, _ = prepare_subscription_tools(request_with_identity)
+        return _COUNT_REQUEST.validate_python(subscription_body)
 
     def get_required_headers(self, api_key: str) -> dict[str, str]:
         """
@@ -112,11 +123,13 @@ class AnthropicCountTokensConfig:
             raise ValueError("messages parameter is required")
 
         if not isinstance(messages, list):
-            raise ValueError("messages must be a list")
+            raise ValueError("messages must be a list")  # noqa: TRY004  # keep one public validation exception type
 
         for i, message in enumerate(messages):
             if not isinstance(message, dict):
-                raise ValueError(f"Message {i} must be a dictionary")
+                raise ValueError(  # noqa: TRY004  # keep one public validation exception type
+                    f"Message {i} must be a dictionary"
+                )
 
             if "role" not in message:
                 raise ValueError(f"Message {i} must have a 'role' field")
