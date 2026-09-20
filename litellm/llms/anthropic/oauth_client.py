@@ -2,19 +2,21 @@ import asyncio
 import base64
 import hashlib
 import math
+import re
 import secrets
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import timezone
 from email.utils import format_datetime, parsedate_to_datetime
-from typing import Final, Protocol, cast, runtime_checkable
+from typing import Final, Protocol, TypeGuard, cast, runtime_checkable
 from urllib.parse import urlencode
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
 _OAUTH_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
+_ACCESS_TOKEN_PATTERN: Final = re.compile(r"sk-ant-oat[-A-Za-z0-9._~+/]+=*")
 
 ANTHROPIC_OAUTH_CLIENT_ID: Final = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 ANTHROPIC_OAUTH_AUTHORIZE_URL: Final = "https://claude.com/cai/oauth/authorize"
@@ -89,7 +91,7 @@ class AnthropicOAuthTokens:
         expires_at: Final = parsed.get("expires_at")
         account_id: Final = parsed.get("account_id")
         device_id: Final = parsed.get("device_id")
-        if not isinstance(access_token, str) or not access_token.startswith("sk-ant-oat"):
+        if not _is_access_token(access_token):
             raise ValueError("Anthropic OAuth access token is invalid")
         if not isinstance(refresh_token, str) or not refresh_token:
             raise ValueError("Anthropic OAuth refresh token is missing")
@@ -226,7 +228,7 @@ class AnthropicOAuthClient:
             if previous is not None
             else None
         )
-        if not isinstance(access_token, str) or not access_token.startswith("sk-ant-oat"):
+        if not _is_access_token(access_token):
             raise AnthropicOAuthError(operation)
         if not isinstance(refresh_token, str) or not refresh_token:
             raise AnthropicOAuthError(operation)
@@ -270,7 +272,7 @@ async def recover_managed_anthropic_oauth_headers(
             continue
         try:
             if (token := await callback.recover_rejected_token(credential_name, rejected_token)) is not None:
-                if not token.startswith("sk-ant-oat"):
+                if not _is_access_token(token):
                     raise AnthropicOAuthError("token refresh", 502)
                 return {
                     **{name: value for name, value in headers.items() if name.lower() != "authorization"},
@@ -325,6 +327,10 @@ def _nested_id(value: object) -> str | None:
         return None
     nested_id: Final = fields.get("uuid") or fields.get("id")
     return nested_id if isinstance(nested_id, str) and nested_id else None
+
+
+def _is_access_token(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and _ACCESS_TOKEN_PATTERN.fullmatch(value) is not None
 
 
 def _base64url(value: bytes) -> str:

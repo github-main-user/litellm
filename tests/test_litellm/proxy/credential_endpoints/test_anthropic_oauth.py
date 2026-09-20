@@ -84,6 +84,24 @@ def test_authorization_response_requires_matching_state() -> None:
             _parse_authorization_code(invalid, "state-a")
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "code#státe",
+        "code#\ud800",
+        "https://[invalid",
+        f"{ANTHROPIC_OAUTH_REDIRECT_URI};ignored?code=code&state=state",
+        f"{ANTHROPIC_OAUTH_REDIRECT_URI}?code=code&code=&state=state",
+        f"{ANTHROPIC_OAUTH_REDIRECT_URI}?code=code&state=wrong#state=state",
+        f"{ANTHROPIC_OAUTH_REDIRECT_URI}?code=old&state=state#code=code",
+    ),
+)
+def test_authorization_response_rejects_ambiguous_or_malformed_values(value: str) -> None:
+    with pytest.raises(HTTPException) as error:
+        _parse_authorization_code(value, "state")
+    assert error.value.status_code == 400
+
+
 @pytest.mark.asyncio
 async def test_start_is_admin_only_and_validates_name() -> None:
     with pytest.raises(HTTPException) as denied:

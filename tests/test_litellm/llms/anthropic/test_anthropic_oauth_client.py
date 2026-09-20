@@ -1,5 +1,7 @@
 import json
 import math
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -13,6 +15,7 @@ from litellm.llms.anthropic.oauth_client import (
     AnthropicOAuthClient,
     AnthropicOAuthError,
     AnthropicOAuthTokens,
+    recover_managed_anthropic_oauth_headers,
 )
 
 
@@ -194,6 +197,41 @@ def test_token_bundle_validation_and_log_safety() -> None:
     assert "refresh" not in repr(tokens)
     with pytest.raises(ValueError):
         AnthropicOAuthTokens.from_json('{"access_token":"not-oauth","refresh_token":"refresh","expires_at":1}')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["\r\nsecret", " secret", "\x00secret", "\x7fsecret", "ésecret"])
+async def test_unsafe_access_tokens_are_rejected_before_header_construction(suffix: str) -> None:
+    token = f"sk-ant-oat-{suffix}"
+    payload = {"access_token": token, "refresh_token": "refresh", "expires_in": 3600}
+    with pytest.raises(ValueError) as stored_error:
+        AnthropicOAuthTokens.from_json(json.dumps({**payload, "expires_at": 3600}))
+    assert token not in str(stored_error.value)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(AnthropicOAuthError) as upstream_error:
+            await AnthropicOAuthClient(http_client).exchange_code("code", "state", "verifier")
+    assert token not in str(upstream_error.value)
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_return_unsafe_headers(monkeypatch) -> None:
+    import litellm
+
+    secret = "sk-ant-oat-private\r\nvalue"
+    callback = SimpleNamespace(recover_rejected_token=AsyncMock(return_value=secret))
+    monkeypatch.setattr(litellm, "callbacks", [callback])
+    with pytest.raises(AnthropicOAuthError) as error:
+        await recover_managed_anthropic_oauth_headers(
+            headers={"Authorization": "Bearer sk-ant-oat-rejected"},
+            litellm_params={"litellm_credential_name": "subscription"},
+        )
+    assert error.value.status_code == 502
+    assert secret not in str(error.value)
+    callback.recover_rejected_token.assert_awaited_once_with("subscription", "sk-ant-oat-rejected")
 
 
 @pytest.mark.parametrize("expires_at", [math.inf, -math.inf, math.nan])

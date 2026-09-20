@@ -155,14 +155,19 @@ def _decode_attempt(value: str, actor: str) -> AnthropicOAuthAttempt:
 def _authorization_response(value: str) -> ParsedAuthorizationCode:
     text: Final = value.strip()
     if text.startswith(("http://", "https://")):
-        parsed: Final = urlparse(text)
+        try:
+            parsed: Final = urlparse(text)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Anthropic authorization response") from None
         expected: Final = urlparse(ANTHROPIC_OAUTH_REDIRECT_URI)
-        if (parsed.scheme, parsed.netloc, parsed.path) != (expected.scheme, expected.netloc, expected.path):
+        if parsed.params or (parsed.scheme, parsed.netloc, parsed.path) != (
+            expected.scheme, expected.netloc, expected.path
+        ):
             raise HTTPException(status_code=400, detail="Invalid Anthropic authorization response")
-        parameters: Final = {**parse_qs(parsed.query), **parse_qs(parsed.fragment)}
+        parameters: Final = parse_qs(f"{parsed.query}&{parsed.fragment}", keep_blank_values=True)
         code_values: Final = parameters.get("code", [])
         state_values: Final = parameters.get("state", [])
-        if len(code_values) != 1 or len(state_values) != 1:
+        if len(code_values) != 1 or len(state_values) != 1 or not code_values[0] or not state_values[0]:
             raise HTTPException(status_code=400, detail="Invalid Anthropic authorization response")
         return ParsedAuthorizationCode(code=code_values[0], state=state_values[0])
     parts: Final = text.split("#")
@@ -173,7 +178,7 @@ def _authorization_response(value: str) -> ParsedAuthorizationCode:
 
 def _parse_authorization_code(value: str, expected_state: str) -> ParsedAuthorizationCode:
     response: Final = _authorization_response(value)
-    if not secrets.compare_digest(response.state, expected_state):
+    if not response.state.isascii() or not secrets.compare_digest(response.state, expected_state):
         raise HTTPException(status_code=400, detail="Invalid Anthropic authorization response")
     return response
 
