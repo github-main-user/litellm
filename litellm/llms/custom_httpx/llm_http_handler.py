@@ -400,12 +400,12 @@ class BaseLLMHTTPHandler:
         signed_json_body: bytes | None = None,
     ) -> httpx.Response:
         """Common implementation across stream + non-stream calls. Meant to ensure consistent error-handling."""
-        max_retry_on_unprocessable_entity_error: Final = provider_config.max_retry_on_unprocessable_entity_error
+        max_attempts: Final = max(provider_config.max_retry_on_unprocessable_entity_error, 1)
 
         response: httpx.Response | None = None
         oauth_retried = False
         request_headers = headers
-        for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
+        for i in range(max_attempts):
             try:
                 while True:
                     try:
@@ -425,10 +425,14 @@ class BaseLLMHTTPHandler:
                             and error.response.status_code == 401
                             and _is_native_anthropic_config(provider_config)
                         ):
-                            refreshed_headers = await _recover_managed_anthropic_oauth_headers(
-                                headers=request_headers,
-                                litellm_params=litellm_params,
-                            )
+                            try:
+                                refreshed_headers = await _recover_managed_anthropic_oauth_headers(
+                                    headers=request_headers,
+                                    litellm_params=litellm_params,
+                                )
+                            except BaseException:
+                                await error.response.aclose()
+                                raise
                             if refreshed_headers is not None:
                                 await error.response.aclose()
                                 oauth_retried = True
@@ -442,12 +446,17 @@ class BaseLLMHTTPHandler:
                     headers=error.headers,
                 ) from None
             except httpx.HTTPStatusError as e:
-                hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
+                hit_max_retry = i + 1 == max_attempts
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
                     e=e, litellm_params=litellm_params
                 )
                 if should_retry and not hit_max_retry:
-                    data = provider_config.transform_request_on_unprocessable_entity_error(e=e, request_data=data)
+                    try:
+                        data = provider_config.transform_request_on_unprocessable_entity_error(
+                            e=e, request_data=data
+                        )
+                    finally:
+                        await e.response.aclose()
                     continue
                 else:
                     raise self._handle_error(e=e, provider_config=provider_config)
@@ -2199,10 +2208,14 @@ class BaseLLMHTTPHandler:
                         return response
                     except httpx.HTTPStatusError as error:
                         if not oauth_retried and error.response.status_code == 401:
-                            refreshed_headers = await _recover_managed_anthropic_oauth_headers(
-                                headers=request_headers,
-                                litellm_params=litellm_params_dict,
-                            )
+                            try:
+                                refreshed_headers = await _recover_managed_anthropic_oauth_headers(
+                                    headers=request_headers,
+                                    litellm_params=litellm_params_dict,
+                                )
+                            except BaseException:
+                                await error.response.aclose()
+                                raise
                             if refreshed_headers is not None:
                                 await error.response.aclose()
                                 oauth_retried = True
@@ -2221,29 +2234,34 @@ class BaseLLMHTTPHandler:
                     e=e, litellm_params=litellm_params_dict
                 )
                 if should_retry and not hit_max_attempt:
-                    if logging_obj.baseline_cache_context is not None:
-                        await logging_obj.invalidate_baseline_cache_estimate("retried_request")
-                    verbose_logger.debug(
-                        "Anthropic /v1/messages: invalid thinking signature; "
-                        "stripping thinking blocks and retrying (attempt %s/%s).",
-                        attempt_idx + 2,
-                        max_attempts,
-                    )
-                    provider_config.transform_anthropic_messages_request_on_http_error(e=e, request_data=request_body)
-                    headers, signed_json_body = await sign_request_off_loop_if_aws(
-                        provider_config,
-                        provider_config.sign_request,
-                        headers=request_headers,
-                        optional_params=optional_params_dict,
-                        request_data=request_body,
-                        api_base=request_url,
-                        api_key=api_key,
-                        stream=stream,
-                        fake_stream=False,
-                        model=model,
-                    )
-                    request_headers = headers
-                    logging_obj.model_call_details.update(request_body)
+                    try:
+                        if logging_obj.baseline_cache_context is not None:
+                            await logging_obj.invalidate_baseline_cache_estimate("retried_request")
+                        verbose_logger.debug(
+                            "Anthropic /v1/messages: invalid thinking signature; "
+                            "stripping thinking blocks and retrying (attempt %s/%s).",
+                            attempt_idx + 2,
+                            max_attempts,
+                        )
+                        provider_config.transform_anthropic_messages_request_on_http_error(
+                            e=e, request_data=request_body
+                        )
+                        headers, signed_json_body = await sign_request_off_loop_if_aws(
+                            provider_config,
+                            provider_config.sign_request,
+                            headers=request_headers,
+                            optional_params=optional_params_dict,
+                            request_data=request_body,
+                            api_base=request_url,
+                            api_key=api_key,
+                            stream=stream,
+                            fake_stream=False,
+                            model=model,
+                        )
+                        request_headers = headers
+                        logging_obj.model_call_details.update(request_body)
+                    finally:
+                        await e.response.aclose()
                     continue
                 raise self._handle_error(e=e, provider_config=provider_config)
             except Exception as e:

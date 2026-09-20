@@ -1623,7 +1623,9 @@ async def test_anthropic_post_retry_reserializes_mutated_body():
     prebuilt = _json.dumps(request_body)
 
     err_resp = Mock()
-    http_error = httpx.HTTPStatusError("bad", request=Mock(), response=Mock(status_code=400))
+    error_response = Mock(status_code=400)
+    error_response.aclose = AsyncMock()
+    http_error = httpx.HTTPStatusError("bad", request=Mock(), response=error_response)
     err_resp.raise_for_status = Mock(side_effect=http_error)
     ok_resp = Mock()
     ok_resp.raise_for_status = Mock(return_value=None)
@@ -1662,6 +1664,7 @@ async def test_anthropic_post_retry_reserializes_mutated_body():
     assert first_sent == prebuilt  # attempt 0 used prebuilt
     assert second_sent == _json.dumps(request_body)  # attempt 1 re-serialized
     assert "MUTATED" in second_sent  # ... the mutated body
+    error_response.aclose.assert_awaited_once()
 
 
 def test_base_responses_config_sign_request_is_noop_by_default():
@@ -4120,6 +4123,62 @@ async def test_common_anthropic_chat_401_recovers_for_stream_and_nonstream(strea
     assert hook.calls == [("managed-common", "sk-ant-oat01-common-old")]
     assert client.post.await_count == 2
     assert client.post.await_args_list[1].kwargs["headers"]["Authorization"] == "Bearer sk-ant-oat01-native-fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_limit", [0, 1])
+async def test_common_async_call_does_not_return_rejected_response_after_retry_limit(retry_limit):
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.llms.anthropic.common_utils import AnthropicError
+
+    config = Mock(spec=AnthropicConfig)
+    config.max_retry_on_unprocessable_entity_error = retry_limit
+    config.should_retry_llm_api_inside_llm_translation_on_http_error.return_value = True
+    config.get_error_class = AnthropicConfig().get_error_class
+    response = httpx.Response(
+        422, json={"error": "Rejected request"}, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post.return_value = response
+    with pytest.raises(AnthropicError) as error:
+        await BaseLLMHTTPHandler()._make_common_async_call(
+            async_httpx_client=client, provider_config=config, api_base=str(response.request.url), headers={},
+            data={"model": "claude-test"}, timeout=60, litellm_params={}, logging_obj=Mock(),
+        )
+    assert error.value.status_code == 422
+    client.post.assert_awaited_once()
+    config.transform_request_on_unprocessable_entity_error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_common_anthropic_401_closes_response_when_recovery_is_cancelled():
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    rejected = httpx.Response(
+        401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+    rejected.aclose = AsyncMock(wraps=rejected.aclose)
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(return_value=rejected)
+
+    with patch(
+        "litellm.llms.custom_httpx.llm_http_handler._recover_managed_anthropic_oauth_headers",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await BaseLLMHTTPHandler()._make_common_async_call(
+                async_httpx_client=client,
+                provider_config=AnthropicConfig(),
+                api_base="https://api.anthropic.com/v1/messages",
+                headers={"authorization": "Bearer sk-ant-oat01-old"},
+                data={"model": "claude-test"},
+                timeout=60,
+                litellm_params={"litellm_credential_name": "managed"},
+                logging_obj=Mock(),
+                stream=True,
+            )
+
+    rejected.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

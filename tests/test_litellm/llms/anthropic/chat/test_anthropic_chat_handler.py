@@ -212,6 +212,7 @@ async def test_refresh_failure_is_sanitized_and_preserves_status():
             raise RefreshFailure("secret refresh token must not escape")
 
     response = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    response.aclose = AsyncMock(wraps=response.aclose)
     client = AsyncMock()
     client.post = AsyncMock(return_value=response)
     hook = FailingHook()
@@ -237,6 +238,7 @@ async def test_refresh_failure_is_sanitized_and_preserves_status():
     assert "secret refresh token" not in str(caught.value)
     assert getattr(caught.value, "headers", {}).get("Retry-After") == "2"
     assert client.post.await_count == 1
+    response.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

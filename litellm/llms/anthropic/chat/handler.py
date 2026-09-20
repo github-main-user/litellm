@@ -116,10 +116,14 @@ async def make_call(
                 break
             except httpx.HTTPStatusError as error:
                 if attempt == 0 and error.response.status_code == 401:
-                    refreshed_headers = await _recover_managed_anthropic_oauth(
-                        headers=request_headers,
-                        credential_name=credential_name,
-                    )
+                    try:
+                        refreshed_headers = await _recover_managed_anthropic_oauth(
+                            headers=request_headers,
+                            credential_name=credential_name,
+                        )
+                    except BaseException:
+                        await error.response.aclose()
+                        raise
                     if refreshed_headers is not None:
                         await error.response.aclose()
                         request_headers = refreshed_headers
