@@ -541,11 +541,13 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             ):
                 raise ValueError("Credential authentication type changed")
             stored: Final = _tokens_from_row(row)
+            if (stored.account_id or credential_name) != identity:
+                raise ValueError("Anthropic account identity changed before refresh")
             token_was_rotated: Final = (
                 rejected_access_token is not None and stored.access_token != rejected_access_token
             )
-            should_refresh: Final = not token_was_rotated and (
-                rejected_access_token is not None or not self._is_fresh(stored)
+            should_refresh: Final = not self._is_fresh(stored) or (
+                rejected_access_token is not None and not token_was_rotated
             )
             refreshed: Final = await self._oauth_client.refresh(stored) if should_refresh else stored
             if should_refresh:

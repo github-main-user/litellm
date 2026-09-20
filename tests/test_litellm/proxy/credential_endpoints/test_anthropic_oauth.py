@@ -647,3 +647,44 @@ async def test_recovery_ignores_api_keys_and_preserves_transient_refresh_error()
     assert caught.value is transient
     assert caught.value.response_headers == {"Retry-After": "9"}
     client.refresh.assert_awaited_once_with(rejected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_account,expires_in", [("account-b", 3600), ("account-a", -1), ("account-a", 3600)])
+async def test_recovery_rechecks_stored_account_and_expiry(stored_account: str, expires_in: int) -> None:
+    rejected = AnthropicOAuthTokens("sk-ant-oat-rejected", "refresh-old", time.time() + 3600, "account-a")
+    stored = AnthropicOAuthTokens("sk-ant-oat-rotated", "refresh-rotated", time.time() + expires_in, stored_account)
+    refreshed = AnthropicOAuthTokens("sk-ant-oat-recovered", "refresh-new", time.time() + 3600, stored_account)
+    database = _AdvisoryLockDatabase(
+        SimpleNamespace(
+            credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: stored.to_json()},
+            credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        )
+    )
+    client = MagicMock()
+    client.refresh = AsyncMock(return_value=refreshed)
+    with (
+        patch.object(litellm, "credential_list", [_credential("subscription", rejected)]),
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch(
+            "litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper",
+            side_effect=lambda value, *args, **kwargs: value,
+        ),
+        patch(
+            "litellm.proxy.credential_endpoints.anthropic_oauth.encrypt_value_helper", side_effect=lambda value: value
+        ),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type", AsyncMock()),
+    ):
+        hook = AnthropicOAuthCredentialHook(client)
+        if stored_account != rejected.account_id:
+            with pytest.raises(ValueError, match="account identity changed"):
+                await hook.recover_rejected_token("subscription", rejected.access_token)
+            client.refresh.assert_not_awaited()
+        else:
+            result = await hook.recover_rejected_token("subscription", rejected.access_token)
+            if expires_in < 0:
+                assert result == refreshed.access_token
+                client.refresh.assert_awaited_once_with(stored)
+            else:
+                assert result == stored.access_token
+                client.refresh.assert_not_awaited()
