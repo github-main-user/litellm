@@ -47,6 +47,10 @@ from litellm.litellm_core_utils.llm_request_utils import serialize_multipart_for
 from litellm.litellm_core_utils.realtime_errors import realtime_error_event, websocket_close_reason
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
+from litellm.llms.anthropic.oauth_client import AnthropicOAuthError as _ManagedAnthropicOAuthRecoveryError
+from litellm.llms.anthropic.oauth_client import (
+    recover_managed_anthropic_oauth_headers as _recover_managed_anthropic_oauth_headers,
+)
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
 )
@@ -259,6 +263,10 @@ def _responses_api_optional_request_param_names() -> frozenset[str]:
     return frozenset(get_type_hints(ResponsesAPIOptionalRequestParams).keys())
 
 
+def _is_native_anthropic_config(provider_config: object) -> bool:
+    return provider_config.__class__.__module__.startswith("litellm.llms.anthropic.")
+
+
 def _custom_logger_callbacks(logging_obj: LiteLLMLoggingObj) -> list["CustomLogger"]:
     from litellm.integrations.custom_logger import CustomLogger
     from litellm.litellm_core_utils.litellm_logging import (
@@ -395,16 +403,44 @@ class BaseLLMHTTPHandler:
         max_retry_on_unprocessable_entity_error: Final = provider_config.max_retry_on_unprocessable_entity_error
 
         response: httpx.Response | None = None
+        oauth_retried = False
+        request_headers = headers
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
-                response = await async_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    data=(signed_json_body if signed_json_body is not None else json.dumps(data)),
-                    timeout=timeout,
-                    stream=stream,
-                    logging_obj=logging_obj,
-                )
+                while True:
+                    try:
+                        response = await async_httpx_client.post(
+                            url=api_base,
+                            headers=request_headers,
+                            data=(signed_json_body if signed_json_body is not None else json.dumps(data)),
+                            timeout=timeout,
+                            stream=stream,
+                            logging_obj=logging_obj,
+                        )
+                        response.raise_for_status()
+                        break
+                    except httpx.HTTPStatusError as error:
+                        if (
+                            not oauth_retried
+                            and error.response.status_code == 401
+                            and _is_native_anthropic_config(provider_config)
+                        ):
+                            refreshed_headers = await _recover_managed_anthropic_oauth_headers(
+                                headers=request_headers,
+                                litellm_params=litellm_params,
+                            )
+                            if refreshed_headers is not None:
+                                await error.response.aclose()
+                                oauth_retried = True
+                                request_headers = refreshed_headers
+                                continue
+                        raise
+            except _ManagedAnthropicOAuthRecoveryError as error:
+                raise provider_config.get_error_class(
+                    error_message=str(error),
+                    status_code=error.status_code,
+                    headers=error.headers,
+                ) from None
             except httpx.HTTPStatusError as e:
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
@@ -2145,18 +2181,40 @@ class BaseLLMHTTPHandler:
         max_attempts: Final = max(provider_config.max_retry_on_anthropic_messages_http_error, 1)
         litellm_params_dict: Final = dict(litellm_params)
         optional_params_dict: Final = dict(litellm_params)
+        oauth_retried = False
+        request_headers = headers
         for attempt_idx in range(max_attempts):
             try:
-                response = await async_httpx_client.post(
-                    url=request_url,
-                    headers=headers,
-                    data=signed_json_body or json.dumps(request_body),
-                    stream=stream or False,
-                    logging_obj=logging_obj,
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-                return response
+                while True:
+                    try:
+                        response = await async_httpx_client.post(
+                            url=request_url,
+                            headers=request_headers,
+                            data=signed_json_body or json.dumps(request_body),
+                            stream=stream or False,
+                            logging_obj=logging_obj,
+                            timeout=timeout,
+                        )
+                        response.raise_for_status()
+                        return response
+                    except httpx.HTTPStatusError as error:
+                        if not oauth_retried and error.response.status_code == 401:
+                            refreshed_headers = await _recover_managed_anthropic_oauth_headers(
+                                headers=request_headers,
+                                litellm_params=litellm_params_dict,
+                            )
+                            if refreshed_headers is not None:
+                                await error.response.aclose()
+                                oauth_retried = True
+                                request_headers = refreshed_headers
+                                continue
+                        raise
+            except _ManagedAnthropicOAuthRecoveryError as error:
+                raise provider_config.get_error_class(
+                    error_message=str(error),
+                    status_code=error.status_code,
+                    headers=error.headers,
+                ) from None
             except httpx.HTTPStatusError as e:
                 hit_max_attempt = attempt_idx + 1 == max_attempts
                 should_retry = provider_config.should_retry_anthropic_messages_on_http_error(
@@ -2175,7 +2233,7 @@ class BaseLLMHTTPHandler:
                     headers, signed_json_body = await sign_request_off_loop_if_aws(
                         provider_config,
                         provider_config.sign_request,
-                        headers=headers,
+                        headers=request_headers,
                         optional_params=optional_params_dict,
                         request_data=request_body,
                         api_base=request_url,
@@ -2184,6 +2242,7 @@ class BaseLLMHTTPHandler:
                         fake_stream=False,
                         model=model,
                     )
+                    request_headers = headers
                     logging_obj.model_call_details.update(request_body)
                     continue
                 raise self._handle_error(e=e, provider_config=provider_config)
@@ -2312,6 +2371,11 @@ class BaseLLMHTTPHandler:
                     anthropic_messages_optional_request_params, path
                 )
 
+        from litellm.llms.anthropic.subscription_tools import (
+            ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY,
+            tool_name_reverse_map,
+        )
+
         # Prepare request body
         request_body: Final = anthropic_messages_provider_config.transform_anthropic_messages_request(
             model=model,
@@ -2319,6 +2383,9 @@ class BaseLLMHTTPHandler:
             anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
             litellm_params=litellm_params,
             headers=headers,
+        )
+        response_tool_names: Final = tool_name_reverse_map(
+            cast(object, getattr(litellm_params, ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, None))
         )
         logging_obj.stream = stream
         logging_obj.model_call_details.update(request_body)
@@ -2386,6 +2453,9 @@ class BaseLLMHTTPHandler:
                 custom_llm_provider=custom_llm_provider,
             ),
         )
+
+        if response_tool_names:
+            response.extensions[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = response_tool_names
 
         # used for logging + cost tracking
         logging_obj.model_call_details["httpx_response"] = response

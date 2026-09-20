@@ -6451,3 +6451,190 @@ def test_eager_input_streaming_reaches_anthropic_request_tools():
 
     assert result["tools"][0]["eager_input_streaming"] is True
     assert result["tools"][0]["name"] == "write_file"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_subscription_transform_preserves_tool_exchange_without_mutating_input(stream):
+    from copy import deepcopy
+
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+
+    config = AnthropicConfig()
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Use tools carefully", "cache_control": {"type": "ephemeral"}}
+            ],
+        },
+        {"role": "user", "content": "Check weather"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_weather_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_weather_1", "content": "sunny"},
+    ]
+    original = deepcopy(messages)
+
+    result = config.transform_request(
+        model="claude-sonnet-4-6",
+        messages=messages,
+        optional_params={
+            "stream": stream,
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ],
+        },
+        litellm_params={},
+        headers={"authorization": "Bearer sk-ant-oat01-test"},
+    )
+
+    assert result["system"][0] == {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
+    assert result["system"][1] == original[0]["content"][0]
+    content_blocks = [
+        block
+        for message in result["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+    ]
+    tool_use = next(block for block in content_blocks if block["type"] == "tool_use")
+    tool_result = next(block for block in content_blocks if block["type"] == "tool_result")
+    assert tool_use["id"] == tool_result["tool_use_id"] == "call_weather_1"
+    assert result["stream"] is stream
+    assert messages == original
+
+
+def test_api_key_transform_does_not_add_subscription_identity():
+    config = AnthropicConfig()
+    result = config.transform_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "system", "content": "Original"}, {"role": "user", "content": "Hi"}],
+        optional_params={},
+        litellm_params={},
+        headers={"x-api-key": "sk-ant-api03-test"},
+    )
+
+    assert result["system"] == [{"type": "text", "text": "Original"}]
+
+
+def test_native_messages_subscription_transform_adds_identity_without_changing_blocks():
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+
+    original_system = [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
+    original_params = {"max_tokens": 100, "system": original_system}
+    result = AnthropicMessagesConfig().transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "Hi"}],
+        anthropic_messages_optional_request_params=original_params,
+        litellm_params={},
+        headers={"authorization": "Bearer sk-ant-oat01-test"},
+    )
+
+    assert result["system"] == [
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+        original_system[0],
+    ]
+    assert original_system == [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
+    api_key_result = AnthropicMessagesConfig().transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "Hi"}],
+        anthropic_messages_optional_request_params=original_params,
+        litellm_params={},
+        headers={"x-api-key": "sk-ant-api03-test"},
+    )
+    assert api_key_result["system"] == original_system
+    assert original_params == {"max_tokens": 100, "system": original_system}
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+def test_subscription_tool_names_round_trip_through_chat_and_stream(oauth):
+    from copy import deepcopy
+
+    import httpx
+
+    from litellm.llms.anthropic.chat.handler import ModelResponseIterator
+    from litellm.llms.anthropic.subscription_tools import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY
+    from litellm.types.utils import ModelResponse
+
+    config = AnthropicConfig()
+    messages = [
+        {"role": "user", "content": "Read the file"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_read", "type": "function", "function": {"name": "read", "arguments": '{}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "toolu_read", "content": "File contents"},
+    ]
+    tools = [
+        {"type": "custom", "name": name, "input_schema": {"type": "object"}}
+        for name in ("read", "extra/read")
+    ]
+    original = deepcopy((messages, tools))
+    params = {ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY: {"Read": "stale_from_another_attempt"}}
+    body = config.transform_request(
+        model="claude-sonnet-5",
+        messages=messages,
+        optional_params={"tools": tools, "tool_choice": {"type": "tool", "name": "read"}},
+        litellm_params=params,
+        headers={"authorization": "Bearer sk-ant-oat01-test"} if oauth else {"x-api-key": "sk-test"},
+    )
+    wire_name = "Read" if oauth else "read"
+    assert [tool["name"] for tool in body["tools"]] == [wire_name, "extra_read"]
+    assert body["tool_choice"]["name"] == wire_name
+    history_calls = [
+        block for message in body["messages"] for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
+    assert history_calls[0]["name"] == wire_name
+    assert (messages, tools) == original
+    assert ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY not in body
+    blocks = [
+        {"type": "tool_use", "id": f"toolu_{index}", "name": name, "input": {"name": "Read"}}
+        for index, name in enumerate((wire_name, "extra_read"))
+    ]
+    upstream = httpx.Response(200, json={
+        "id": "msg_tools", "model": "claude-sonnet-5", "stop_reason": "tool_use",
+        "content": blocks, "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    result = config.transform_response(
+        model="claude-sonnet-5", raw_response=upstream, model_response=ModelResponse(),
+        logging_obj=MagicMock(), request_data=body, messages=messages, optional_params={},
+        litellm_params=params, encoding=None,
+    )
+    assert [call.function.name for call in result.choices[0].message.tool_calls] == ["read", "extra/read"]
+    iterator = ModelResponseIterator(
+        streaming_response=iter([]), sync_stream=True,
+        tool_name_reverse_map=params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY],
+    )
+    chunk = iterator.chunk_parser({"type": "content_block_start", "index": 0, "content_block": blocks[0]})
+    assert chunk.choices[0].delta.tool_calls[0]["function"]["name"] == "read"
+
+
+def test_subscription_normalization_does_not_contaminate_api_key_fallback():
+    from litellm.llms.anthropic.subscription_tools import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY
+
+    config = AnthropicConfig()
+    params = {}
+    optional = {"tools": [{"type": "custom", "name": "read", "input_schema": {"type": "object"}}]}
+    oauth_body = config.transform_request(
+        model="claude-sonnet-5", messages=[{"role": "user", "content": "Read"}],
+        optional_params=optional, litellm_params=params,
+        headers={"authorization": "Bearer sk-ant-oat01-test"},
+    )
+    api_body = config.transform_request(
+        model="claude-sonnet-5", messages=[{"role": "user", "content": "Read"}],
+        optional_params=optional, litellm_params=params, headers={"x-api-key": "sk-test"},
+    )
+    assert oauth_body["tools"][0]["name"] == "Read"
+    assert api_body["tools"][0]["name"] == "read"
+    assert ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY not in params

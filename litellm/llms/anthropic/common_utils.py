@@ -75,6 +75,10 @@ _CLAUDE_CODE_OBJECT_LIST_ADAPTER: Final = TypeAdapter(list[object])
 
 
 _CLAUDE_CODE_USER_AGENT_PREFIXES: Final = ("claude-cli/", "claude-code/")
+ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
+ANTHROPIC_SUBSCRIPTION_APP_HEADER: Final = "cli"
+ANTHROPIC_SUBSCRIPTION_BETA_HEADER: Final = "claude-code-20250219"
+ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.278 (external, cli)"
 
 
 def supports_anthropic_cache_control(model: str, custom_llm_provider: str | None) -> bool:
@@ -211,6 +215,65 @@ def _merge_beta_headers(existing: str | None, new_beta: str) -> str:
     return ",".join(sorted(betas))
 
 
+def _subscription_user_agent_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {
+        **{name: value for name, value in headers.items() if name.lower() != "user-agent"},
+        "user-agent": ANTHROPIC_SUBSCRIPTION_USER_AGENT,
+    }
+
+
+def is_anthropic_subscription_request(headers: Mapping[object, object]) -> bool:
+    authorization: Final = next(
+        (
+            value
+            for name, value in headers.items()
+            if isinstance(name, str) and name.lower() == "authorization" and isinstance(value, str)
+        ),
+        None,
+    )
+    return is_anthropic_oauth_key(authorization)
+
+
+def prepare_anthropic_subscription_system(system: object) -> list[object]:
+    identity: Final = {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
+    if system is None:
+        return [identity]
+    blocks: Final = (
+        [{"type": "text", "text": system}]
+        if isinstance(system, str)
+        else list(system)
+        if isinstance(system, Sequence)
+        else [system]
+    )
+    identity_blocks: Final = [
+        block
+        for block in blocks
+        if isinstance(block, Mapping)
+        and block.get("type") == "text"
+        and block.get("text") == ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+    ]
+    remaining_blocks: Final = [
+        block
+        for block in blocks
+        if not (
+            isinstance(block, Mapping)
+            and block.get("type") == "text"
+            and block.get("text") == ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+        )
+    ]
+    first_identity: Final = identity_blocks[0] if identity_blocks else identity
+    billing_blocks: Final = [
+        block
+        for block in remaining_blocks
+        if isinstance(block, Mapping)
+        and block.get("type") == "text"
+        and isinstance(text := block.get("text"), str)
+        and text.startswith(_CLAUDE_CODE_BILLING_HEADER_PREFIX)
+    ]
+    instructions: Final = [block for block in remaining_blocks if block not in billing_blocks]
+    return [*billing_blocks, first_identity, *instructions]
+
+
 def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tuple[dict, str | None]:
     """
     Handle Anthropic OAuth token detection and header setup.
@@ -234,16 +297,25 @@ def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tup
         ):
             headers.pop(name)
         headers["authorization"] = auth_header
-        headers["anthropic-beta"] = _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER)
+        headers["anthropic-beta"] = _merge_beta_headers(
+            _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER),
+            ANTHROPIC_SUBSCRIPTION_BETA_HEADER,
+        )
         headers["anthropic-dangerous-direct-browser-access"] = "true"
-        return headers, api_key
+        headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
+        return _subscription_user_agent_headers(headers), api_key
     # Check api_key directly (standard chat/completion flow)
     if api_key and api_key.startswith(ANTHROPIC_OAUTH_TOKEN_PREFIX):
         for name in tuple(header_name for header_name in headers if header_name.lower() == "x-api-key"):
             headers.pop(name)
         headers["authorization"] = f"Bearer {api_key}"
-        headers["anthropic-beta"] = _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER)
+        headers["anthropic-beta"] = _merge_beta_headers(
+            _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER),
+            ANTHROPIC_SUBSCRIPTION_BETA_HEADER,
+        )
         headers["anthropic-dangerous-direct-browser-access"] = "true"
+        headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
+        return _subscription_user_agent_headers(headers), api_key
     return headers, api_key
 
 
@@ -936,7 +1008,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         if _is_oauth:
             headers["authorization"] = f"Bearer {api_key}"
             headers["anthropic-dangerous-direct-browser-access"] = "true"
+            headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
+            headers["user-agent"] = ANTHROPIC_SUBSCRIPTION_USER_AGENT
             betas.add(ANTHROPIC_OAUTH_BETA_HEADER)
+            betas.add(ANTHROPIC_SUBSCRIPTION_BETA_HEADER)
         elif auth_token and not api_key:
             headers["authorization"] = f"Bearer {auth_token}"
         elif api_key:
@@ -1025,7 +1100,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
         headers = {**headers, **anthropic_headers}
 
-        return headers
+        return _subscription_user_agent_headers(headers) if is_anthropic_oauth_key(api_key) else headers
 
     @staticmethod
     def get_api_base(api_base: str | None = None) -> str | None:

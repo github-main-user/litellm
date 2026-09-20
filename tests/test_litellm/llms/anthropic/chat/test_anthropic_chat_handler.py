@@ -50,6 +50,230 @@ async def test_make_call_passes_logging_obj_to_client_post():
     assert call_kwargs.get("logging_obj") is logging_obj
 
 
+class _RecoveringOAuthHook:
+    def __init__(self, recovered: str = "sk-ant-oat01-fresh") -> None:
+        self.recovered = recovered
+        self.calls: list[tuple[str, str]] = []
+
+    async def recover_rejected_token(self, credential_name: str, rejected_access_token: str) -> str:
+        self.calls.append((credential_name, rejected_access_token))
+        return self.recovered
+
+
+@pytest.mark.asyncio
+async def test_stream_401_recovers_managed_oauth_once_before_output():
+    rejected = httpx.Response(
+        401,
+        content=b'{"error":"expired"}',
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    accepted = httpx.Response(
+        200,
+        content=b'data: {"type":"message_stop"}\n\n',
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[rejected, accepted])
+    hook = _RecoveringOAuthHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        await make_call(
+            client=client,
+            api_base="https://api.anthropic.com/v1/messages",
+            headers={"Authorization": "Bearer sk-ant-oat01-rejected"},
+            data="{}",
+            model="claude-test",
+            messages=[],
+            logging_obj=MagicMock(),
+            timeout=60,
+            json_mode=False,
+            credential_name="managed-one",
+        )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert hook.calls == [("managed-one", "sk-ant-oat01-rejected")]
+    assert client.post.await_count == 2
+    assert client.post.await_args_list[1].kwargs["headers"]["Authorization"] == "Bearer sk-ant-oat01-fresh"
+
+
+@pytest.mark.asyncio
+async def test_stream_recovers_when_http_client_raises_status_error_directly():
+    rejected = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        rejected.raise_for_status()
+    accepted = httpx.Response(200, content=b"", request=rejected.request)
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[raised.value, accepted])
+    hook = _RecoveringOAuthHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        await make_call(
+            client=client,
+            api_base="https://api.anthropic.com/v1/messages",
+            headers={"authorization": "Bearer sk-ant-oat01-rejected"},
+            data="{}",
+            model="claude-test",
+            messages=[],
+            logging_obj=MagicMock(),
+            timeout=60,
+            json_mode=False,
+            credential_name="managed-one",
+        )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert client.post.await_count == 2
+    assert hook.calls == [("managed-one", "sk-ant-oat01-rejected")]
+
+
+@pytest.mark.asyncio
+async def test_async_nonstream_401_recovers_managed_oauth():
+    from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
+
+    rejected = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    accepted = httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[rejected, accepted])
+    provider_config = MagicMock()
+    provider_config.transform_response.return_value = "transformed"
+    hook = _RecoveringOAuthHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        result = await AnthropicChatCompletion().acompletion_function(
+            model="claude-test",
+            messages=[],
+            api_base="https://api.anthropic.com/v1/messages",
+            custom_prompt_dict={},
+            model_response=MagicMock(),
+            print_verbose=MagicMock(),
+            timeout=60,
+            encoding=None,
+            api_key="sk-ant-oat01-rejected",
+            logging_obj=MagicMock(),
+            stream=False,
+            _is_function_call=False,
+            data={"max_tokens": 1},
+            optional_params={},
+            json_mode=False,
+            litellm_params={"litellm_credential_name": "managed-one"},
+            provider_config=provider_config,
+            headers={"authorization": "Bearer sk-ant-oat01-rejected"},
+            client=client,
+        )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert result == "transformed"
+    assert hook.calls == [("managed-one", "sk-ant-oat01-rejected")]
+    assert client.post.await_args_list[1].kwargs["headers"]["authorization"] == "Bearer sk-ant-oat01-fresh"
+
+
+@pytest.mark.asyncio
+async def test_stream_second_401_stops_without_another_refresh():
+    responses = [
+        httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+        for _ in range(2)
+    ]
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=responses)
+    hook = _RecoveringOAuthHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        with pytest.raises(Exception) as caught:
+            await make_call(
+                client=client,
+                api_base="https://api.anthropic.com/v1/messages",
+                headers={"authorization": "Bearer sk-ant-oat01-rejected"},
+                data="{}",
+                model="claude-test",
+                messages=[],
+                logging_obj=MagicMock(),
+                timeout=60,
+                json_mode=False,
+                credential_name="managed-one",
+            )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert getattr(caught.value, "status_code", None) == 401
+    assert hook.calls == [("managed-one", "sk-ant-oat01-rejected")]
+    assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_is_sanitized_and_preserves_status():
+    class RefreshFailure(RuntimeError):
+        status_code = 503
+        response_headers = {"Retry-After": "2"}
+
+    class FailingHook:
+        async def recover_rejected_token(self, credential_name, rejected_access_token):
+            raise RefreshFailure("secret refresh token must not escape")
+
+    response = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=response)
+    hook = FailingHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        with pytest.raises(Exception) as caught:
+            await make_call(
+                client=client,
+                api_base="https://api.anthropic.com/v1/messages",
+                headers={"authorization": "Bearer sk-ant-oat01-rejected"},
+                data="{}",
+                model="claude-test",
+                messages=[],
+                logging_obj=MagicMock(),
+                timeout=60,
+                json_mode=False,
+                credential_name="managed-one",
+            )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert getattr(caught.value, "status_code", None) == 503
+    assert "secret refresh token" not in str(caught.value)
+    assert getattr(caught.value, "headers", {}).get("Retry-After") == "2"
+    assert client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "credential_name"),
+    [
+        ({"x-api-key": "sk-ant-api01-ordinary"}, "managed-one"),
+        ({"authorization": "Bearer sk-ant-oat01-raw"}, None),
+    ],
+)
+async def test_stream_401_does_not_refresh_unmanaged_keys(headers, credential_name):
+    response = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=response)
+    hook = _RecoveringOAuthHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        with pytest.raises(Exception):
+            await make_call(
+                client=client,
+                api_base="https://api.anthropic.com/v1/messages",
+                headers=headers,
+                data="{}",
+                model="claude-test",
+                messages=[],
+                logging_obj=MagicMock(),
+                timeout=60,
+                json_mode=False,
+                credential_name=credential_name,
+            )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert hook.calls == []
+    assert client.post.await_count == 1
+
+
 def test_anthropic_completion_does_not_send_deployment_default_limits():
     captured_requests: list[httpx.Request] = []
 

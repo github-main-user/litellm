@@ -69,6 +69,19 @@ def _loads_stream_chunk(payload: str) -> dict[str, object]:
     return json.loads(payload)
 
 
+async def _recover_managed_anthropic_oauth(
+    *, headers: Mapping[str, object], credential_name: object
+) -> dict[str, object] | None:
+    from litellm.llms.anthropic.oauth_client import AnthropicOAuthError, recover_managed_anthropic_oauth_headers
+
+    try:
+        return await recover_managed_anthropic_oauth_headers(
+            headers=headers, litellm_params={"litellm_credential_name": credential_name}
+        )
+    except AnthropicOAuthError as error:
+        raise AnthropicError(status_code=error.status_code, message=str(error), headers=error.headers) from None
+
+
 async def make_call(
     client: AsyncHTTPHandler | None,
     api_base: str,
@@ -81,19 +94,39 @@ async def make_call(
     json_mode: bool,
     speed: str | None = None,
     tool_name_reverse_map: dict[str, str] | None = None,
+    credential_name: str | None = None,
 ) -> tuple["ModelResponseIterator", httpx.Headers]:
     if client is None:
         client = litellm.module_level_aclient
 
     try:
-        response: Final = await client.post(
-            api_base,
-            headers=headers,
-            data=data,
-            stream=True,
-            timeout=timeout,
-            logging_obj=logging_obj,
-        )
+        response = None
+        request_headers = headers
+        for attempt in range(2):
+            try:
+                response = await client.post(
+                    api_base,
+                    headers=request_headers,
+                    data=data,
+                    stream=True,
+                    timeout=timeout,
+                    logging_obj=logging_obj,
+                )
+                response.raise_for_status()
+                break
+            except httpx.HTTPStatusError as error:
+                if attempt == 0 and error.response.status_code == 401:
+                    refreshed_headers = await _recover_managed_anthropic_oauth(
+                        headers=request_headers,
+                        credential_name=credential_name,
+                    )
+                    if refreshed_headers is not None:
+                        await error.response.aclose()
+                        request_headers = refreshed_headers
+                        continue
+                raise
+        if response is None:  # pragma: no cover - the bounded loop always returns or raises
+            raise RuntimeError("Anthropic request completed without a response")
     except httpx.HTTPStatusError as e:
         error_headers = getattr(e, "headers", None)
         error_response: Final[object] = getattr(e, "response", None)
@@ -104,6 +137,8 @@ async def make_call(
             message=await e.response.aread(),
             headers=error_headers,
         )
+    except AnthropicError:
+        raise
     except Exception as e:
         for exception in litellm.LITELLM_EXCEPTION_TYPES:
             if isinstance(e, exception):
@@ -241,6 +276,9 @@ class AnthropicChatCompletion(BaseLLM):
             tool_name_reverse_map=(
                 litellm_params.get(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY) if isinstance(litellm_params, dict) else None
             ),
+            credential_name=(
+                litellm_params.get("litellm_credential_name") if isinstance(litellm_params, dict) else None
+            ),
         )
         streamwrapper: Final = CustomStreamWrapper(
             completion_stream=completion_stream,
@@ -277,13 +315,33 @@ class AnthropicChatCompletion(BaseLLM):
         async_handler: Final = client or get_async_httpx_client(llm_provider=litellm.LlmProviders.ANTHROPIC)
 
         try:
-            response: Final = await async_handler.post(
-                api_base,
-                headers=headers,
-                json=data,
-                timeout=timeout,
-                logging_obj=logging_obj,
-            )
+            response = None
+            request_headers = headers
+            credential_name = litellm_params.get("litellm_credential_name")
+            for attempt in range(2):
+                try:
+                    response = await async_handler.post(
+                        api_base,
+                        headers=request_headers,
+                        json=data,
+                        timeout=timeout,
+                        logging_obj=logging_obj,
+                    )
+                    response.raise_for_status()
+                    break
+                except httpx.HTTPStatusError as error:
+                    if attempt == 0 and error.response.status_code == 401:
+                        refreshed_headers = await _recover_managed_anthropic_oauth(
+                            headers=request_headers,
+                            credential_name=credential_name,
+                        )
+                        if refreshed_headers is not None:
+                            await error.response.aclose()
+                            request_headers = refreshed_headers
+                            continue
+                    raise
+            if response is None:  # pragma: no cover - the bounded loop always returns or raises
+                raise RuntimeError("Anthropic request completed without a response")
         except Exception as e:
             ## LOGGING
             logging_obj.post_call(

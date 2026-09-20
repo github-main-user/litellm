@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 import time
@@ -95,9 +96,14 @@ from ..common_utils import (
     AnthropicError,
     AnthropicModelInfo,
     eager_input_streaming_flag,
+    is_anthropic_subscription_request,
+    prepare_anthropic_subscription_system,
     process_anthropic_headers,
     strip_advisor_blocks_from_messages,
 )
+from ..subscription_identity import get_subscription_identity, prepare_subscription_identity
+from ..subscription_tools import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY as _TOOL_NAME_MAP_KEY
+from ..subscription_tools import prepare_subscription_tools
 
 if TYPE_CHECKING:
     import tiktoken
@@ -182,7 +188,7 @@ def _enum_conflicts_with_declared_type(schema: Mapping[str, Any]) -> bool:
 # params`` IS (it becomes the JSON body via ``data = {**optional_params}``).
 # Keep these two channels strictly separate -- never stash internal
 # coordination state in ``optional_params``.
-ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY: Final = "_anthropic_tool_name_map"
+ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY: Final = _TOOL_NAME_MAP_KEY
 
 
 def _basic_sanitize_anthropic_tool_name(name: str) -> str:
@@ -1893,6 +1899,11 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             anthropic_messages_pt,
         )
 
+        subscription_request: Final = is_anthropic_subscription_request(headers)
+        cast(dict[str, object], litellm_params).pop(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, None)
+        request_messages: Final = copy.deepcopy(messages)
+        messages = request_messages
+
         if "tools" not in optional_params and messages is not None and has_tool_call_blocks(messages):
             optional_params["tools"], _ = self._map_tools(add_dummy_tool(custom_llm_provider="anthropic"))
 
@@ -1960,7 +1971,12 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = _name_reverse_map
 
         # Separate system prompt from rest of message
-        anthropic_system_message_list: Final = self.translate_system_message(messages=messages)
+        translated_system_message_list: Final = self.translate_system_message(messages=messages)
+        anthropic_system_message_list: Final = (
+            prepare_anthropic_subscription_system(translated_system_message_list)
+            if subscription_request
+            else translated_system_message_list
+        )
         # Handling anthropic API Prompt Caching
         if len(anthropic_system_message_list) > 0:
             optional_params["system"] = anthropic_system_message_list
@@ -2049,6 +2065,21 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
         self._apply_output_config(data=data, model=model, optional_params=optional_params)
 
+        if subscription_request:
+            subscription_body, subscription_reverse = prepare_subscription_tools(cast(Mapping[str, object], data))
+            litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = {
+                **_name_reverse_map,
+                **{wire: _name_reverse_map.get(original, original) for wire, original in subscription_reverse.items()},
+            }
+            identity_body, identity_headers = prepare_subscription_identity(
+                subscription_body,
+                cast(Mapping[str, object], headers),
+                cast(Mapping[str, object], litellm_params),
+                get_subscription_identity(litellm_params.get("litellm_credential_name")),
+            )
+            headers.clear()
+            headers.update(identity_headers)
+            return identity_body
         return data
 
     def _apply_output_config(self, data: dict, model: str, optional_params: dict) -> None:

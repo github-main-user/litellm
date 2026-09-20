@@ -4007,3 +4007,211 @@ async def test_async_realtime_bridges_a_transcription_session_through_the_provid
     assert events[6]["usage"] == {"type": "duration", "seconds": 2.0}
     assert speech_client.requests[0].streaming_config.config.model == "chirp_3"
     assert [bytes(request.audio) for request in speech_client.requests[1:]] == [b"\x00\x01" * 800, b"\x00\x01" * 800]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oauth", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_subscription_tool_names_round_trip_at_http_boundary(oauth, stream):
+    import json
+    from copy import deepcopy
+
+    from openai._streaming import SSEDecoder
+
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.anthropic.subscription_tools import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY
+
+    wire_name = "Read" if oauth else "read"
+    block = {"type": "tool_use", "id": "toolu_read", "name": wire_name, "input": {"name": "Read"}}
+    response_body = {
+        "id": "msg_read", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "content": [block], "stop_reason": "tool_use", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    events = [
+        {"type": "message_start", "message": {**response_body, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": block},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    ]
+    content = (
+        "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        if stream else json.dumps(response_body)
+    )
+    upstream = httpx.Response(
+        200, content=content,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(return_value=upstream)
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+    logging_obj.dynamic_success_callbacks = []
+    messages = [{"role": "user", "content": "Read the file"}]
+    optional = {
+        "max_tokens": 32,
+        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "tool", "name": "read"},
+    }
+    original = deepcopy((messages, optional))
+    params = GenericLiteLLMParams()
+    params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = {"Read": "stale_from_another_attempt"}
+    result = await BaseLLMHTTPHandler().async_anthropic_messages_handler(
+        model="claude-sonnet-5", messages=messages,
+        anthropic_messages_provider_config=AnthropicMessagesConfig(),
+        anthropic_messages_optional_request_params=optional,
+        custom_llm_provider="anthropic", litellm_params=params,
+        logging_obj=logging_obj, client=client,
+        api_key="sk-ant-oat01-test" if oauth else "sk-test", stream=stream, kwargs={},
+    )
+    sent = json.loads(client.post.await_args.kwargs["data"])
+    assert sent["tools"][0]["name"] == wire_name
+    assert sent["tool_choice"]["name"] == wire_name
+    assert ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY not in sent
+    assert (messages, optional) == original
+    if stream:
+        chunks = [chunk async for chunk in result]
+        parsed = [event.json() for event in SSEDecoder().iter_bytes(iter(chunks))]
+        restored_block = next(event["content_block"] for event in parsed if event["type"] == "content_block_start")
+    else:
+        restored_block = result["content"][0]
+    assert restored_block == {**block, "name": "read"}
+
+
+class _NativeMessagesRecoveringHook:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def recover_rejected_token(self, credential_name, rejected_access_token):
+        self.calls.append((credential_name, rejected_access_token))
+        return "sk-ant-oat01-native-fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_common_anthropic_chat_401_recovers_for_stream_and_nonstream(stream):
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    responses = [
+        httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+        httpx.Response(200, content=b"ok", request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+    ]
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(side_effect=responses)
+    hook = _NativeMessagesRecoveringHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        response = await BaseLLMHTTPHandler()._make_common_async_call(
+            async_httpx_client=client,
+            provider_config=AnthropicConfig(),
+            api_base="https://api.anthropic.com/v1/messages",
+            headers={"Authorization": "Bearer sk-ant-oat01-common-old"},
+            data={"model": "claude-test"},
+            timeout=60,
+            litellm_params={"litellm_credential_name": "managed-common"},
+            logging_obj=Mock(),
+            stream=stream,
+        )
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert response.status_code == 200
+    assert hook.calls == [("managed-common", "sk-ant-oat01-common-old")]
+    assert client.post.await_count == 2
+    assert client.post.await_args_list[1].kwargs["headers"]["Authorization"] == "Bearer sk-ant-oat01-native-fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_messages_401_recovers_once_before_stream_or_body(stream):
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    body = {
+        "id": "msg_recovered",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    content = (
+        f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': body})}\n\n"
+        f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        if stream
+        else json.dumps(body)
+    )
+    responses = [
+        httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+        httpx.Response(200, content=content, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+    ]
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(side_effect=responses)
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+    logging_obj.dynamic_success_callbacks = []
+    hook = _NativeMessagesRecoveringHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        result = await BaseLLMHTTPHandler().async_anthropic_messages_handler(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "hi"}],
+            anthropic_messages_provider_config=AnthropicMessagesConfig(),
+            anthropic_messages_optional_request_params={"max_tokens": 8},
+            custom_llm_provider="anthropic",
+            litellm_params=GenericLiteLLMParams(litellm_credential_name="managed-native"),
+            logging_obj=logging_obj,
+            client=client,
+            api_key="sk-ant-oat01-native-old",
+            stream=stream,
+            kwargs={},
+        )
+        if stream:
+            assert [chunk async for chunk in result]
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert hook.calls == [("managed-native", "sk-ant-oat01-native-old")]
+    assert client.post.await_count == 2
+    assert client.post.await_args_list[1].kwargs["headers"]["authorization"] == "Bearer sk-ant-oat01-native-fresh"
+
+
+@pytest.mark.asyncio
+async def test_native_messages_does_not_retry_after_stream_response_started():
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    upstream = httpx.Response(
+        200,
+        content='event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"expired"}}\n\n',
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    client = AsyncMock(spec=AsyncHTTPHandler)
+    client.post = AsyncMock(return_value=upstream)
+    logging_obj = Mock()
+    logging_obj.model_call_details = {}
+    logging_obj.dynamic_success_callbacks = []
+    hook = _NativeMessagesRecoveringHook()
+    litellm.callbacks.insert(0, hook)
+    try:
+        result = await BaseLLMHTTPHandler().async_anthropic_messages_handler(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "hi"}],
+            anthropic_messages_provider_config=AnthropicMessagesConfig(),
+            anthropic_messages_optional_request_params={"max_tokens": 8},
+            custom_llm_provider="anthropic",
+            litellm_params=GenericLiteLLMParams(litellm_credential_name="managed-native"),
+            logging_obj=logging_obj,
+            client=client,
+            api_key="sk-ant-oat01-native-old",
+            stream=True,
+            kwargs={},
+        )
+        chunks = [chunk async for chunk in result]
+        assert chunks
+    finally:
+        litellm.callbacks.remove(hook)
+
+    assert hook.calls == []
+    assert client.post.await_count == 1

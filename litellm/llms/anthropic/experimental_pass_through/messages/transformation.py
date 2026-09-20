@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import httpx
 
@@ -23,9 +23,19 @@ from litellm.types.router import GenericLiteLLMParams
 from ...common_utils import (
     AnthropicError,
     AnthropicModelInfo,
+    is_anthropic_subscription_request,
     optionally_handle_anthropic_oauth,
+    prepare_anthropic_subscription_system,
     strip_advisor_blocks_from_messages,
     strip_encrypted_reasoning_blocks_from_anthropic_messages,
+)
+from ...subscription_identity import get_subscription_identity, prepare_subscription_identity
+from ...subscription_tools import (
+    ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY,
+    prepare_subscription_tools,
+    restore_subscription_tool_stream,
+    restore_subscription_tools,
+    tool_name_reverse_map,
 )
 from .mid_conversation_system import (
     as_system_content_blocks,
@@ -482,7 +492,16 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
 
         This takes in a request in the Anthropic /v1/messages API spec -> transforms it to /v1/messages API spec (i.e) no transformation is needed
         """
+        anthropic_messages_optional_request_params = dict(  # rebind-ok: isolate parameters across routed attempts
+            anthropic_messages_optional_request_params
+        )
         max_tokens: Final = anthropic_messages_optional_request_params.pop("max_tokens", None)
+        subscription_request: Final = is_anthropic_subscription_request(cast(Mapping[object, object], headers))
+        litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = {}
+        if subscription_request:
+            anthropic_messages_optional_request_params["system"] = prepare_anthropic_subscription_system(
+                anthropic_messages_optional_request_params.get("system")
+            )
         if max_tokens is None:
             raise AnthropicError(
                 message="max_tokens is required for Anthropic /v1/messages API",
@@ -559,6 +578,18 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             model=model,
             **anthropic_messages_optional_request_params,
         )
+        if subscription_request:
+            subscription_body, reverse = prepare_subscription_tools(anthropic_messages_request)
+            litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = reverse
+            identity_body, identity_headers = prepare_subscription_identity(
+                subscription_body,
+                cast(Mapping[str, object], headers),
+                dict(litellm_params),
+                get_subscription_identity(litellm_params.get("litellm_credential_name")),
+            )
+            headers.clear()
+            headers.update(identity_headers)
+            return identity_body
         return dict(anthropic_messages_request)
 
     def transform_anthropic_messages_response(
@@ -574,7 +605,11 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             raw_response_json: Final = raw_response.json()
         except Exception:
             raise AnthropicError(message=raw_response.text, status_code=raw_response.status_code)
-        return AnthropicMessagesResponse(**raw_response_json)
+        reverse: Final = tool_name_reverse_map(raw_response.extensions.get(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY))
+        return cast(
+            AnthropicMessagesResponse,
+            restore_subscription_tools(AnthropicMessagesResponse(**raw_response_json), reverse),
+        )
 
     def get_async_streaming_response_iterator(
         self,
@@ -593,11 +628,16 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
             litellm_logging_obj=litellm_logging_obj,
             request_body=request_body,
         )
-        return handler.get_async_streaming_response_iterator(
-            httpx_response=httpx_response,
-            request_body=request_body,
-            litellm_logging_obj=litellm_logging_obj,
+        completion_stream: Final = cast(
+            AsyncIterator[bytes],
+            handler.get_async_streaming_response_iterator(
+                httpx_response=httpx_response,
+                request_body=request_body,
+                litellm_logging_obj=litellm_logging_obj,
+            ),
         )
+        reverse: Final = tool_name_reverse_map(httpx_response.extensions.get(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY))
+        return restore_subscription_tool_stream(completion_stream, reverse) if reverse else completion_stream
 
     @staticmethod
     def _update_headers_with_anthropic_beta(

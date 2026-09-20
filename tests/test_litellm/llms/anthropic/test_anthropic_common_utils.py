@@ -67,8 +67,9 @@ class TestOptionallyHandleAnthropicOAuth:
         updated_headers, extracted_api_key = optionally_handle_anthropic_oauth(headers, None)
 
         assert extracted_api_key == FAKE_OAUTH_TOKEN
-        assert updated_headers["anthropic-beta"] == "oauth-2025-04-20"
+        assert set(updated_headers["anthropic-beta"].split(",")) == {"oauth-2025-04-20", "claude-code-20250219"}
         assert updated_headers["anthropic-dangerous-direct-browser-access"] == "true"
+        assert updated_headers["x-app"] == "cli"
         assert "x-api-key" not in updated_headers
         assert [name for name in updated_headers if name.lower() == "authorization"] == ["authorization"]
         assert updated_headers["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
@@ -99,8 +100,9 @@ class TestOptionallyHandleAnthropicOAuth:
 
         assert returned_api_key == FAKE_OAUTH_TOKEN
         assert updated_headers["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
-        assert updated_headers["anthropic-beta"] == "oauth-2025-04-20"
+        assert set(updated_headers["anthropic-beta"].split(",")) == {"oauth-2025-04-20", "claude-code-20250219"}
         assert updated_headers["anthropic-dangerous-direct-browser-access"] == "true"
+        assert updated_headers["x-app"] == "cli"
         assert "x-api-key" not in updated_headers
 
     def test_oauth_removes_existing_x_api_key(self):
@@ -172,6 +174,7 @@ class TestGetAnthropicHeaders:
 
         assert headers["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
         assert headers["anthropic-dangerous-direct-browser-access"] == "true"
+        assert headers["x-app"] == "cli"
         assert "oauth-2025-04-20" in headers.get("anthropic-beta", "")
         assert "x-api-key" not in headers
 
@@ -191,6 +194,7 @@ class TestGetAnthropicHeaders:
         assert headers["x-api-key"] == FAKE_REGULAR_KEY
         assert "authorization" not in headers
         assert "anthropic-dangerous-direct-browser-access" not in headers
+        assert "x-app" not in headers
 
     def test_custom_api_base_uses_bearer_header(self):
         """Custom api_base and non-standard API key should produce Authorization: Bearer header when opted in."""
@@ -2275,3 +2279,94 @@ def test_create_anthropic_model_list_response_lists_ids_as_told():
     assert (gpt["id"], gpt["display_name"], gpt["max_input_tokens"]) == ("claude-router-gpt-4o[1m]", "GPT 4o", 1000000)
     assert (haiku["id"], haiku["display_name"]) == ("claude-haiku-4-5", "claude-haiku-4-5")
     assert (response["first_id"], response["last_id"]) == ("claude-router-gpt-4o[1m]", "claude-haiku-4-5")
+
+
+def test_prepare_anthropic_subscription_system_is_identity_first_and_idempotent():
+    from litellm.llms.anthropic.common_utils import (
+        ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+        prepare_anthropic_subscription_system,
+    )
+
+    cached_identity = {
+        "type": "text",
+        "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"},
+    }
+    original = [
+        {"type": "text", "text": "Keep this instruction", "cache_control": {"type": "ephemeral"}},
+        cached_identity,
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+    ]
+
+    prepared = prepare_anthropic_subscription_system(original)
+    prepared_again = prepare_anthropic_subscription_system(prepared)
+
+    assert prepared[0] == cached_identity
+    assert prepared[1:] == [original[0]]
+    assert prepared_again == prepared
+    assert original[0]["text"] == "Keep this instruction"
+    assert len(original) == 3
+    assert prepare_anthropic_subscription_system("Original") == [
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+        {"type": "text", "text": "Original"},
+    ]
+
+
+@pytest.mark.parametrize("forwarded", [False, True])
+@pytest.mark.parametrize("header_name", ["User-Agent", "user-agent", "USER-AGENT"])
+def test_subscription_sets_single_claude_cli_user_agent(forwarded, header_name):
+    from litellm.llms.anthropic.common_utils import (
+        ANTHROPIC_SUBSCRIPTION_USER_AGENT,
+        optionally_handle_anthropic_oauth,
+    )
+
+    headers = {header_name: "other-client/1.0", "x-request-id": "keep-me"}
+    if forwarded:
+        headers["Authorization"] = f"Bearer {FAKE_OAUTH_TOKEN}"
+    result, token = optionally_handle_anthropic_oauth(headers, None if forwarded else FAKE_OAUTH_TOKEN)
+    repeated, _ = optionally_handle_anthropic_oauth(result, token)
+
+    assert token == FAKE_OAUTH_TOKEN
+    assert [(name, value) for name, value in result.items() if name.lower() == "user-agent"] == [
+        ("user-agent", ANTHROPIC_SUBSCRIPTION_USER_AGENT)
+    ]
+    assert result["x-request-id"] == "keep-me"
+    assert repeated == result
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+def test_chat_environment_user_agent_is_subscription_only(oauth):
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_USER_AGENT, AnthropicModelInfo
+
+    token = FAKE_OAUTH_TOKEN if oauth else FAKE_REGULAR_KEY
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": token}):
+        headers = AnthropicModelInfo().validate_environment(
+            headers={"User-Agent": "other-client/1.0"},
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "Hi"}],
+            optional_params={},
+            litellm_params={},
+        )
+
+    assert [value for name, value in headers.items() if name.lower() == "user-agent"] == [
+        ANTHROPIC_SUBSCRIPTION_USER_AGENT if oauth else "other-client/1.0"
+    ]
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+def test_native_messages_user_agent_is_subscription_only(oauth):
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_USER_AGENT
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    headers, _ = AnthropicMessagesConfig().validate_anthropic_messages_environment(
+        headers={"User-Agent": "other-client/1.0"},
+        model="claude-sonnet-5",
+        messages=[{"role": "user", "content": "Hi"}],
+        optional_params={},
+        litellm_params={},
+        api_key=FAKE_OAUTH_TOKEN if oauth else FAKE_REGULAR_KEY,
+    )
+
+    assert [value for name, value in headers.items() if name.lower() == "user-agent"] == [
+        ANTHROPIC_SUBSCRIPTION_USER_AGENT if oauth else "other-client/1.0"
+    ]
