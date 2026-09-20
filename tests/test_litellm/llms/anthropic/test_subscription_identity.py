@@ -55,6 +55,20 @@ def test_application_session_names_are_stable_and_scoped_to_device():
     UUID(first["x-claude-code-session-id"])
 
 
+def test_trace_id_keeps_generated_session_stable_across_routed_attempts():
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    params = {"litellm_trace_id": "trace-for-one-logical-request"}
+
+    first_body, first_headers = prepare_subscription_identity({}, {}, params, identity)
+    second_body, second_headers = prepare_subscription_identity({}, {}, params, identity)
+
+    assert first_headers == second_headers
+    assert first_body == second_body
+    assert json.loads(first_body["metadata"]["user_id"])["session_id"] == first_headers[
+        "x-claude-code-session-id"
+    ]
+
+
 def test_identity_preserves_short_opaque_user_id_and_bounds_large_values():
     identity = SubscriptionIdentity("account-a", "a" * 64)
     short, _ = prepare_subscription_identity({"metadata": {"user_id": "customer-123"}}, {}, {}, identity)

@@ -77,7 +77,12 @@ def prepare_subscription_identity(
     session_id: Final = next(
         (
             normalized
-            for candidate in (header_session, incoming.get("session_id"), request_metadata.get("session_id"))
+            for candidate in (
+                header_session,
+                incoming.get("session_id"),
+                request_metadata.get("session_id"),
+                params.get("litellm_trace_id"),
+            )
             if (normalized := _session_id(candidate, identity.device_id)) is not None
         ),
         str(uuid4()),
