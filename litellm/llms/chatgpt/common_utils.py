@@ -21,7 +21,8 @@ CHATGPT_API_BASE: Final = "https://chatgpt.com/backend-api/codex"
 CHATGPT_CLIENT_ID: Final = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 DEFAULT_ORIGINATOR: Final = "codex_cli_rs"
-DEFAULT_USER_AGENT: Final = "codex_cli_rs/0.0.0 (Unknown 0; unknown) unknown"
+CODEX_CLI_VERSION: Final = "0.155.1"
+DEFAULT_USER_AGENT: Final = f"{DEFAULT_ORIGINATOR}/{CODEX_CLI_VERSION} (Unknown 0; unknown) unknown"
 CHATGPT_DEFAULT_INSTRUCTIONS = """You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.
 
 ## General
@@ -196,15 +197,6 @@ def _terminal_user_agent() -> str:
     return "unknown"
 
 
-def _get_litellm_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("litellm")
-    except Exception:
-        return "0.0.0"
-
-
 def get_chatgpt_originator() -> str:
     originator: Final = os.getenv("CHATGPT_ORIGINATOR") or DEFAULT_ORIGINATOR
     return _safe_header_value(originator) or DEFAULT_ORIGINATOR
@@ -214,14 +206,13 @@ def get_chatgpt_user_agent(originator: str) -> str:
     override: Final = os.getenv("CHATGPT_USER_AGENT")
     if override:
         return _safe_header_value(override) or DEFAULT_USER_AGENT
-    version: Final = _get_litellm_version()
     os_type: Final = platform.system() or "Unknown"
     os_version: Final = platform.release() or "0"
     arch: Final = platform.machine() or "unknown"
     terminal_ua: Final = _terminal_user_agent()
     suffix = os.getenv("CHATGPT_USER_AGENT_SUFFIX", "").strip()
     suffix = f" ({suffix})" if suffix else ""
-    candidate: Final = f"{originator}/{version} ({os_type} {os_version}; {arch}) {terminal_ua}{suffix}"
+    candidate: Final = f"{originator}/{CODEX_CLI_VERSION} ({os_type} {os_version}; {arch}) {terminal_ua}{suffix}"
     return _safe_header_value(candidate) or DEFAULT_USER_AGENT
 
 
