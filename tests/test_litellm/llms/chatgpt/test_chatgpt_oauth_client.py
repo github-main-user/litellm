@@ -3,6 +3,7 @@ import json
 import time
 
 import httpx
+import pytest
 
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_DEVICE_CODE_URL,
@@ -97,6 +98,59 @@ def test_refresh_preserves_rotating_credentials() -> None:
     assert tokens.refresh_token == "refresh-new"
     assert tokens.account_id == "account-b"
     assert "refresh-new" not in repr(tokens)
+
+
+def test_client_rejects_injected_transport_with_proxy() -> None:
+    http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500)))
+    try:
+        with pytest.raises(ValueError, match="cannot be used together"):
+            ChatGPTOAuthClient(http_client, proxy_url="http://proxy.example:8080")
+    finally:
+        http_client.close()
+
+
+def test_invalid_proxy_performs_no_http_operation(monkeypatch) -> None:
+    opened = False
+
+    def fail_client(**kwargs: object) -> None:
+        nonlocal opened
+        opened = True
+
+    monkeypatch.setattr(httpx, "Client", fail_client)
+    secret_url = "http://proxy-secret.example:70000"
+    with pytest.raises(ValueError) as caught:
+        ChatGPTOAuthClient(proxy_url=secret_url)
+
+    assert not opened
+    assert secret_url not in str(caught.value)
+
+
+def test_dedicated_proxy_client_disables_environment_and_closes(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            captured["closed"] = True
+
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"device_auth_id": "device", "user_code": "CODE"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    ChatGPTOAuthClient(proxy_url="http://proxy.example:8080").request_device_code()
+
+    assert captured["proxy"] == "http://proxy.example:8080"
+    assert captured["trust_env"] is False
+    assert captured["closed"] is True
 
 
 def test_token_bundle_round_trip() -> None:

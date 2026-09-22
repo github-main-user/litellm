@@ -59,7 +59,9 @@ def credential_store():
         llm_router: object | None = None,
         **repository_calls: AsyncMock,
     ) -> None:
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock() if connected else None).start()
+        # This fixture exercises the repository fallback used by lightweight DB
+        # adapters. Transaction/race behavior has a dedicated fake below.
+        patch("litellm.proxy.proxy_server.prisma_client", object() if connected else None).start()
         patch("litellm.proxy.proxy_server.master_key", "sk-test-master").start()
         patch.object(litellm, "credential_list", list(in_memory)).start()
         app.dependency_overrides[get_llm_router] = lambda: llm_router
@@ -315,6 +317,272 @@ def test_update_credential_answers_500_when_model_id_is_given_but_no_router_is_l
     update_by_name.assert_not_awaited()
 
 
+def test_proxy_create_validates_encrypts_and_only_exposes_safe_metadata(credential_store):
+    create = AsyncMock(return_value=None)
+    credential_store(create=create)
+
+    response = _create_credential(
+        {
+            "credential_name": "proxied",
+            "credential_values": {
+                "api_key": "sk-value",
+                "litellm_internal_proxy_url": "SOCKS5H://user:super-secret@proxy.example:1080",
+            },
+            "credential_info": {"provider": "openai"},
+        }
+    )
+
+    assert response.status_code == 200, response.text
+    written = create.await_args.kwargs["data"]
+    values = json.loads(written["credential_values"])
+    assert values["litellm_internal_proxy_url"] != "socks5h://user:super-secret@proxy.example:1080"
+    assert "super-secret" not in values["litellm_internal_proxy_url"]
+    assert json.loads(written["credential_info"])["proxy_configured"] is True
+    assert litellm.credential_list[0].credential_values["litellm_internal_proxy_url"].lower().startswith("socks5h://")
+
+
+def test_proxy_create_rejects_invalid_values_without_echoing_credentials(credential_store):
+    create = AsyncMock(return_value=None)
+    credential_store(create=create)
+    secret = "do-not-echo-this-password"
+
+    response = _create_credential(
+        {
+            "credential_name": "bad-proxy",
+            "credential_values": {"litellm_internal_proxy_url": f"ftp://user:{secret}@proxy.example"},
+            "credential_info": {},
+        }
+    )
+
+    assert response.status_code == 400
+    assert secret not in response.text
+    create.assert_not_awaited()
+
+
+@pytest.mark.parametrize("proxy_value", [123, {"url": "http://proxy.example"}, ["http://proxy.example"]])
+def test_proxy_create_rejects_non_string_values(credential_store, proxy_value):
+    create = AsyncMock(return_value=None)
+    credential_store(create=create)
+
+    response = _create_credential(
+        {
+            "credential_name": "bad-proxy-type",
+            "credential_values": {"litellm_internal_proxy_url": proxy_value},
+            "credential_info": {},
+        }
+    )
+
+    assert response.status_code == 400
+    create.assert_not_awaited()
+
+
+def test_generic_log_masking_treats_proxy_fields_as_sensitive():
+    from litellm.litellm_core_utils.litellm_logging import _get_masked_values
+
+    secret_url = "http://user:proxy-password@proxy.example:8080"
+    masked = _get_masked_values({"proxy_url": secret_url, "http_proxy": secret_url})
+
+    assert masked["proxy_url"] != secret_url
+    assert masked["http_proxy"] != secret_url
+    assert "proxy-password" not in repr(masked)
+
+
+def test_proxy_get_never_returns_internal_url_or_password(credential_store):
+    credential_store(
+        in_memory=(
+            CredentialItem(
+                credential_name="proxied",
+                credential_values={
+                    "api_key": "sk-secret",
+                    "litellm_internal_proxy_url": "http://user:proxy-password@proxy.example:8080",
+                },
+                credential_info={"provider": "openai"},
+            ),
+        )
+    )
+
+    response = _list_credentials()
+
+    assert response.status_code == 200
+    body = response.json()["credentials"][0]
+    assert "litellm_internal_proxy_url" not in body["credential_values"]
+    assert "proxy-password" not in response.text
+    assert body["credential_info"]["proxy_configured"] is True
+
+
+def test_proxy_patch_absent_preserves_and_empty_clears_without_wiping_metadata(credential_store):
+    stored = CredentialItem(
+        credential_name="proxied",
+        credential_values={"api_key": "encrypted-key", "litellm_internal_proxy_url": "encrypted-proxy"},
+        credential_info={"provider": "anthropic", "auth_type": "oauth", "proxy_configured": True},
+    )
+    update = AsyncMock(return_value=None)
+    credential_store(find_by_name=AsyncMock(return_value=stored), update_by_name=update)
+
+    preserved = _patch_credential(
+        "proxied",
+        {"credential_name": "proxied", "credential_values": {"api_key": "replacement"}, "credential_info": {}},
+    )
+    assert preserved.status_code == 200, preserved.text
+    preserved_data = update.await_args.kwargs["data"]
+    assert "litellm_internal_proxy_url" in json.loads(preserved_data["credential_values"])
+    assert json.loads(preserved_data["credential_info"]) == {
+        "provider": "anthropic",
+        "auth_type": "oauth",
+        "proxy_configured": True,
+    }
+
+    update.reset_mock()
+    cleared = _patch_credential(
+        "proxied",
+        {
+            "credential_name": "proxied",
+            "credential_values": {"litellm_internal_proxy_url": ""},
+            "credential_info": {"proxy_configured": True},
+        },
+    )
+    assert cleared.status_code == 200, cleared.text
+    cleared_data = update.await_args.kwargs["data"]
+    assert "litellm_internal_proxy_url" not in json.loads(cleared_data["credential_values"])
+    assert json.loads(cleared_data["credential_info"]) == {
+        "provider": "anthropic",
+        "auth_type": "oauth",
+        "proxy_configured": False,
+    }
+
+
+@pytest.mark.parametrize("provider", ["chatgpt", "anthropic"])
+def test_oauth_proxy_validation_never_echoes_secret_inputs(provider):
+    secret = "proxy-password-never-in-response"
+    response = _call_as_admin(
+        "POST",
+        f"/credentials/{provider}/oauth/start",
+        {"credential_name": "proxied", "proxy_url": {"password": secret}},
+    )
+    assert response.status_code == 422, response.text
+    assert secret not in response.text
+    assert all("input" not in error and "ctx" not in error for error in response.json()["detail"])
+
+
+def test_proxy_patch_refreshes_memory_from_latest_encrypted_row(credential_store):
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+    from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helper
+
+    find = AsyncMock()
+    cached = CredentialItem(
+        credential_name="proxied",
+        credential_values={"api_key": "old-token"},
+        credential_info={"provider": "openai", "auth_type": "api_key"},
+    )
+    credential_store(in_memory=(cached,), find_by_name=find, update_by_name=AsyncMock())
+    find.return_value = CredentialItem(
+        credential_name="proxied",
+        credential_values={"api_key": encrypt_value_helper("rotated-token")},
+        credential_info={"provider": "openai", "auth_type": "api_key"},
+    )
+    response = _patch_credential(
+        "proxied",
+        {
+            "credential_name": "proxied",
+            "credential_values": {"litellm_internal_proxy_url": "http://proxy.example:8080"},
+            "credential_info": {},
+        },
+    )
+    assert response.status_code == 200, response.text
+    latest = CredentialAccessor.find_credential("proxied")
+    assert latest is not None
+    assert latest.credential_values["api_key"] == "rotated-token"
+    assert latest.credential_values["litellm_internal_proxy_url"] == "http://proxy.example:8080"
+    assert latest.credential_info["proxy_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_generic_patch_rereads_after_both_oauth_advisory_locks(monkeypatch):
+    """A token refreshed while PATCH was waiting must be the value PATCH merges."""
+    from litellm.proxy.credential_endpoints.endpoints import (
+        _credential_lock_keys,
+        _update_credential_under_oauth_locks,
+    )
+
+    class Table:
+        def __init__(self):
+            self.written = None
+
+        async def find_unique(self, *, where):
+            assert transaction.locks == _credential_lock_keys("oauth-credential", "oauth-credential")
+            return {
+                "credential_name": "oauth-credential",
+                "credential_values": {"oauth_token_bundle": "freshly-rotated-encrypted-token"},
+                "credential_info": {"provider": "anthropic", "auth_type": "oauth"},
+            }
+
+        async def update(self, *, where, data):
+            self.written = data
+
+    class Transaction:
+        def __init__(self):
+            self.litellm_credentialstable = Table()
+            self.locks = []
+            self.committed = False
+
+        async def execute_raw(self, sql, lock_key):
+            self.locks.append(lock_key)
+
+    class TransactionContext:
+        def __init__(self, transaction):
+            self.transaction = transaction
+
+        async def __aenter__(self):
+            return self.transaction
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            self.transaction.committed = exc_type is None
+            return False
+
+    class Database:
+        def __init__(self, transaction):
+            self.transaction = transaction
+
+        def tx(self, *, timeout):
+            assert timeout.total_seconds() == 120
+            return TransactionContext(self.transaction)
+
+    transaction = Transaction()
+
+    async def publish_after_commit(table):
+        assert transaction.committed
+        assert table == "litellm_credentialstable"
+
+    publish = AsyncMock(side_effect=publish_after_commit)
+    monkeypatch.setattr(
+        "litellm.proxy.credential_endpoints.endpoints.publish_config_change_for_object_type", publish
+    )
+    prisma = MagicMock()
+    prisma.db = Database(transaction)
+    repository = MagicMock()
+    repository.find_by_name = AsyncMock(side_effect=AssertionError("stale read outside transaction"))
+    monkeypatch.setattr(
+        "litellm.proxy.credential_endpoints.endpoints.encrypt_value_helper",
+        lambda value, new_encryption_key=None: f"encrypted:{value}",
+    )
+    patch_item = CredentialItem(
+        credential_name="oauth-credential",
+        credential_values={"litellm_internal_proxy_url": "http://proxy.example:8080"},
+        credential_info={"proxy_configured": True},
+    )
+
+    await _update_credential_under_oauth_locks(
+        prisma, repository, "oauth-credential", patch_item, False, "admin"
+    )
+
+    assert transaction.locks == _credential_lock_keys("oauth-credential", "oauth-credential")
+    written_values = json.loads(transaction.litellm_credentialstable.written["credential_values"])
+    assert written_values["oauth_token_bundle"] == "freshly-rotated-encrypted-token"
+    assert written_values["litellm_internal_proxy_url"] == "encrypted:http://proxy.example:8080"
+    repository.find_by_name.assert_not_awaited()
+    publish.assert_awaited_once()
+
+
 def test_update_credential_still_accepts_a_body_without_credential_values(credential_store):
     """Renaming or re-tagging a credential sends only ``credential_info``; that must not 422."""
     stored = CredentialItem(credential_name="existing", credential_values={"api_key": "sk-old"}, credential_info={})
@@ -328,5 +596,8 @@ def test_update_credential_still_accepts_a_body_without_credential_values(creden
 
     assert response.status_code == 200, response.text
     written = update_by_name.await_args.kwargs["data"]
-    assert json.loads(written["credential_info"]) == {"custom_llm_provider": "openai"}
+    assert json.loads(written["credential_info"]) == {
+        "custom_llm_provider": "openai",
+        "proxy_configured": False,
+    }
     assert set(json.loads(written["credential_values"])) == {"api_key"}, "stored values survive an info-only patch"

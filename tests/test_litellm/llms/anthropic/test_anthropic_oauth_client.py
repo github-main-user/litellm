@@ -34,6 +34,64 @@ def test_begin_authorization_has_state_and_pkce() -> None:
     assert authorization.code_verifier not in authorization.authorization_url
 
 
+def test_client_rejects_injected_transport_with_proxy() -> None:
+    http_client = AsyncMock()
+    with pytest.raises(ValueError, match="cannot be used together"):
+        AnthropicOAuthClient(http_client, proxy_url="http://proxy.example:8080")
+
+
+def test_invalid_proxy_performs_no_http_operation(monkeypatch) -> None:
+    opened = False
+
+    def fail_client(**kwargs: object) -> None:
+        nonlocal opened
+        opened = True
+
+    monkeypatch.setattr(httpx, "AsyncClient", fail_client)
+    secret_url = "http://proxy-secret.example:70000"
+    with pytest.raises(ValueError) as caught:
+        AnthropicOAuthClient(proxy_url=secret_url)
+
+    assert not opened
+    assert secret_url not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_proxy_client_disables_environment_and_closes(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            captured["closed"] = True
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "sk-ant-oat-access",
+                    "refresh_token": "refresh",
+                    "expires_in": 300,
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    await AnthropicOAuthClient(proxy_url="socks5://proxy.example:1080").exchange_code(
+        "code", "state", "verifier"
+    )
+
+    assert captured["proxy"] == "socks5://proxy.example:1080"
+    assert captured["trust_env"] is False
+    assert captured["transport"] is None
+    assert captured["closed"] is True
+
+
 @pytest.mark.asyncio
 async def test_exchange_reads_nested_account_uuid_and_refresh_preserves_it() -> None:
     requests: list[dict[str, object]] = []

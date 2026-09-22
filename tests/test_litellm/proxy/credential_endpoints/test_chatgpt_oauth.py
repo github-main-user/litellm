@@ -1,16 +1,29 @@
 import asyncio
+import json
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import litellm
-from litellm.llms.chatgpt.oauth_client import ChatGPTTokens
+from litellm.llms.chatgpt.oauth_client import (
+    ChatGPTAuthorizationCode,
+    ChatGPTDeviceCode,
+    ChatGPTTokens,
+)
 from litellm.models.credentials import CredentialItem
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
 from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     CHATGPT_CREDENTIAL_VALUE_KEY,
+    CREDENTIAL_PROXY_VALUE_KEY,
     ChatGPTOAuthCredentialHook,
+    ChatGPTOAuthPollRequest,
+    ChatGPTOAuthStartRequest,
+    poll_chatgpt_oauth,
+    start_chatgpt_oauth,
 )
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.utils import load_credentials_from_list
@@ -200,3 +213,135 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
     assert second == fresh
     oauth_client.refresh.assert_called_once_with("refresh-old")
     transaction.litellm_credentialstable.update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_poll_store_reconnect_uses_override_and_encrypts_until_success() -> None:
+    old_proxy = "http://old-proxy.example:8080"
+    new_proxy = "socks5://new-proxy.example:1080"
+    old_tokens = ChatGPTTokens("old-access", "old-refresh", "old-id", 1, "account-a")
+    new_tokens = ChatGPTTokens("new-access", "new-refresh", "new-id", int(time.time()) + 3600, "account-a")
+    calls: list[str | None] = []
+    updated: list[dict[str, object]] = []
+
+    class OAuthClient:
+        def __init__(self, *, proxy_url=None):
+            calls.append(proxy_url)
+
+        def request_device_code(self):
+            return ChatGPTDeviceCode("device", "CODE", 1)
+
+        def poll_authorization(self, device_code):
+            return ChatGPTAuthorizationCode("code", "verifier")
+
+        def exchange_code(self, authorization):
+            return new_tokens
+
+    class Table:
+        async def find_unique(self, *, where):
+            return row
+
+        async def update(self, *, where, data):
+            updated.append(data)
+
+    class Transaction:
+        litellm_credentialstable = Table()
+
+        async def execute_raw(self, query, key):
+            return None
+
+    class Database:
+        def tx(self):
+            @asynccontextmanager
+            async def context():
+                yield Transaction()
+
+            return context()
+
+    previous = litellm.credential_list
+    with patch.dict("os.environ", {"LITELLM_SALT_KEY": "chatgpt-proxy-lifecycle-key"}):
+        row = SimpleNamespace(
+            credential_info={"provider": "chatgpt", "auth_type": "oauth", "custom": "preserved"},
+            credential_values={
+                CHATGPT_CREDENTIAL_VALUE_KEY: encrypt_value_helper(old_tokens.to_json()),
+                CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(old_proxy),
+                "other": "preserved",
+            },
+        )
+        litellm.credential_list = [
+            CredentialItem(
+                credential_name="subscription",
+                credential_info={"provider": "chatgpt", "auth_type": "oauth", "proxy_configured": True},
+                credential_values={
+                    CHATGPT_CREDENTIAL_VALUE_KEY: old_tokens.to_json(),
+                    CREDENTIAL_PROXY_VALUE_KEY: old_proxy,
+                },
+            )
+        ]
+        try:
+            with (
+                patch("litellm.proxy.credential_endpoints.chatgpt_oauth.ChatGPTOAuthClient", OAuthClient),
+                patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=Database())),
+                patch(
+                    "litellm.proxy.credential_endpoints.chatgpt_oauth.publish_config_change_for_object_type",
+                    AsyncMock(),
+                ),
+            ):
+                started = await start_chatgpt_oauth(
+                    ChatGPTOAuthStartRequest(credential_name="subscription", proxy_url=new_proxy),
+                    UserAPIKeyAuth(user_id="actor-a"),
+                )
+                assert old_proxy not in started.attempt_token
+                assert new_proxy not in started.attempt_token
+                connected = await poll_chatgpt_oauth(
+                    ChatGPTOAuthPollRequest(attempt_token=started.attempt_token),
+                    UserAPIKeyAuth(user_id="actor-a"),
+                )
+        finally:
+            litellm.credential_list = previous
+
+    assert connected.status == "connected"
+    assert calls == [new_proxy, new_proxy]
+    values = updated[0]["credential_values"]
+    if isinstance(values, str):
+        values = json.loads(values)
+    assert isinstance(values, dict)
+    assert values["other"] == "preserved"
+    with patch.dict("os.environ", {"LITELLM_SALT_KEY": "chatgpt-proxy-lifecycle-key"}):
+        assert decrypt_value_helper(values[CREDENTIAL_PROXY_VALUE_KEY], CREDENTIAL_PROXY_VALUE_KEY) == new_proxy
+        assert decrypt_value_helper(values[CHATGPT_CREDENTIAL_VALUE_KEY], CHATGPT_CREDENTIAL_VALUE_KEY) == new_tokens.to_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"credential_name": "subscription"}, {"credential_name": "subscription", "proxy_url": None}])
+async def test_start_reuses_saved_proxy_when_omitted_or_null(payload: dict[str, object]) -> None:
+    saved_proxy = "http://saved-proxy.example:8080"
+    seen: list[str | None] = []
+
+    class OAuthClient:
+        def __init__(self, *, proxy_url=None):
+            seen.append(proxy_url)
+
+        def request_device_code(self):
+            return ChatGPTDeviceCode("device", "CODE", 1)
+
+    previous = litellm.credential_list
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="subscription",
+            credential_info={"provider": "chatgpt", "auth_type": "oauth", "proxy_configured": True},
+            credential_values={CREDENTIAL_PROXY_VALUE_KEY: saved_proxy},
+        )
+    ]
+    try:
+        with (
+            patch.dict("os.environ", {"LITELLM_SALT_KEY": "chatgpt-proxy-reuse-key"}),
+            patch("litellm.proxy.credential_endpoints.chatgpt_oauth.ChatGPTOAuthClient", OAuthClient),
+        ):
+            await start_chatgpt_oauth(
+                ChatGPTOAuthStartRequest.model_validate(payload), UserAPIKeyAuth(user_id="actor-a")
+            )
+    finally:
+        litellm.credential_list = previous
+
+    assert seen == [saved_proxy]

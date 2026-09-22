@@ -12,14 +12,16 @@ import litellm
 from litellm.exceptions import AuthenticationError
 from litellm.llms.anthropic.oauth_client import (
     ANTHROPIC_OAUTH_REDIRECT_URI,
+    AnthropicAuthorization,
     AnthropicOAuthError,
     AnthropicOAuthTokens,
 )
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
-from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper
+from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
 from litellm.proxy.credential_endpoints.anthropic_oauth import (
     ANTHROPIC_CREDENTIAL_VALUE_KEY,
+    CREDENTIAL_PROXY_VALUE_KEY,
     AnthropicOAuthAttempt,
     AnthropicOAuthCompleteRequest,
     AnthropicOAuthCredentialHook,
@@ -145,6 +147,194 @@ async def test_complete_is_admin_only_and_rejects_malformed_or_expired_attempts(
     assert denied.value.status_code == 403
     assert malformed.value.status_code == 400
     assert expired_error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_start_complete_reconnect_supports_maximum_proxy_snapshots() -> None:
+    old_prefix, old_suffix = "http://user:", "@old.example"
+    new_prefix, new_suffix = "socks5://user:", "@new.example"
+    old_proxy = old_prefix + "a" * (4096 - len(old_prefix) - len(old_suffix)) + old_suffix
+    new_proxy = new_prefix + "b" * (4096 - len(new_prefix) - len(new_suffix)) + new_suffix
+    old_tokens = AnthropicOAuthTokens("sk-ant-oat-old", "refresh-old", time.time() + 3600, "account-a")
+    new_tokens = AnthropicOAuthTokens("sk-ant-oat-new", "refresh-new", time.time() + 3600, "account-a")
+    proxies: list[str | None] = []
+    updated: list[dict[str, object]] = []
+
+    class OAuthClient:
+        def __init__(self, *, proxy_url=None):
+            proxies.append(proxy_url)
+
+        def begin_authorization(self):
+            return AnthropicAuthorization("https://claude.com/authorize", "state", "verifier")
+
+        async def exchange_code(self, code, state, code_verifier):
+            return new_tokens
+
+    class Table:
+        async def find_unique(self, *, where):
+            return row
+
+        async def update(self, *, where, data):
+            updated.append(data)
+
+    class Transaction:
+        litellm_credentialstable = Table()
+
+        async def execute_raw(self, query, *parameters):
+            return None
+
+    class Database:
+        def tx(self, *, timeout):
+            @asynccontextmanager
+            async def context():
+                yield Transaction()
+
+            return context()
+
+    admin = UserAPIKeyAuth(user_id="admin-a", user_role=LitellmUserRoles.PROXY_ADMIN)
+    previous = litellm.credential_list
+    with patch.dict("os.environ", {"LITELLM_SALT_KEY": "anthropic-proxy-lifecycle-key"}):
+        row = SimpleNamespace(
+            credential_info={"provider": "anthropic", "auth_type": "oauth", "custom": "preserved"},
+            credential_values={
+                ANTHROPIC_CREDENTIAL_VALUE_KEY: encrypt_value_helper(old_tokens.to_json()),
+                CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(old_proxy),
+                "other": "preserved",
+            },
+        )
+        litellm.credential_list = [
+            CredentialItem(
+                credential_name="subscription",
+                credential_info={"provider": "anthropic", "auth_type": "oauth", "proxy_configured": True},
+                credential_values={
+                    ANTHROPIC_CREDENTIAL_VALUE_KEY: old_tokens.to_json(),
+                    CREDENTIAL_PROXY_VALUE_KEY: old_proxy,
+                },
+            )
+        ]
+        try:
+            with (
+                patch("litellm.proxy.credential_endpoints.anthropic_oauth.AnthropicOAuthClient", OAuthClient),
+                patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=Database())),
+                patch(
+                    "litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type",
+                    AsyncMock(),
+                ),
+            ):
+                started = await start_anthropic_oauth(
+                    AnthropicOAuthStartRequest(credential_name="subscription", proxy_url=new_proxy), admin
+                )
+                assert old_proxy not in started.attempt_token
+                assert new_proxy not in started.attempt_token
+                request = AnthropicOAuthCompleteRequest(
+                    attempt_token=started.attempt_token,
+                    authorization_code="code#state",
+                )
+                completed = await complete_anthropic_oauth(request, admin)
+        finally:
+            litellm.credential_list = previous
+
+        values = updated[0]["credential_values"]
+        if isinstance(values, str):
+            values = json.loads(values)
+        assert isinstance(values, dict)
+        assert values["other"] == "preserved"
+        assert decrypt_value_helper(values[CREDENTIAL_PROXY_VALUE_KEY], CREDENTIAL_PROXY_VALUE_KEY) == new_proxy
+        stored_tokens = AnthropicOAuthTokens.from_json(
+            decrypt_value_helper(values[ANTHROPIC_CREDENTIAL_VALUE_KEY], ANTHROPIC_CREDENTIAL_VALUE_KEY)
+        )
+        assert stored_tokens.access_token == new_tokens.access_token
+        assert stored_tokens.refresh_token == new_tokens.refresh_token
+        assert stored_tokens.device_id == old_tokens.device_id
+
+    assert completed.status == "connected"
+    assert proxies == [new_proxy, new_proxy]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{"credential_name": "subscription"}, {"credential_name": "subscription", "proxy_url": None}],
+)
+async def test_start_reuses_saved_proxy_for_omitted_or_null(payload: dict[str, object]) -> None:
+    saved_proxy = "http://saved.example:8080"
+    seen: list[str | None] = []
+
+    class OAuthClient:
+        def __init__(self, *, proxy_url=None):
+            seen.append(proxy_url)
+
+        def begin_authorization(self):
+            return AnthropicAuthorization("https://claude.com/authorize", "state", "verifier")
+
+    previous = litellm.credential_list
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="subscription",
+            credential_info={"provider": "anthropic", "auth_type": "oauth", "proxy_configured": True},
+            credential_values={CREDENTIAL_PROXY_VALUE_KEY: saved_proxy},
+        )
+    ]
+    try:
+        with (
+            patch.dict("os.environ", {"LITELLM_SALT_KEY": "anthropic-proxy-reuse-key"}),
+            patch("litellm.proxy.credential_endpoints.anthropic_oauth.AnthropicOAuthClient", OAuthClient),
+        ):
+            await start_anthropic_oauth(
+                AnthropicOAuthStartRequest.model_validate(payload),
+                UserAPIKeyAuth(user_id="admin-a", user_role=LitellmUserRoles.PROXY_ADMIN),
+            )
+    finally:
+        litellm.credential_list = previous
+
+    assert seen == [saved_proxy]
+
+
+@pytest.mark.asyncio
+async def test_completion_rejects_current_database_proxy_change_before_exchange() -> None:
+    attempt = AnthropicOAuthAttempt(
+        credential_name="subscription",
+        actor="admin-a",
+        proxy_url="http://attempt.example:8080",
+        previous_proxy_url="http://old.example:8080",
+        state="state",
+        code_verifier="verifier",
+        expires_at=time.time() + 60,
+    )
+    row = SimpleNamespace(
+        credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        credential_values={CREDENTIAL_PROXY_VALUE_KEY: "http://changed.example:8080"},
+    )
+
+    class Database:
+        def tx(self, *, timeout):
+            @asynccontextmanager
+            async def context():
+                transaction = MagicMock()
+                transaction.execute_raw = AsyncMock()
+                transaction.litellm_credentialstable.find_unique = AsyncMock(return_value=row)
+                yield transaction
+
+            return context()
+
+    oauth_client = MagicMock()
+    oauth_client.exchange_code = AsyncMock()
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=Database())),
+        patch(
+            "litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper",
+            side_effect=lambda value, *args, **kwargs: value,
+        ),
+        pytest.raises(HTTPException) as caught,
+    ):
+        await _complete_and_store(
+            attempt,
+            ParsedAuthorizationCode(code="code", state="state"),
+            oauth_client,
+        )
+
+    assert caught.value.status_code == 409
+    oauth_client.exchange_code.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -558,6 +748,89 @@ async def test_reconnect_and_refresh_share_the_same_database_lock() -> None:
         litellm.credential_list = previous
 
     assert maximum_active_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_token_recovery_uses_stored_proxy_and_preserves_concurrent_proxy_edit() -> None:
+    old_proxy = "http://old.example:8080"
+    new_proxy = "socks5://new.example:1080"
+    rejected = AnthropicOAuthTokens("sk-ant-oat-rejected", "refresh-old", time.time() + 3600, "account-a")
+    refreshed = AnthropicOAuthTokens("sk-ant-oat-refreshed", "refresh-new", time.time() + 3600, "account-a")
+    seen_proxies: list[str | None] = []
+    updates: list[dict[str, object]] = []
+
+    class OAuthClient:
+        def __init__(self, *, proxy_url=None):
+            seen_proxies.append(proxy_url)
+
+        async def refresh(self, previous):
+            return refreshed
+
+    with patch.dict("os.environ", {"LITELLM_SALT_KEY": "anthropic-refresh-proxy-key"}):
+        old_row = SimpleNamespace(
+            credential_values={
+                ANTHROPIC_CREDENTIAL_VALUE_KEY: encrypt_value_helper(rejected.to_json()),
+                CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(old_proxy),
+                "other": "preserved",
+            },
+            credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        )
+        new_row = SimpleNamespace(
+            credential_values={
+                **old_row.credential_values,
+                CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(new_proxy),
+            },
+            credential_info={"provider": "anthropic", "auth_type": "oauth", "edited": True},
+        )
+
+        class Table:
+            calls = 0
+
+            async def find_unique(self, *, where):
+                self.calls += 1
+                return old_row if self.calls == 1 else new_row
+
+            async def update(self, *, where, data):
+                updates.append(data)
+
+        class Transaction:
+            litellm_credentialstable = Table()
+
+            async def execute_raw(self, query, *parameters):
+                return None
+
+        class Database:
+            def tx(self, *, timeout):
+                @asynccontextmanager
+                async def context():
+                    yield Transaction()
+
+                return context()
+
+        previous_cache = litellm.credential_list
+        litellm.credential_list = [_credential("subscription", rejected)]
+        try:
+            with (
+                patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=Database())),
+                patch("litellm.proxy.credential_endpoints.anthropic_oauth.AnthropicOAuthClient", OAuthClient),
+                patch(
+                    "litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type",
+                    AsyncMock(),
+                ),
+            ):
+                recovered = await AnthropicOAuthCredentialHook(MagicMock()).recover_rejected_token(
+                    "subscription", rejected.access_token
+                )
+        finally:
+            litellm.credential_list = previous_cache
+
+        values = json.loads(updates[0]["credential_values"])
+        assert values[CREDENTIAL_PROXY_VALUE_KEY] == new_row.credential_values[CREDENTIAL_PROXY_VALUE_KEY]
+        assert values["other"] == "preserved"
+        assert json.loads(updates[0]["credential_info"])["edited"] is True
+
+    assert recovered == refreshed.access_token
+    assert seen_proxies == [old_proxy]
 
 
 @pytest.mark.asyncio
