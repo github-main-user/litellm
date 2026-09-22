@@ -44,7 +44,9 @@ class Authenticator:
         )
         self.auth_file = os.path.join(self.token_dir, os.getenv("CHATGPT_AUTH_FILE", "auth.json"))
         self.oauth_client = oauth_client or ChatGPTOAuthClient()
-        self._ensure_token_dir()
+        self.file_auth_enabled = os.getenv("CHATGPT_ALLOW_FILE_AUTH", "true").strip().lower() == "true"
+        if self.file_auth_enabled:
+            self._ensure_token_dir()
 
     def get_api_base(self) -> str:
         return os.getenv("CHATGPT_API_BASE") or os.getenv("OPENAI_CHATGPT_API_BASE") or CHATGPT_API_BASE
@@ -90,7 +92,14 @@ class Authenticator:
         if not os.path.exists(self.token_dir):
             os.makedirs(self.token_dir, exist_ok=True)
 
+    def _require_file_auth(self) -> None:
+        if not self.file_auth_enabled:
+            raise GetAccessTokenError(
+                "ChatGPT file authentication is disabled. Configure a managed ChatGPT credential."
+            )
+
     def _read_auth_file(self) -> JsonObject | None:
+        self._require_file_auth()
         try:
             with open(self.auth_file, "r") as f:
                 return _JSON_OBJECT_ADAPTER.validate_python(json.load(f))
@@ -101,6 +110,7 @@ class Authenticator:
             return None
 
     def _write_auth_file(self, data: JsonObject) -> None:
+        self._require_file_auth()
         try:
             with open(self.auth_file, "w") as f:
                 json.dump(data, f)

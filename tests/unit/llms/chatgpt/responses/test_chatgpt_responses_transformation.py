@@ -6,12 +6,15 @@ Source: litellm/llms/chatgpt/responses/transformation.py
 
 import json
 from collections.abc import Generator
+from pathlib import Path
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 import litellm
+from litellm.exceptions import AuthenticationError
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.main import responses_api_bridge_check
@@ -27,6 +30,28 @@ def local_model_cost_map(monkeypatch: pytest.MonkeyPatch) -> Generator[None, Non
     litellm.get_model_info.cache_clear()
     yield
     litellm.get_model_info.cache_clear()
+
+
+def test_responses_requires_explicit_credentials_when_file_auth_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token_dir: Final = tmp_path / ".config" / "litellm" / "chatgpt"
+    monkeypatch.setenv("CHATGPT_ALLOW_FILE_AUTH", "false")
+    monkeypatch.delenv("CHATGPT_TOKEN_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config: Final = ChatGPTResponsesAPIConfig()
+
+    with pytest.raises(AuthenticationError, match="file authentication is disabled"):
+        config.validate_environment(headers={}, model="gpt-5.5", litellm_params=GenericLiteLLMParams())
+
+    headers: Final = config.validate_environment(
+        headers={},
+        model="gpt-5.5",
+        litellm_params=GenericLiteLLMParams(api_key="managed-token", chatgpt_auth_account_id="managed-account"),
+    )
+    assert headers["Authorization"] == "Bearer managed-token"
+    assert headers["ChatGPT-Account-Id"] == "managed-account"
+    assert not token_dir.exists()
 
 
 class TestChatGPTResponsesAPITransformation:
