@@ -383,7 +383,18 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         client: OpenAI | AsyncOpenAI | None = None,
         shared_session: Optional["ClientSession"] = None,
     ) -> OpenAI | AsyncOpenAI | None:
+        from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+
         workload_identity_config: Final = resolve_openai_workload_identity_config(api_key=api_key, api_base=api_base)
+        transport_handler: HTTPHandler | AsyncHTTPHandler | None = None
+        if isinstance(client, (HTTPHandler, AsyncHTTPHandler)):
+            transport_handler = client
+            client = None
+        if transport_handler is not None:
+            if is_async and not isinstance(transport_handler, AsyncHTTPHandler):
+                raise TypeError("An asynchronous OpenAI request requires AsyncHTTPHandler")
+            if not is_async and not isinstance(transport_handler, HTTPHandler):
+                raise TypeError("A synchronous OpenAI request requires HTTPHandler")
         client_initialization_params: Final[dict] = locals()
         if client is None:
             if not isinstance(max_retries, int):
@@ -391,16 +402,24 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     status_code=422,
                     message=f"max retries must be an int. Passed in value: {max_retries}",
                 )
-            cached_client: Final = self.get_cached_openai_client(
-                client_initialization_params=client_initialization_params,
-                client_type="openai",
+            cached_client: Final = (
+                None
+                if transport_handler is not None
+                else self.get_cached_openai_client(
+                    client_initialization_params=client_initialization_params,
+                    client_type="openai",
+                )
             )
 
             if cached_client:
                 if isinstance(cached_client, OpenAI) or isinstance(cached_client, AsyncOpenAI):
                     return cached_client
             if is_async:
-                async_http_client: Final = OpenAIChatCompletion._get_async_http_client(shared_session=shared_session)
+                async_http_client: Final = (
+                    transport_handler.client
+                    if isinstance(transport_handler, AsyncHTTPHandler)
+                    else OpenAIChatCompletion._get_async_http_client(shared_session=shared_session)
+                )
                 http_client: httpx.Client | httpx.AsyncClient | None = async_http_client
                 _new_client: OpenAI | AsyncOpenAI = (
                     AsyncOpenAI(
@@ -422,7 +441,11 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     )
                 )
             else:
-                sync_http_client: Final = OpenAIChatCompletion._get_sync_http_client()
+                sync_http_client: Final = (
+                    transport_handler.client
+                    if isinstance(transport_handler, HTTPHandler)
+                    else OpenAIChatCompletion._get_sync_http_client()
+                )
                 http_client = sync_http_client
                 _new_client = (
                     OpenAI(
@@ -444,13 +467,15 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     )
                 )
 
-            ## SAVE CACHE KEY
-            self.set_cached_openai_client(
-                openai_client=_new_client,
-                client_initialization_params=client_initialization_params,
-                client_type="openai",
-                litellm_owned_client=self.owns_wrapped_http_client(http_client),
-            )
+            ## SAVE CACHE KEY. Per-credential transports are intentionally
+            # request-scoped and their URLs must never enter a cache key.
+            if transport_handler is None:
+                self.set_cached_openai_client(
+                    openai_client=_new_client,
+                    client_initialization_params=client_initialization_params,
+                    client_type="openai",
+                    litellm_owned_client=self.owns_wrapped_http_client(http_client),
+                )
             return _new_client
 
         else:

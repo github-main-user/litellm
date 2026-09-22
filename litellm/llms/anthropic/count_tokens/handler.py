@@ -41,6 +41,7 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
         tools: list[dict[str, JsonValue]] | None = None,
         system: JsonValue = None,
         optional_params: Mapping[str, JsonValue] | None = None,
+        proxy_url: str | None = None,
     ) -> dict[str, JsonValue]:
         """
         Handle a CountTokens request using httpx.
@@ -84,18 +85,24 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
             # Get required headers
             headers: Final = self.get_required_headers(api_key)
 
-            # Use LiteLLM's async httpx client
-            async_client: Final = get_async_httpx_client(llm_provider=litellm.LlmProviders.ANTHROPIC)
+            async_client: Final = get_async_httpx_client(
+                llm_provider=litellm.LlmProviders.ANTHROPIC,
+                params={"proxy_url": proxy_url} if proxy_url is not None else None,
+            )
+            owns_client: Final = proxy_url is not None
 
-            # Use provided timeout or fall back to litellm.request_timeout
             request_timeout: Final = timeout if timeout is not None else litellm.request_timeout
 
-            response: Final = await async_client.post(
-                endpoint_url,
-                headers=headers,
-                json=request_body,
-                timeout=request_timeout,
-            )
+            try:
+                response: Final = await async_client.post(
+                    endpoint_url,
+                    headers=headers,
+                    json=request_body,
+                    timeout=request_timeout,
+                )
+            finally:
+                if owns_client:
+                    await async_client.close()
 
             verbose_logger.debug("Response status: %s", response.status_code)
 

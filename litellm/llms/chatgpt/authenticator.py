@@ -95,7 +95,8 @@ class Authenticator:
     def _require_file_auth(self) -> None:
         if not self.file_auth_enabled:
             raise GetAccessTokenError(
-                "ChatGPT file authentication is disabled. Configure a managed ChatGPT credential."
+                status_code=401,
+                message="ChatGPT file authentication is disabled. Configure a managed ChatGPT credential.",
             )
 
     def _read_auth_file(self) -> JsonObject | None:

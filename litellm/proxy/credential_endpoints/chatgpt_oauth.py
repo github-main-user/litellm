@@ -12,6 +12,10 @@ import litellm
 from litellm.exceptions import AuthenticationError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.litellm_core_utils.credential_proxy import (
+    get_credential_proxy_url,
+    validate_proxy_url,
+)
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_DEVICE_VERIFY_URL,
     ChatGPTAuthError,
@@ -35,6 +39,7 @@ from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.types.utils import CallTypes
 
 CHATGPT_CREDENTIAL_VALUE_KEY: Final = "litellm_internal_chatgpt_auth_token"
+CREDENTIAL_PROXY_VALUE_KEY: Final = "litellm_internal_proxy_url"
 CHATGPT_CREDENTIAL_PROVIDER: Final = "chatgpt"
 CHATGPT_CREDENTIAL_AUTH_TYPE: Final = "oauth"
 CHATGPT_TOKEN_EXPIRY_SKEW_SECONDS: Final = 60
@@ -46,6 +51,7 @@ router: Final = APIRouter()
 
 class ChatGPTOAuthStartRequest(BaseModel):
     credential_name: str | None = Field(default=None, min_length=1, max_length=255)
+    proxy_url: str | None = Field(default=None, repr=False)
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -72,6 +78,9 @@ class ChatGPTOAuthPollResponse(BaseModel):
 
 class ChatGPTOAuthAttempt(BaseModel):
     credential_name: str | None
+    actor: str
+    proxy_url: str | None = Field(default=None, repr=False)
+    previous_proxy_url: str | None = Field(default=None, repr=False)
     device_auth_id: str
     user_code: str
     interval_seconds: int
@@ -96,7 +105,7 @@ def _encode_attempt(attempt: ChatGPTOAuthAttempt) -> str:
     return encrypted
 
 
-def _decode_attempt(attempt_token: str) -> ChatGPTOAuthAttempt:
+def _decode_attempt(attempt_token: str, actor: str) -> ChatGPTOAuthAttempt:
     decrypted: Final = decrypt_value_helper(
         attempt_token,
         CHATGPT_CREDENTIAL_VALUE_KEY,
@@ -108,6 +117,8 @@ def _decode_attempt(attempt_token: str) -> ChatGPTOAuthAttempt:
         attempt: Final = ChatGPTOAuthAttempt.model_validate_json(decrypted)
     except Exception as error:
         raise HTTPException(status_code=400, detail="Invalid ChatGPT authentication attempt") from error
+    if attempt.actor != actor:
+        raise HTTPException(status_code=400, detail="Invalid ChatGPT authentication attempt")
     if time.time() >= attempt.expires_at:
         raise HTTPException(status_code=400, detail="ChatGPT authentication attempt expired")
     return attempt
@@ -148,13 +159,18 @@ def _is_chatgpt_oauth_credential(credential: CredentialItem) -> bool:
 
 
 def _decrypt_credential(credential: CredentialItem) -> CredentialItem:
+    values = {
+        key: decrypt_value_helper(value=value, key=key) or value
+        for key, value in credential.credential_values.items()
+    }
+    proxy_url = values.get(CREDENTIAL_PROXY_VALUE_KEY)
     return CredentialItem(
         credential_name=credential.credential_name,
-        credential_info=credential.credential_info,
-        credential_values={
-            key: decrypt_value_helper(value=value, key=key) or value
-            for key, value in credential.credential_values.items()
+        credential_info={
+            **credential.credential_info,
+            "proxy_configured": isinstance(proxy_url, str) and bool(proxy_url),
         },
+        credential_values=values,
     )
 
 
@@ -195,21 +211,37 @@ async def _store_tokens(
     credential_name: str,
     tokens: ChatGPTTokens,
     actor: str,
+    proxy_url: str | None,
+    previous_proxy_url: str | None,
 ) -> None:
     from litellm.proxy.proxy_server import prisma_client
 
     if prisma_client is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-    existing: Final = await CredentialsRepository(prisma_client).find_by_name(credential_name)
-    if existing is not None and existing.credential_info.get("provider") != CHATGPT_CREDENTIAL_PROVIDER:
-        raise HTTPException(status_code=409, detail="Credential name is already used by another provider")
-    if existing is not None:
-        in_memory_existing: Final = _find_credential(credential_name)
-        existing_tokens: Final = (
-            _tokens_from_credential(in_memory_existing)
-            if in_memory_existing is not None
-            else _tokens_from_encrypted_credential(existing)
+    plaintext = CredentialItem(
+        credential_name=credential_name,
+        credential_info={
+            "provider": CHATGPT_CREDENTIAL_PROVIDER,
+            "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
+            "proxy_configured": proxy_url is not None,
+        },
+        credential_values={
+            CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json(),
+            **({CREDENTIAL_PROXY_VALUE_KEY: proxy_url} if proxy_url is not None else {}),
+        },
+    )
+    lock_key: Final = int.from_bytes(
+        hashlib.blake2b(credential_name.encode(), digest_size=8).digest(), "big", signed=True
+    )
+    async with prisma_client.db.tx() as transaction:
+        await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
+        row: Final = await transaction.litellm_credentialstable.find_unique(
+            where={"credential_name": credential_name}
         )
+        info: Final = row.credential_info if row is not None else {}
+        if row is not None and info.get("provider") != CHATGPT_CREDENTIAL_PROVIDER:
+            raise HTTPException(status_code=409, detail="Credential name is already used by another provider")
+        existing_tokens: Final = _tokens_from_encrypted_credential(row) if row is not None else None
         if (
             existing_tokens is not None
             and existing_tokens.account_id is not None
@@ -217,25 +249,70 @@ async def _store_tokens(
             and existing_tokens.account_id != tokens.account_id
         ):
             raise HTTPException(status_code=409, detail="Credential name belongs to another ChatGPT account")
-    plaintext: Final = CredentialItem(
-        credential_name=credential_name,
-        credential_info={
-            "provider": CHATGPT_CREDENTIAL_PROVIDER,
-            "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
-        },
-        credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
-    )
-    encrypted: Final = CredentialHelperUtils.encrypt_credential_values(plaintext)
-    data: Final = jsonify_object(encrypted.model_dump())
-    repository: Final = CredentialsRepository(prisma_client)
-    if existing is None:
-        await repository.create(data={**data, "created_by": actor, "updated_by": actor})
-    else:
-        await repository.update_by_name(
-            credential_name,
-            data={**data, "updated_by": actor},
+        encrypted_proxy: Final = (
+            row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY) if row is not None else None
         )
+        current_proxy_value: Final = (
+            decrypt_value_helper(encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
+            if isinstance(encrypted_proxy, str)
+            else None
+        )
+        current_proxy: Final = current_proxy_value or None
+        if current_proxy != previous_proxy_url:
+            raise HTTPException(
+                status_code=409,
+                detail="Credential proxy configuration changed; restart authentication",
+            )
+        latest_row: Final = await transaction.litellm_credentialstable.find_unique(
+            where={"credential_name": credential_name}
+        )
+        latest_encrypted_proxy: Final = (
+            latest_row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
+            if latest_row is not None
+            else None
+        )
+        latest_proxy_value: Final = (
+            decrypt_value_helper(latest_encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
+            if isinstance(latest_encrypted_proxy, str)
+            else None
+        )
+        latest_proxy: Final = latest_proxy_value or None
+        if (row is None) != (latest_row is None) or latest_proxy != current_proxy:
+            raise HTTPException(
+                status_code=409,
+                detail="Credential proxy configuration changed; restart authentication",
+            )
+        row = latest_row
+        encrypted = CredentialHelperUtils.encrypt_credential_values(plaintext)
+        if row is not None:
+            existing_values = dict(row.credential_values)
+            if proxy_url is None:
+                existing_values.pop(CREDENTIAL_PROXY_VALUE_KEY, None)
+            plaintext = CredentialItem(
+                credential_name=credential_name,
+                credential_info={
+                    **(row.credential_info or {}),
+                    **plaintext.credential_info,
+                },
+                credential_values=plaintext.credential_values,
+            )
+            encrypted = CredentialItem(
+                credential_name=credential_name,
+                credential_info=plaintext.credential_info,
+                credential_values={**existing_values, **encrypted.credential_values},
+            )
+        data: Final = jsonify_object(encrypted.model_dump())
+        if row is None:
+            await transaction.litellm_credentialstable.create(
+                data={**data, "created_by": actor, "updated_by": actor}
+            )
+        else:
+            await transaction.litellm_credentialstable.update(
+                where={"credential_name": credential_name},
+                data={**data, "updated_by": actor},
+            )
     CredentialAccessor.upsert_credentials([plaintext])
+    await publish_config_change_for_object_type("litellm_credentialstable")
 
 
 @router.post(
@@ -246,14 +323,26 @@ async def _store_tokens(
 )
 async def start_chatgpt_oauth(
     payload: ChatGPTOAuthStartRequest,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> ChatGPTOAuthStartResponse:
     credential_name: Final = _validate_credential_name(payload.credential_name)
     try:
-        device_code: Final = await asyncio.to_thread(ChatGPTOAuthClient().request_device_code)
+        previous_proxy_url: Final = (
+            get_credential_proxy_url(credential_name) if credential_name is not None else None
+        )
+        proxy_url: Final = (
+            validate_proxy_url(payload.proxy_url) if payload.proxy_url is not None else previous_proxy_url
+        )
+        device_code: Final = await asyncio.to_thread(ChatGPTOAuthClient(proxy_url=proxy_url).request_device_code)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     except ChatGPTAuthError as error:
         raise HTTPException(status_code=error.status_code or 400, detail=str(error)) from error
     attempt: Final = ChatGPTOAuthAttempt(
         credential_name=credential_name,
+        actor=str(user_api_key_dict.user_id or "litellm-proxy-admin"),
+        proxy_url=proxy_url,
+        previous_proxy_url=previous_proxy_url,
         device_auth_id=device_code.device_auth_id,
         user_code=device_code.user_code,
         interval_seconds=device_code.interval_seconds,
@@ -278,13 +367,14 @@ async def poll_chatgpt_oauth(
     payload: ChatGPTOAuthPollRequest,
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
 ) -> ChatGPTOAuthPollResponse:
-    attempt: Final = _decode_attempt(payload.attempt_token)
+    actor: Final = str(user_api_key_dict.user_id or "litellm-proxy-admin")
+    attempt: Final = _decode_attempt(payload.attempt_token, actor)
     device_code: Final = ChatGPTDeviceCode(
         device_auth_id=attempt.device_auth_id,
         user_code=attempt.user_code,
         interval_seconds=attempt.interval_seconds,
     )
-    oauth_client: Final = ChatGPTOAuthClient()
+    oauth_client: Final = ChatGPTOAuthClient(proxy_url=attempt.proxy_url)
     try:
         authorization: Final = await asyncio.to_thread(oauth_client.poll_authorization, device_code)
         if authorization is None:
@@ -296,8 +386,13 @@ async def poll_chatgpt_oauth(
     except ChatGPTAuthError as error:
         raise HTTPException(status_code=error.status_code or 400, detail=str(error)) from error
     credential_name: Final = _resolved_credential_name(attempt.credential_name, tokens)
-    actor: Final = str(user_api_key_dict.user_id or "litellm-proxy-admin")
-    await _store_tokens(credential_name=credential_name, tokens=tokens, actor=actor)
+    await _store_tokens(
+        credential_name=credential_name,
+        tokens=tokens,
+        actor=actor,
+        proxy_url=attempt.proxy_url,
+        previous_proxy_url=attempt.previous_proxy_url,
+    )
     return ChatGPTOAuthPollResponse(status="connected", credential_name=credential_name)
 
 
@@ -391,7 +486,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         credential_info: dict[str, Any]
         async with prisma_client.db.tx() as transaction:
             await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
-            row: Final = await transaction.litellm_credentialstable.find_unique(
+            row = await transaction.litellm_credentialstable.find_unique(
                 where={"credential_name": credential_name}
             )
             if row is None:
@@ -408,7 +503,31 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             if self._is_fresh(stored):
                 refreshed = stored
             else:
-                refreshed = await asyncio.to_thread(self._oauth_client.refresh, stored.refresh_token)
+                encrypted_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
+                proxy_url = (
+                    decrypt_value_helper(encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
+                    if isinstance(encrypted_proxy, str)
+                    else None
+                ) or None
+                if proxy_url is not None and not isinstance(proxy_url, str):
+                    raise TypeError("Credential proxy configuration cannot be decrypted")
+                refresh_client: Final = (
+                    ChatGPTOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
+                )
+                refreshed = await asyncio.to_thread(refresh_client.refresh, stored.refresh_token)
+                latest_row: Final = await transaction.litellm_credentialstable.find_unique(
+                    where={"credential_name": credential_name}
+                )
+                if latest_row is None:
+                    raise ValueError("Credential was removed during refresh")
+                row = latest_row
+                latest_encrypted_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
+                latest_proxy: Final = (
+                    decrypt_value_helper(latest_encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
+                    if isinstance(latest_encrypted_proxy, str)
+                    else None
+                )
+                proxy_url = latest_proxy if isinstance(latest_proxy, str) and latest_proxy else None
                 encrypted_bundle: Final = encrypt_value_helper(refreshed.to_json())
                 if not isinstance(encrypted_bundle, str):
                     raise ValueError("Credential token bundle cannot be encrypted")
@@ -423,6 +542,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                             **(row.credential_info or {}),
                             "provider": CHATGPT_CREDENTIAL_PROVIDER,
                             "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
+                            "proxy_configured": proxy_url is not None,
                         },
                         "updated_by": "litellm-chatgpt-oauth",
                     },
@@ -432,13 +552,27 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                 "provider": CHATGPT_CREDENTIAL_PROVIDER,
                 "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
             }
+            cached_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
+            plaintext_proxy: Final = (
+                decrypt_value_helper(cached_proxy, CREDENTIAL_PROXY_VALUE_KEY)
+                if isinstance(cached_proxy, str)
+                else None
+            )
+            credential_info["proxy_configured"] = bool(plaintext_proxy)
         await publish_config_change_for_object_type("litellm_credentialstable")
         CredentialAccessor.upsert_credentials(
             [
                 CredentialItem(
                     credential_name=credential_name,
                     credential_info=credential_info,
-                    credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: refreshed.to_json()},
+                    credential_values={
+                        CHATGPT_CREDENTIAL_VALUE_KEY: refreshed.to_json(),
+                        **(
+                            {CREDENTIAL_PROXY_VALUE_KEY: plaintext_proxy}
+                            if isinstance(plaintext_proxy, str) and plaintext_proxy
+                            else {}
+                        ),
+                    },
                 )
             ]
         )

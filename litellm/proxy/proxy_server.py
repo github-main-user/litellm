@@ -1909,6 +1909,15 @@ class _ExceptionRow(TypedDict, total=False):
 
 @app.exception_handler(RequestValidationError)
 async def otel_request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    if request.url.path == "/credentials" or request.url.path.startswith("/credentials/"):
+        credential_errors: Final = [
+            {key: value for key, value in error.items() if key in {"type", "loc", "msg"}}
+            for error in exc.errors()
+        ]
+        _close_dangling_otel_server_span(
+            request, 422, exc=HTTPException(status_code=422, detail="Invalid credential request")
+        )
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(credential_errors)})
     if request.url.path.startswith(MANAGEMENT_V1_PREFIX):
         validation_errors: Final[Sequence[ValidationErrorDetail]] = exc.errors()
         problem: Final = request_validation_problem(validation_errors)

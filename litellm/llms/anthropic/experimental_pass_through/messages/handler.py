@@ -12,6 +12,7 @@ from functools import partial
 from typing import Any, Final, cast
 
 import litellm
+from litellm.litellm_core_utils.credential_proxy import pop_request_proxy_url as _credential_proxy_url
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
@@ -110,6 +111,33 @@ def _deployment_supports_cache_control_ttl(model_info: object) -> bool:
 # Initialize any necessary instances or variables here
 base_llm_http_handler = BaseLLMHTTPHandler()
 #################################################
+
+
+class _CredentialProxyMessagesStream:
+    def __init__(self, stream: object, handler: AsyncHTTPHandler) -> None:
+        self._stream = stream
+        self._handler = handler
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+    def __aiter__(self) -> "_CredentialProxyMessagesStream":
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            return await self._stream.__anext__()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        from .streaming_iterator import aclose_if_supported
+
+        try:
+            await aclose_if_supported(self._stream)
+        finally:
+            await self._handler.close()
 
 
 async def _execute_pre_request_hooks(
@@ -251,6 +279,8 @@ async def anthropic_messages(
 
     Runs the empty-content-block sanitizer before any backend dispatch.
     """
+    proxy_handler: AsyncHTTPHandler | None = None
+
     # Anthropic's API rejects requests containing empty / whitespace-only
     # text content blocks ("messages: text content blocks must be
     # non-empty") and empty thinking blocks ("each thinking block must
@@ -362,6 +392,12 @@ async def anthropic_messages(
                 **kwargs,
             )
 
+    proxy_url: Final = _credential_proxy_url(kwargs)
+    if proxy_url is not None:
+        proxy_handler = AsyncHTTPHandler(proxy_url=proxy_url)
+        client = proxy_handler
+        kwargs.pop("shared_session", None)
+
     loop: Final = asyncio.get_event_loop()
     kwargs["is_async"] = True
 
@@ -396,16 +432,23 @@ async def anthropic_messages(
     func_with_context: Final = partial(ctx.run, func)
     try:
         init_response: Final = await loop.run_in_executor(None, func_with_context)
-        if asyncio.iscoroutine(init_response):
-            return await init_response
-        return init_response
-    except BaseLLMException as e:
-        raise exception_type(
-            model=model,
-            custom_llm_provider=custom_llm_provider,
-            original_exception=e,
-            extra_kwargs=kwargs,
-        )
+        response = await init_response if asyncio.iscoroutine(init_response) else init_response
+        if proxy_handler is not None:
+            if hasattr(response, "__aiter__"):
+                return cast(Any, _CredentialProxyMessagesStream(response, proxy_handler))
+            await proxy_handler.close()
+        return response
+    except BaseException as e:
+        if proxy_handler is not None:
+            await proxy_handler.close()
+        if isinstance(e, BaseLLMException):
+            raise exception_type(
+                model=model,
+                custom_llm_provider=custom_llm_provider,
+                original_exception=e,
+                extra_kwargs=kwargs,
+            )
+        raise
 
 
 def validate_anthropic_api_metadata(metadata: dict | None = None) -> dict | None:

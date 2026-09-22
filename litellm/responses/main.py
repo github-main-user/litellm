@@ -21,12 +21,14 @@ from litellm.constants import DEFAULT_CHAT_COMPLETION_PARAM_VALUES, request_time
 from litellm.integrations.anthropic_cache_control_hook import CARRY_UNMATCHED_MESSAGE_POINTS
 from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.litellm_core_utils.core_helpers import normalize_drop_params
+from litellm.litellm_core_utils.credential_proxy import pop_request_proxy_url as _credential_proxy_url
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     update_responses_input_with_model_file_ids,
     update_responses_tools_with_model_file_ids,
 )
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.llms.openai_like.responses.transformation import OpenAILikeResponsesConfig
 from litellm.responses.litellm_completion_transformation.handler import (
@@ -92,6 +94,60 @@ __all__ = (
 base_llm_http_handler = BaseLLMHTTPHandler()
 litellm_completion_transformation_handler: Final = LiteLLMCompletionTransformationHandler()
 #################################################
+
+
+class _CredentialProxySyncStream:
+    def __init__(self, stream: object, handler: HTTPHandler) -> None:
+        self._stream = stream
+        self._handler = handler
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+    def __iter__(self) -> "_CredentialProxySyncStream":
+        return self
+
+    def __next__(self) -> object:
+        try:
+            return next(self._stream)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        close = getattr(self._stream, "close", None)
+        try:
+            if close is not None:
+                close()
+        finally:
+            self._handler.close()
+
+
+class _CredentialProxyAsyncStream:
+    def __init__(self, stream: object, handler: AsyncHTTPHandler) -> None:
+        self._stream = stream
+        self._handler = handler
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+    def __aiter__(self) -> "_CredentialProxyAsyncStream":
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            return await self._stream.__anext__()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        close = getattr(self._stream, "aclose", None)
+        try:
+            if close is not None:
+                await close()
+        finally:
+            await self._handler.close()
 
 
 def _has_file_search_tool(tools: Iterable[Mapping[str, object]] | None) -> bool:
@@ -607,8 +663,16 @@ async def aresponses(
     """
     Async: Handles responses API requests by reusing the synchronous function
     """
-    local_vars: Final = locals()
+    proxy_handler: AsyncHTTPHandler | None = None
     try:
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        if proxy_url is not None:
+            proxy_handler = AsyncHTTPHandler(proxy_url=proxy_url)
+            kwargs["client"] = proxy_handler
+            kwargs.pop("shared_session", None)
+        local_vars: Final = locals()
+        local_vars.pop("proxy_url", None)
+        local_vars.pop("proxy_handler", None)
         loop: Final = asyncio.get_event_loop()
         kwargs["aresponses"] = True
 
@@ -747,13 +811,21 @@ async def aresponses(
         if response is None:
             raise ValueError(f"Got an unexpected None response from the Responses API: {response}")
 
+        if proxy_handler is not None:
+            if hasattr(response, "__aiter__"):
+                return cast(Any, _CredentialProxyAsyncStream(response, proxy_handler))
+            await proxy_handler.close()
         return response
-    except Exception as e:
+    except BaseException as e:
+        if proxy_handler is not None:
+            await proxy_handler.close()
+        if not isinstance(e, Exception):
+            raise
         raise litellm.exception_type(
             model=model,
             custom_llm_provider=custom_llm_provider,
             original_exception=e,
-            completion_kwargs=local_vars,
+            completion_kwargs=locals().get("local_vars", {}),
             extra_kwargs=kwargs,
         )
 
@@ -1161,7 +1233,15 @@ def responses(
     Synchronous version of the Responses API.
     Uses the synchronous HTTP handler to make requests.
     """
+    proxy_handler: HTTPHandler | None = None
+    proxy_url: Final = None if isinstance(kwargs.get("client"), AsyncHTTPHandler) else _credential_proxy_url(kwargs)
+    if proxy_url is not None:
+        proxy_handler = HTTPHandler(proxy_url=proxy_url)
+        kwargs["client"] = proxy_handler
+        kwargs.pop("shared_session", None)
     local_vars: Final = locals()
+    local_vars.pop("proxy_url", None)
+    local_vars.pop("proxy_handler", None)
 
     try:
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
@@ -1218,6 +1298,8 @@ def responses(
         # MOCK RESPONSE LOGIC
         #########################################################
         if litellm_params.mock_response and isinstance(litellm_params.mock_response, str):
+            if proxy_handler is not None:
+                proxy_handler.close()
             return mock_responses_api_response(mock_response=litellm_params.mock_response)
 
         model, custom_llm_provider = _resolve_model_provider_for_responses(
@@ -1226,6 +1308,12 @@ def responses(
             litellm_params=litellm_params,
             local_vars=local_vars,
         )
+
+        request_client: Final = kwargs.get("client")
+        if isinstance(request_client, (HTTPHandler, AsyncHTTPHandler)) and request_client.proxy_url is not None:
+            from litellm.litellm_core_utils.credential_proxy import require_proxy_provider_support
+
+            require_proxy_provider_support(custom_llm_provider)
 
         #########################################################
         # Update input and tools with provider-specific file IDs if managed files are used
@@ -1340,7 +1428,7 @@ def responses(
 
         if _bridges_to_chat_completions(responses_api_provider_config, use_chat_completions_api):
             bridge_kwargs: Final = _bridge_kwargs(kwargs, responses_api_provider_config, allowed_openai_params)
-            return litellm_completion_transformation_handler.response_api_handler(
+            response = litellm_completion_transformation_handler.response_api_handler(
                 model=model,
                 input=input,
                 responses_api_request=response_api_optional_params,
@@ -1353,6 +1441,11 @@ def responses(
                 allowed_openai_params=allowed_openai_params,
                 **bridge_kwargs,
             )
+            if proxy_handler is not None and not _is_async:
+                if hasattr(response, "__iter__") and not isinstance(response, ResponsesAPIResponse):
+                    return _CredentialProxySyncStream(response, proxy_handler)
+                proxy_handler.close()
+            return response
 
         # Get optional parameters for the responses API
         request_drop_params: Final = kwargs.get("drop_params")
@@ -1418,8 +1511,14 @@ def responses(
             # (mirrors litellm/main.py:1371 for chat completions)
             response._hidden_params["custom_llm_provider"] = custom_llm_provider
 
+        if proxy_handler is not None:
+            if hasattr(response, "__iter__") and not isinstance(response, ResponsesAPIResponse):
+                return _CredentialProxySyncStream(response, proxy_handler)
+            proxy_handler.close()
         return response
     except Exception as e:
+        if proxy_handler is not None:
+            proxy_handler.close()
         raise litellm.exception_type(
             model=model,
             custom_llm_provider=custom_llm_provider,

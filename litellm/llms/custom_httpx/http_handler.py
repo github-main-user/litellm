@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from enum import Enum
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from io import BytesIO
 from types import MappingProxyType
@@ -600,6 +601,13 @@ class MaskedHTTPStatusError(httpx.HTTPStatusError):
         self.status_code = original_error.response.status_code
 
 
+class _CredentialProxyTrust(Enum):
+    ROUTER = "router"
+
+
+CREDENTIAL_PROXY_TRUSTED: Final = _CredentialProxyTrust.ROUTER
+
+
 class AsyncHTTPHandler:
     def __init__(
         self,
@@ -609,10 +617,16 @@ class AsyncHTTPHandler:
         client_alias: str | None = None,  # name for client in logs
         ssl_verify: VerifyTypes | None = None,
         shared_session: Optional["ClientSession"] = None,
+        proxy_url: str | None = None,
     ):
+        from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
+
         self.timeout = timeout
         self.event_hooks = event_hooks
         self.ssl_verify = ssl_verify
+        self.proxy_url = validate_proxy_url(proxy_url) if proxy_url is not None else None
+        if self.proxy_url is not None and shared_session is not None:
+            raise ValueError("A shared session cannot be used with a credential proxy")
         self.shared_session = shared_session
         self._owns_client = True
         self._client = self.create_client(
@@ -657,10 +671,14 @@ class AsyncHTTPHandler:
             timeout = _DEFAULT_TIMEOUT
         # Create a client with a connection pool
 
-        transport: Final = AsyncHTTPHandler._create_async_transport(
-            ssl_context=ssl_config if isinstance(ssl_config, ssl.SSLContext) else None,
-            ssl_verify=ssl_config if isinstance(ssl_config, bool) else None,
-            shared_session=shared_session,
+        transport: Final = (
+            AsyncHTTPTransport(proxy=self.proxy_url, verify=ssl_config, cert=cert, http2=http2_enabled())
+            if self.proxy_url is not None
+            else AsyncHTTPHandler._create_async_transport(
+                ssl_context=ssl_config if isinstance(ssl_config, ssl.SSLContext) else None,
+                ssl_verify=ssl_config if isinstance(ssl_config, bool) else None,
+                shared_session=shared_session,
+            )
         )
 
         # Get default headers (User-Agent, overridable via LITELLM_USER_AGENT)
@@ -668,7 +686,11 @@ class AsyncHTTPHandler:
 
         return httpx.AsyncClient(
             transport=transport,
-            mounts=AsyncHTTPHandler._create_httpx_proxy_mounts(transport, verify=ssl_config, cert=cert),
+            # An explicit credential proxy is the sole route.  In particular, do
+            # not install environment NO_PROXY mounts which could bypass it.
+            mounts=None
+            if self.proxy_url is not None
+            else AsyncHTTPHandler._create_httpx_proxy_mounts(transport, verify=ssl_config, cert=cert),
             event_hooks=event_hooks,
             timeout=timeout,
             verify=ssl_config,
@@ -1360,9 +1382,15 @@ class HTTPHandler:
         ssl_verify: bool | str | None = None,
         disable_default_headers: bool
         | None = False,  # arize phoenix returns different API responses when user agent header in request
+        proxy_url: str | None = None,
     ):
+        from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
+
         self.timeout = timeout
         self.ssl_verify = ssl_verify
+        self.proxy_url = validate_proxy_url(proxy_url) if proxy_url is not None else None
+        if self.proxy_url is not None and client is not None:
+            raise ValueError("An existing client cannot be used with a credential proxy")
         self.disable_default_headers = disable_default_headers
         self._owns_client = client is None
         self._heal_lock = threading.Lock()
@@ -1380,9 +1408,17 @@ class HTTPHandler:
         default_headers: Final = get_default_headers() if not self.disable_default_headers else None
 
         # Create a client with a connection pool
+        transport: Final = (
+            HTTPTransport(proxy=self.proxy_url, verify=ssl_config, cert=cert, http2=http2_enabled())
+            if self.proxy_url is not None
+            else self._create_sync_transport()
+        )
         return httpx.Client(
-            transport=self._create_sync_transport(),
-            mounts=self._create_sync_proxy_mounts(verify=ssl_config, cert=cert),
+            transport=transport,
+            # Explicit per-credential routing must not honor environment bypasses.
+            mounts=None
+            if self.proxy_url is not None
+            else self._create_sync_proxy_mounts(verify=ssl_config, cert=cert),
             timeout=self.timeout if self.timeout is not None else _DEFAULT_TIMEOUT,
             verify=ssl_config,
             cert=cert,
@@ -1699,6 +1735,14 @@ def get_async_httpx_client(
 
     Caches the new client and returns it.
     """
+    # Proxy URLs can contain passwords. Never serialize one into the shared
+    # cache key, and don't cache these clients: credential changes take effect
+    # on the next call.
+    if params is not None and params.get("proxy_url") is not None:
+        proxy_handler_params = {k: v for k, v in params.items() if k != "disable_aiohttp_transport"}
+        proxy_handler_params["shared_session"] = shared_session
+        return AsyncHTTPHandler(**proxy_handler_params)
+
     _params_key_name = ""
     if params is not None:
         for key, value in params.items():
@@ -1749,6 +1793,10 @@ def _get_httpx_client(params: dict | None = None) -> HTTPHandler:
 
     Caches the new client and returns it.
     """
+    if params is not None and params.get("proxy_url") is not None:
+        proxy_handler_params = {k: v for k, v in params.items() if k != "disable_aiohttp_transport"}
+        return HTTPHandler(**proxy_handler_params)
+
     _params_key_name = ""
     if params is not None:
         for key, value in params.items():

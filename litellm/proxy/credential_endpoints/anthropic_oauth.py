@@ -17,6 +17,7 @@ import litellm
 from litellm.exceptions import AuthenticationError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url, validate_proxy_url
 from litellm.llms.anthropic.oauth_client import (
     ANTHROPIC_OAUTH_REDIRECT_URI,
     AnthropicOAuthClient,
@@ -34,6 +35,7 @@ from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.types.utils import CallTypes
 
 ANTHROPIC_CREDENTIAL_VALUE_KEY: Final = "litellm_internal_anthropic_auth_token"
+CREDENTIAL_PROXY_VALUE_KEY: Final = "litellm_internal_proxy_url"
 ANTHROPIC_CREDENTIAL_PROVIDER: Final = "anthropic"
 ANTHROPIC_CREDENTIAL_AUTH_TYPE: Final = "oauth"
 ANTHROPIC_ATTEMPT_LIFETIME_SECONDS: Final = 10 * 60
@@ -86,12 +88,13 @@ _OBJECT_MAPPING: Final = TypeAdapter(dict[object, object])
 
 class AnthropicOAuthStartRequest(BaseModel):
     credential_name: str = Field(min_length=1, max_length=255)
+    proxy_url: str | None = Field(default=None, repr=False)
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
 
 class AnthropicOAuthCompleteRequest(BaseModel):
-    attempt_token: str = Field(min_length=1, max_length=8192, repr=False)
+    attempt_token: str = Field(min_length=1, max_length=65536, repr=False)
     authorization_code: str = Field(min_length=1, max_length=8192, repr=False)
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -111,6 +114,8 @@ class AnthropicOAuthCompleteResponse(BaseModel):
 class AnthropicOAuthAttempt(BaseModel):
     credential_name: str
     actor: str
+    proxy_url: str | None = Field(default=None, repr=False)
+    previous_proxy_url: str | None = Field(default=None, repr=False)
     state: str = Field(repr=False)
     code_verifier: str = Field(repr=False)
     expires_at: float
@@ -239,6 +244,21 @@ def _credential_info_from_row(row: _CredentialRow) -> dict[str, object]:
     return _string_object_mapping(row.credential_info) or {}
 
 
+def _proxy_from_row(row: _CredentialRow) -> str | None:
+    values: Final = _string_object_mapping(row.credential_values)
+    encrypted: Final = values.get(CREDENTIAL_PROXY_VALUE_KEY) if values is not None else None
+    if not isinstance(encrypted, str) or not encrypted:
+        return None
+    decrypted: Final = decrypt_value_helper(
+        encrypted, CREDENTIAL_PROXY_VALUE_KEY, exception_type="debug"
+    )
+    if decrypted == "":
+        return None
+    if not isinstance(decrypted, str):
+        raise TypeError("Credential proxy configuration cannot be decrypted")
+    return validate_proxy_url(decrypted)
+
+
 def _lock_key(identity: str, namespace: str = "credential") -> int:
     return int.from_bytes(
         hashlib.blake2b(f"anthropic-oauth:{namespace}:{identity}".encode(), digest_size=8).digest(), "big", signed=True
@@ -249,11 +269,24 @@ def _find_cached(credential_name: str) -> CredentialItem | None:
     return next((item for item in litellm.credential_list if item.credential_name == credential_name), None)
 
 
-def _plaintext_credential(credential_name: str, tokens: AnthropicOAuthTokens) -> CredentialItem:
+def _plaintext_credential(
+    credential_name: str,
+    tokens: AnthropicOAuthTokens,
+    proxy_url: str | None = None,
+    credential_info: Mapping[str, object] | None = None,
+) -> CredentialItem:
     return CredentialItem(
         credential_name=credential_name,
-        credential_info={"provider": ANTHROPIC_CREDENTIAL_PROVIDER, "auth_type": ANTHROPIC_CREDENTIAL_AUTH_TYPE},
-        credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: tokens.to_json()},
+        credential_info={
+            **(credential_info or {}),
+            "provider": ANTHROPIC_CREDENTIAL_PROVIDER,
+            "auth_type": ANTHROPIC_CREDENTIAL_AUTH_TYPE,
+            "proxy_configured": proxy_url is not None,
+        },
+        credential_values={
+            ANTHROPIC_CREDENTIAL_VALUE_KEY: tokens.to_json(),
+            **({CREDENTIAL_PROXY_VALUE_KEY: proxy_url} if proxy_url is not None else {}),
+        },
     )
 
 
@@ -273,16 +306,22 @@ async def _complete_and_store(
     database: Final = cast(_PrismaClient, prisma_client).db
     async with database.tx(timeout=ANTHROPIC_REFRESH_TRANSACTION_TIMEOUT) as transaction:
         await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", _lock_key(attempt.credential_name))
-        row: Final = await transaction.litellm_credentialstable.find_unique(
+        row = await transaction.litellm_credentialstable.find_unique(
             where={"credential_name": attempt.credential_name}
         )
-        existing_info: Final = _credential_info_from_row(row) if row is not None else {}
+        existing_info = _credential_info_from_row(row) if row is not None else {}
         if row is not None and (
             existing_info.get("provider") != ANTHROPIC_CREDENTIAL_PROVIDER
             or existing_info.get("auth_type") != ANTHROPIC_CREDENTIAL_AUTH_TYPE
         ):
             raise HTTPException(
                 status_code=409, detail="Credential name is already used by another authentication type"
+            )
+        current_proxy: Final = _proxy_from_row(row) if row is not None else None
+        if current_proxy != attempt.previous_proxy_url:
+            raise HTTPException(
+                status_code=409,
+                detail="Credential proxy configuration changed; restart authentication",
             )
         existing_tokens: Final = _tokens_from_row(row) if row is not None else None
         if existing_tokens is not None and existing_tokens.account_id is not None:
@@ -300,6 +339,24 @@ async def _complete_and_store(
                 ) from None
             raise HTTPException(status_code=400, detail="Unable to complete Anthropic authentication") from None
         if (
+            tokens.account_id is not None
+            and (existing_tokens is None or existing_tokens.account_id is None)
+        ):
+            await transaction.execute_raw(
+                "SELECT pg_advisory_xact_lock($1::bigint)", _lock_key(tokens.account_id, "account")
+            )
+        latest_row: Final = await transaction.litellm_credentialstable.find_unique(
+            where={"credential_name": attempt.credential_name}
+        )
+        latest_proxy: Final = _proxy_from_row(latest_row) if latest_row is not None else None
+        if (row is None) != (latest_row is None) or latest_proxy != current_proxy:
+            raise HTTPException(
+                status_code=409,
+                detail="Credential proxy configuration changed; restart authentication",
+            )
+        row = latest_row
+        existing_info = _credential_info_from_row(row) if row is not None else {}
+        if (
             existing_tokens is not None
             and existing_tokens.account_id is not None
             and existing_tokens.account_id != tokens.account_id
@@ -308,8 +365,22 @@ async def _complete_and_store(
         stored_tokens: Final = (
             replace(tokens, device_id=existing_tokens.device_id) if existing_tokens is not None else tokens
         )
-        plaintext: Final = _plaintext_credential(attempt.credential_name, stored_tokens)
-        encrypted: Final = CredentialHelperUtils.encrypt_credential_values(plaintext)
+        plaintext: Final = _plaintext_credential(
+            attempt.credential_name,
+            stored_tokens,
+            attempt.proxy_url,
+            existing_info,
+        )
+        encrypted = CredentialHelperUtils.encrypt_credential_values(plaintext)
+        if row is not None:
+            existing_values: Final = _string_object_mapping(row.credential_values) or {}
+            if attempt.proxy_url is None:
+                existing_values.pop(CREDENTIAL_PROXY_VALUE_KEY, None)
+            encrypted = CredentialItem(
+                credential_name=encrypted.credential_name,
+                credential_info=plaintext.credential_info,
+                credential_values={**existing_values, **encrypted.credential_values},
+            )
         dumped: Final = _STRING_OBJECT_MAPPING.validate_python(encrypted.model_dump(), strict=True)
         data: Final = _database_data(dumped)
         if row is None:
@@ -341,10 +412,19 @@ async def start_anthropic_oauth(
             status_code=422,
             detail="Credential name may contain only letters, numbers, dots, underscores, and hyphens",
         )
-    authorization: Final = AnthropicOAuthClient().begin_authorization()
+    try:
+        previous_proxy_url: Final = get_credential_proxy_url(payload.credential_name)
+        proxy_url: Final = (
+            validate_proxy_url(payload.proxy_url) if payload.proxy_url is not None else previous_proxy_url
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    authorization: Final = AnthropicOAuthClient(proxy_url=proxy_url).begin_authorization()
     attempt: Final = AnthropicOAuthAttempt(
         credential_name=payload.credential_name,
         actor=_actor(user),
+        proxy_url=proxy_url,
+        previous_proxy_url=previous_proxy_url,
         state=authorization.state,
         code_verifier=authorization.code_verifier,
         expires_at=time.time() + ANTHROPIC_ATTEMPT_LIFETIME_SECONDS,
@@ -368,7 +448,7 @@ async def complete_anthropic_oauth(
     _require_admin(user)
     attempt: Final = _decode_attempt(payload.attempt_token, _actor(user))
     code: Final = _parse_authorization_code(payload.authorization_code, attempt.state)
-    await _complete_and_store(attempt, code, AnthropicOAuthClient())
+    await _complete_and_store(attempt, code, AnthropicOAuthClient(proxy_url=attempt.proxy_url))
     return AnthropicOAuthCompleteResponse(status="connected", credential_name=attempt.credential_name)
 
 
@@ -488,7 +568,9 @@ class AnthropicOAuthCredentialHook(CustomLogger):
         if row is None or not _is_managed_credential(row):
             return row
         tokens: Final = _tokens_from_row(row)
-        plaintext: Final = _plaintext_credential(credential_name, tokens)
+        plaintext: Final = _plaintext_credential(
+            credential_name, tokens, _proxy_from_row(row), _credential_info_from_row(row)
+        )
         CredentialAccessor.upsert_credentials([plaintext])
         return plaintext
 
@@ -534,7 +616,7 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             )
             if row is None:
                 raise ValueError("Credential not found")
-            info: Final = _credential_info_from_row(row)
+            info = _credential_info_from_row(row)
             if (
                 info.get("provider") != ANTHROPIC_CREDENTIAL_PROVIDER
                 or info.get("auth_type") != ANTHROPIC_CREDENTIAL_AUTH_TYPE
@@ -549,18 +631,33 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             should_refresh: Final = not self._is_fresh(stored) or (
                 rejected_access_token is not None and not token_was_rotated
             )
-            refreshed: Final = await self._oauth_client.refresh(stored) if should_refresh else stored
+            proxy_url = _proxy_from_row(row)
+            refresh_client: Final = (
+                AnthropicOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
+            )
+            refreshed: Final = await refresh_client.refresh(stored) if should_refresh else stored
             if should_refresh:
                 if stored.account_id is not None and refreshed.account_id != stored.account_id:
                     raise ValueError("Anthropic account identity changed during refresh")
+                latest_row: Final = await transaction.litellm_credentialstable.find_unique(
+                    where={"credential_name": credential_name}
+                )
+                if latest_row is None:
+                    raise ValueError("Credential was removed during refresh")
+                latest_proxy: Final = _proxy_from_row(latest_row)
+                latest_values: Final = _string_object_mapping(latest_row.credential_values)
+                if latest_values is None:
+                    raise TypeError("Credential values are invalid")
+                # A proxy edit is independent of token rotation. Preserve the newest
+                # encrypted value rather than resurrecting the one used by this request.
+                values = latest_values
+                proxy_url = latest_proxy
+                info = _credential_info_from_row(latest_row)
                 encrypted: Final = encrypt_value_helper(refreshed.to_json())
                 if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime crypto boundary
                     encrypted, str
                 ):
                     raise ValueError("Credential token bundle cannot be encrypted")
-                values: Final = _string_object_mapping(row.credential_values)
-                if values is None:
-                    raise TypeError("Credential values are invalid")
                 await transaction.litellm_credentialstable.update(
                     where={"credential_name": credential_name},
                     data=_database_data(
@@ -570,12 +667,15 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                                 **info,
                                 "provider": ANTHROPIC_CREDENTIAL_PROVIDER,
                                 "auth_type": ANTHROPIC_CREDENTIAL_AUTH_TYPE,
+                                "proxy_configured": proxy_url is not None,
                             },
                             "updated_by": "litellm-anthropic-oauth",
                         }
                     ),
                 )
-        CredentialAccessor.upsert_credentials([_plaintext_credential(credential_name, refreshed)])
+        CredentialAccessor.upsert_credentials(
+            [_plaintext_credential(credential_name, refreshed, proxy_url, info)]
+        )
         await publish_config_change_for_object_type("litellm_credentialstable")
         return refreshed
 

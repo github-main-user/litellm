@@ -16,6 +16,7 @@ from litellm._logging import verbose_logger
 from litellm.caching.caching import DualCache
 from litellm.constants import DEFAULT_MAX_RETRIES
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.openai.common_utils import BaseOpenAILLM
 from litellm.secret_managers.get_azure_ad_token_provider import (
     get_azure_ad_token_provider,
@@ -482,12 +483,16 @@ class BaseAzureLLM(BaseOpenAILLM):
         api_key: str | None,
         api_base: str | None,
         api_version: str | None = None,
-        client: AzureOpenAI | AsyncAzureOpenAI | OpenAI | AsyncOpenAI | None = None,
+        client: AzureOpenAI | AsyncAzureOpenAI | OpenAI | AsyncOpenAI | HTTPHandler | AsyncHTTPHandler | None = None,
         litellm_params: dict | None = None,
         _is_async: bool = False,
         model: str | None = None,
     ) -> AzureOpenAI | AsyncAzureOpenAI | OpenAI | AsyncOpenAI | None:
         openai_client: AzureOpenAI | AsyncAzureOpenAI | OpenAI | AsyncOpenAI | None = None
+        transport_handler: HTTPHandler | AsyncHTTPHandler | None = None
+        if isinstance(client, (HTTPHandler, AsyncHTTPHandler)):
+            transport_handler = client
+            client = None
         client_initialization_params: Final[dict] = locals()
         client_initialization_params["is_async"] = _is_async
         _lp: Final = litellm_params or {}
@@ -523,9 +528,13 @@ class BaseAzureLLM(BaseOpenAILLM):
             )
             return client
 
-        cached_client: Final = self.get_cached_openai_client(
-            client_initialization_params=client_initialization_params,
-            client_type="azure",
+        cached_client: Final = (
+            None
+            if transport_handler is not None
+            else self.get_cached_openai_client(
+                client_initialization_params=client_initialization_params,
+                client_type="azure",
+            )
         )
         if cached_client:
             if isinstance(cached_client, (AzureOpenAI, AsyncAzureOpenAI, OpenAI, AsyncOpenAI)):
@@ -539,6 +548,12 @@ class BaseAzureLLM(BaseOpenAILLM):
             api_version=api_version,
             is_async=_is_async,
         )
+        if transport_handler is not None:
+            if _is_async and not isinstance(transport_handler, AsyncHTTPHandler):
+                raise TypeError("An asynchronous Azure request requires AsyncHTTPHandler")
+            if not _is_async and not isinstance(transport_handler, HTTPHandler):
+                raise TypeError("A synchronous Azure request requires HTTPHandler")
+            azure_client_params["http_client"] = transport_handler.client
 
         # For Azure v1 API, use standard OpenAI client instead of AzureOpenAI
         # See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#api-specs
@@ -591,12 +606,13 @@ class BaseAzureLLM(BaseOpenAILLM):
                 openai_client = AzureOpenAI(**azure_client_params)
 
         # save client in-memory cache
-        self.set_cached_openai_client(
-            openai_client=openai_client,
-            client_initialization_params=client_initialization_params,
-            client_type="azure",
-            litellm_owned_client=self.owns_wrapped_http_client(azure_client_params.get("http_client")),
-        )
+        if transport_handler is None:
+            self.set_cached_openai_client(
+                openai_client=openai_client,
+                client_initialization_params=client_initialization_params,
+                client_type="azure",
+                litellm_owned_client=self.owns_wrapped_http_client(azure_client_params.get("http_client")),
+            )
         return openai_client
 
     def initialize_azure_sdk_client(

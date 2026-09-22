@@ -15,6 +15,8 @@ from urllib.parse import urlencode
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
+from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
+
 _OAUTH_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
 _ACCESS_TOKEN_PATTERN: Final = re.compile(r"sk-ant-oat[-A-Za-z0-9._~+/]+=*")
 
@@ -118,8 +120,16 @@ class AnthropicOAuthTokens:
 
 
 class AnthropicOAuthClient:
-    def __init__(self, http_client: AsyncHTTPClient | None = None) -> None:
+    def __init__(
+        self,
+        http_client: AsyncHTTPClient | None = None,
+        *,
+        proxy_url: str | None = None,
+    ) -> None:
+        if http_client is not None and proxy_url is not None:
+            raise ValueError("http_client and proxy_url cannot be used together")
         self._http_client = http_client
+        self._proxy_url = validate_proxy_url(proxy_url) if proxy_url is not None else None
 
     def begin_authorization(self) -> AnthropicAuthorization:
         verifier: Final = _base64url(secrets.token_bytes(64))
@@ -195,8 +205,13 @@ class AnthropicOAuthClient:
     async def _post(self, body: Mapping[str, str], headers: Mapping[str, str] | None) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.post(ANTHROPIC_OAUTH_TOKEN_URL, json=body, headers=headers)
-        transport: Final = httpx.AsyncHTTPTransport(retries=0)
-        async with httpx.AsyncClient(timeout=ANTHROPIC_OAUTH_TIMEOUT_SECONDS, transport=transport) as client:
+        transport: Final = httpx.AsyncHTTPTransport(retries=0) if self._proxy_url is None else None
+        async with httpx.AsyncClient(
+            timeout=ANTHROPIC_OAUTH_TIMEOUT_SECONDS,
+            transport=transport,
+            proxy=self._proxy_url,
+            trust_env=False,
+        ) as client:
             return await client.post(ANTHROPIC_OAUTH_TOKEN_URL, json=body, headers=headers)
 
     @staticmethod

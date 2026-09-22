@@ -10,6 +10,7 @@ from pydantic import Field
 
 from litellm._logging import verbose_logger
 from litellm.exceptions import AuthenticationError
+from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.oauth_client import (
     AnthropicOAuthError,
@@ -135,6 +136,9 @@ class AnthropicTokenCounter(BaseTokenCounter):
         credential_name: Final = litellm_params.get("litellm_credential_name")
 
         try:
+            proxy_url: Final = get_credential_proxy_url(
+                credential_name if isinstance(credential_name, str) else None
+            )
             resolved: Final = (
                 await self._resolve_named_credential(model=model_to_use, litellm_params=litellm_params)
                 if isinstance(credential_name, str) and credential_name
@@ -168,8 +172,10 @@ class AnthropicTokenCounter(BaseTokenCounter):
                     model=model_to_use,
                     messages=messages or [],
                     api_key=api_key,
+                    api_base=litellm_params.get("api_base"),
                     tools=tools,
                     system=system,
+                    proxy_url=proxy_url,
                 )
             except AnthropicError as error:
                 if error.status_code != 401 or resolved is None:
@@ -186,8 +192,10 @@ class AnthropicTokenCounter(BaseTokenCounter):
                     model=model_to_use,
                     messages=messages or [],
                     api_key=authorization.removeprefix("Bearer "),
+                    api_base=litellm_params.get("api_base"),
                     tools=tools,
                     system=system,
+                    proxy_url=proxy_url,
                 )
             input_tokens: Final = result.get("input_tokens")
             if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or input_tokens < 0:

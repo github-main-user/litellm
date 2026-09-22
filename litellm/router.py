@@ -3939,9 +3939,24 @@ class Router:
                     merged_tags.append(tag)
             kwargs[metadata_variable_name]["tags"] = merged_tags
 
-        ## CREDENTIAL NAME AS TAG
+        ## CREDENTIAL NAME AS TAG / CONNECTION-SPECIFIC TRANSPORT
         credential_name: Final = deployment.get("litellm_params", {}).get("litellm_credential_name")
+        # This is an internal, deployment-derived value. A request body may not
+        # select or override an egress proxy, and retries must not retain the
+        # previous deployment's route.
+        kwargs.pop("_credential_proxy_url", None)
+        kwargs.pop("_credential_proxy_trusted", None)
+        kwargs.pop("litellm_internal_proxy_url", None)
         if credential_name:
+            from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
+            from litellm.llms.custom_httpx.http_handler import CREDENTIAL_PROXY_TRUSTED
+
+            if CredentialAccessor.find_credential(credential_name) is None:
+                raise ValueError(f"Credential '{credential_name}' was not found")
+            credential_proxy_url: Final = get_credential_proxy_url(credential_name)
+            if credential_proxy_url is not None:
+                kwargs["_credential_proxy_url"] = credential_proxy_url
+                kwargs["_credential_proxy_trusted"] = CREDENTIAL_PROXY_TRUSTED
             credential_tag: Final = f"Credential: {credential_name}"
             existing_tags = kwargs[metadata_variable_name].get("tags") or []
             if credential_tag not in existing_tags:

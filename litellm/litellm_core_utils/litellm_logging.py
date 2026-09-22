@@ -4161,6 +4161,7 @@ def _get_masked_values(
         "credentials",
         "password",
         "passwd",
+        "proxy",
     ]
 
     def _mask_value(v: Any) -> Any:

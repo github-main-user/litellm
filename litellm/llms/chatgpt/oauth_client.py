@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
 from litellm.llms.custom_httpx.http_handler import HTTPHandler, _get_httpx_client
 
 from .common_utils import (
@@ -85,12 +86,20 @@ class ChatGPTTokens:
 
 
 class ChatGPTOAuthClient:
-    def __init__(self, http_client: SyncHTTPClient | HTTPHandler | None = None) -> None:
+    def __init__(
+        self,
+        http_client: SyncHTTPClient | HTTPHandler | None = None,
+        *,
+        proxy_url: str | None = None,
+    ) -> None:
+        if http_client is not None and proxy_url is not None:
+            raise ValueError("http_client and proxy_url cannot be used together")
         self._http_client = http_client
+        self._proxy_url = validate_proxy_url(proxy_url) if proxy_url is not None else None
 
     def request_device_code(self) -> ChatGPTDeviceCode:
         try:
-            response: Final = self._client().post(
+            response: Final = self._post(
                 CHATGPT_DEVICE_CODE_URL,
                 json={"client_id": CHATGPT_CLIENT_ID},
             )
@@ -100,12 +109,12 @@ class ChatGPTOAuthClient:
             raise GetDeviceCodeError(
                 message=f"Failed to request device code: HTTP {exc.response.status_code}",
                 status_code=exc.response.status_code,
-            ) from exc
-        except Exception as exc:
+            ) from None
+        except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
             raise GetDeviceCodeError(
                 message="Failed to request device code",
                 status_code=400,
-            ) from exc
+            ) from None
 
         device_auth_id: Final = data.get("device_auth_id")
         user_code: Final = data.get("user_code") or data.get("usercode")
@@ -124,7 +133,7 @@ class ChatGPTOAuthClient:
 
     def poll_authorization(self, device_code: ChatGPTDeviceCode) -> ChatGPTAuthorizationCode | None:
         try:
-            response: Final = self._client().post(
+            response: Final = self._post(
                 CHATGPT_DEVICE_TOKEN_URL,
                 json={
                     "device_auth_id": device_code.device_auth_id,
@@ -139,12 +148,12 @@ class ChatGPTOAuthClient:
             raise GetAccessTokenError(
                 message=f"Polling failed: HTTP {exc.response.status_code}",
                 status_code=exc.response.status_code,
-            ) from exc
-        except Exception as exc:
+            ) from None
+        except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
             raise GetAccessTokenError(
                 message="Polling failed",
                 status_code=400,
-            ) from exc
+            ) from None
 
         authorization_code: Final = data.get("authorization_code")
         code_verifier: Final = data.get("code_verifier")
@@ -175,7 +184,7 @@ class ChatGPTOAuthClient:
             }
         )
         try:
-            response: Final = self._client().post(
+            response: Final = self._post(
                 CHATGPT_OAUTH_TOKEN_URL,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 content=body,
@@ -186,17 +195,17 @@ class ChatGPTOAuthClient:
             raise GetAccessTokenError(
                 message=f"Token exchange failed: HTTP {exc.response.status_code}",
                 status_code=exc.response.status_code,
-            ) from exc
-        except Exception as exc:
+            ) from None
+        except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
             raise GetAccessTokenError(
                 message="Token exchange failed",
                 status_code=400,
-            ) from exc
+            ) from None
         return self._tokens_from_response(data=data, error_type=GetAccessTokenError)
 
     def refresh(self, refresh_token: str) -> ChatGPTTokens:
         try:
-            response: Final = self._client().post(
+            response: Final = self._post(
                 CHATGPT_OAUTH_TOKEN_URL,
                 json={
                     "client_id": CHATGPT_CLIENT_ID,
@@ -211,21 +220,29 @@ class ChatGPTOAuthClient:
             raise RefreshAccessTokenError(
                 message=f"Refresh token failed: HTTP {exc.response.status_code}",
                 status_code=exc.response.status_code,
-            ) from exc
-        except Exception as exc:
+            ) from None
+        except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
             raise RefreshAccessTokenError(
                 message="Refresh token failed",
                 status_code=400,
-            ) from exc
+            ) from None
         return self._tokens_from_response(
             data=data,
             fallback_refresh_token=refresh_token,
             error_type=RefreshAccessTokenError,
         )
 
-    def _client(self) -> SyncHTTPClient:
-        client = self._http_client or _get_httpx_client()
-        return client.client if isinstance(client, HTTPHandler) else client
+    def _post(self, url: str, **kwargs: Any) -> httpx.Response:
+        if self._http_client is not None:
+            client = self._http_client.client if isinstance(self._http_client, HTTPHandler) else self._http_client
+            return client.post(url, **kwargs)
+        if self._proxy_url is not None:
+            # A dedicated client prevents provider credentials from inheriting ambient
+            # proxy settings and is closed after each synchronous OAuth operation.
+            with httpx.Client(proxy=self._proxy_url, trust_env=False) as client:
+                return client.post(url, **kwargs)
+        client = _get_httpx_client()
+        return (client.client if isinstance(client, HTTPHandler) else client).post(url, **kwargs)
 
     @staticmethod
     def _parse_interval(value: object) -> int:

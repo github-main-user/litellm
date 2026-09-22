@@ -106,7 +106,11 @@ from litellm.llms.base_llm.base_model_iterator import (
 )
 from litellm.llms.bedrock.common_utils import BedrockModelInfo
 from litellm.llms.cohere.common_utils import CohereModelInfo
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler, http2_enabled
+from litellm.llms.custom_httpx.http_handler import (
+    AsyncHTTPHandler,
+    HTTPHandler,
+    http2_enabled,
+)
 from litellm.llms.openai.chat.gpt_5_transformation import OpenAIGPT5Config
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.llms.vertex_ai.common_utils import (
@@ -2783,6 +2787,7 @@ def _complete_anthropic_text(
     acompletion: Final = ctx.acompletion
     api_base = ctx.api_base
     api_key = ctx.api_key
+    client: Final = _dispatch_client_http(ctx)
     custom_prompt_dict = ctx.custom_prompt_dict
     headers: Final = ctx.headers
     litellm_params: Final = ctx.litellm_params
@@ -2829,6 +2834,7 @@ def _complete_anthropic_text(
         encoding=_get_encoding(),
         api_key=api_key,
         logging_obj=logging,  # model call logging done inside the class as we make need to modify I/O to fit aleph alpha's requirements
+        client=client,
     )
 
 
@@ -3001,6 +3007,7 @@ def _complete_cohere_chat(ctx: _CompletionDispatchContext) -> _CompletionDispatc
     acompletion: Final = ctx.acompletion
     api_base = ctx.api_base
     api_key: Final = ctx.api_key
+    client: Final = _dispatch_client_http(ctx)
     extra_headers: Final = ctx.extra_headers
     headers = ctx.headers
     litellm_params: Final = ctx.litellm_params
@@ -3059,6 +3066,7 @@ def _complete_cohere_chat(ctx: _CompletionDispatchContext) -> _CompletionDispatc
         api_key=cohere_key,
         provider_config=provider_config,
         logging_obj=logging,  # model call logging done inside the class as we make need to modify I/O to fit aleph alpha's requirements
+        client=client,
     )
 
 
@@ -5000,6 +5008,146 @@ def _complete_langflow(ctx: _CompletionDispatchContext) -> _CompletionDispatchRe
     )
 
 
+_CREDENTIAL_PROXY_HTTP_PROVIDERS: Final = frozenset(
+    {
+        "azure",
+        "anthropic",
+        "anthropic_text",
+        "cohere",
+        "cohere_chat",
+        "deepseek",
+        "azure_ai",
+        "fireworks_ai",
+        "together_ai",
+        "heroku",
+        "ragflow",
+        "xai",
+        "groq",
+        "bedrock_mantle",
+        "a2a",
+        "gigachat",
+        "sap",
+        "cometapi",
+        "minimax",
+        "hosted_vllm",
+        "mistral",
+        "huggingface",
+        "oci",
+        "compactifai",
+        "databricks",
+        "datarobot",
+        "openrouter",
+        "vercel_ai_gateway",
+        "gemini",
+        "vertex_ai_beta",
+        "vertex_ai",
+        "sagemaker_chat",
+        "sagemaker_nova",
+        "bedrock",
+        "watsonx",
+        "watsonx_text",
+        "ollama",
+        "ollama_chat",
+        "petals",
+        "snowflake",
+        "gdc",
+        "bytez",
+        "lemonade",
+        "ovhcloud",
+        "langgraph",
+        "langflow",
+    }
+)
+
+
+def _credential_proxy_provider_supported(provider: str | None) -> bool:
+    from litellm.litellm_core_utils.credential_proxy import require_proxy_provider_support
+
+    try:
+        require_proxy_provider_support(provider)
+    except ValueError:
+        return False
+    return True
+
+
+def _finalize_credential_proxy_response(
+    response: object, handler: HTTPHandler | AsyncHTTPHandler
+) -> object:
+    if inspect.isawaitable(response):
+        async def await_and_finalize() -> object:
+            try:
+                resolved = await response
+            except BaseException:
+                if isinstance(handler, AsyncHTTPHandler):
+                    await handler.close()
+                else:
+                    handler.close()
+                raise
+            finalized = _finalize_credential_proxy_response(resolved, handler)
+            if inspect.isawaitable(finalized):
+                return await finalized
+            return finalized
+
+        return await_and_finalize()
+
+    if isinstance(response, CustomStreamWrapper):
+        source = response.completion_stream
+        if isinstance(handler, AsyncHTTPHandler):
+            if not hasattr(source, "__aiter__"):
+                handler_to_close = handler
+
+                async def invalid_stream():
+                    try:
+                        raise TypeError("Credential proxy received a synchronous stream for an asynchronous request")
+                        yield
+                    finally:
+                        await handler_to_close.close()
+
+                response.completion_stream = invalid_stream()
+                return response
+
+            async def proxy_async_stream():
+                try:
+                    async for item in source:
+                        yield item
+                finally:
+                    try:
+                        close = getattr(source, "aclose", None)
+                        if close is not None:
+                            await close()
+                    finally:
+                        await handler.close()
+
+            response.completion_stream = proxy_async_stream()
+        else:
+            if not hasattr(source, "__iter__"):
+                handler.close()
+                raise TypeError("Credential proxy received an asynchronous stream for a synchronous request")
+
+            def proxy_sync_stream():
+                try:
+                    yield from source
+                finally:
+                    try:
+                        close = getattr(source, "close", None)
+                        if close is not None:
+                            close()
+                    finally:
+                        handler.close()
+
+            response.completion_stream = proxy_sync_stream()
+        return response
+
+    if isinstance(handler, AsyncHTTPHandler):
+        async def close_after_result() -> object:
+            await handler.close()
+            return response
+
+        return close_after_result()
+    handler.close()
+    return response
+
+
 @tracer.wrap()
 @client
 def completion(
@@ -5246,7 +5394,11 @@ def completion(
     atext_completion: Final = kwargs.get("atext_completion", False)
     ### ASYNC CALLS ###
     acompletion: Final = kwargs.get("acompletion", False)
-    client: Final = kwargs.get("client", None)
+    client = kwargs.get("client", None)
+    from litellm.litellm_core_utils.credential_proxy import pop_request_proxy_url
+
+    credential_proxy_url: Final = pop_request_proxy_url(kwargs)
+    credential_proxy_handler: HTTPHandler | AsyncHTTPHandler | None = None
     ### Admin Controls ###
     no_log: Final = kwargs.get("no-log", False)
     ### PROMPT MANAGEMENT ###
@@ -5620,8 +5772,31 @@ def completion(
         # detection when the deployment name differs from the model name.
         _azure_detection_model: Final = base_model or model
 
+        if credential_proxy_url is not None:
+            if not _credential_proxy_provider_supported(custom_llm_provider):
+                raise ValueError(
+                    f"Credential proxy routing is not supported for provider '{custom_llm_provider}'"
+                )
+            credential_proxy_handler = (
+                AsyncHTTPHandler(proxy_url=credential_proxy_url)
+                if acompletion
+                else HTTPHandler(proxy_url=credential_proxy_url)
+            )
+            client = credential_proxy_handler
+
         if responses_api_model_info.get("mode") == "responses" and not skip_responses_api_bridge:
             from litellm.completion_extras import responses_api_bridge
+            from litellm.llms.custom_httpx.http_handler import CREDENTIAL_PROXY_TRUSTED
+
+            bridge_params: Final = (
+                {
+                    **litellm_params,
+                    "_credential_proxy_url": credential_proxy_url,
+                    "_credential_proxy_trusted": CREDENTIAL_PROXY_TRUSTED,
+                }
+                if credential_proxy_url is not None
+                else litellm_params
+            )
 
             optional_params, rs_val = strip_reasoning_summary_aliases_from_optional_params(optional_params)
 
@@ -5639,7 +5814,7 @@ def completion(
                 else:
                     optional_params["reasoning_effort"] = {"summary": rs_val}
 
-            return responses_api_bridge.completion(  # pyright: ignore[reportReturnType]  # bridge returns a coroutine on the acompletion path; awaited by the async caller
+            bridge_response = responses_api_bridge.completion(
                 model=model,
                 messages=messages,
                 headers=headers,
@@ -5649,13 +5824,16 @@ def completion(
                 acompletion=acompletion,
                 logging_obj=logging,
                 optional_params=optional_params,
-                litellm_params=litellm_params,
+                litellm_params=bridge_params,
                 timeout=timeout,
                 client=client,  # pass AsyncOpenAI, OpenAI client
                 custom_llm_provider=custom_llm_provider,
                 encoding=_get_encoding(),
                 stream=stream,
             )
+            if credential_proxy_handler is not None:
+                return _finalize_credential_proxy_response(bridge_response, credential_proxy_handler)
+            return bridge_response
         elif (custom_llm_provider == "openai" and OpenAIGPT5Config.is_model_gpt_5_model(model)) or (
             custom_llm_provider == "azure"
             and litellm.AzureOpenAIGPT5Config.is_model_gpt_5_model(_azure_detection_model)
@@ -5896,8 +6074,18 @@ def completion(
 
         else:
             raise LiteLLMUnknownProvider(model=model, custom_llm_provider=custom_llm_provider)
+        if credential_proxy_handler is not None:
+            return _finalize_credential_proxy_response(response, credential_proxy_handler)  # pyright: ignore[reportReturnType]
         return response
     except Exception as e:
+        if credential_proxy_handler is not None:
+            if isinstance(credential_proxy_handler, AsyncHTTPHandler):
+                try:
+                    asyncio.get_running_loop().create_task(credential_proxy_handler.close())
+                except RuntimeError:
+                    asyncio.run(credential_proxy_handler.close())
+            else:
+                credential_proxy_handler.close()
         ## Map to OpenAI Exception
         raise exception_type(
             model=model,
