@@ -3998,6 +3998,48 @@ def test_cache_control_in_supported_params():
     assert "cache_control" in params
 
 
+@pytest.mark.parametrize(
+    ("param", "value"),
+    [("prompt_cache_key", "pi-session"), ("store", False)],
+)
+def test_openai_only_params_are_accepted_and_dropped(param, value):
+    config = AnthropicConfig()
+
+    supported_params = config.get_supported_openai_params(model="claude-sonnet-5")
+    result = config.map_openai_params(
+        non_default_params={param: value},
+        optional_params={},
+        model="claude-sonnet-5",
+        drop_params=False,
+    )
+
+    assert param in supported_params
+    assert param not in result
+
+
+def test_store_true_remains_unsupported():
+    config = AnthropicConfig()
+
+    with pytest.raises(litellm.UnsupportedParamsError, match="store=True"):
+        config.map_openai_params(
+            non_default_params={"store": True},
+            optional_params={},
+            model="claude-sonnet-5",
+            drop_params=False,
+        )
+
+
+def test_store_true_is_dropped_when_drop_params_enabled():
+    result = AnthropicConfig().map_openai_params(
+        non_default_params={"store": True},
+        optional_params={},
+        model="claude-sonnet-5",
+        drop_params=True,
+    )
+
+    assert "store" not in result
+
+
 def test_map_openai_params_with_cache_control():
     """
     Test that map_openai_params correctly passes through top-level cache_control

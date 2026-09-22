@@ -513,6 +513,8 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             "speed",
             "context_management",
             "cache_control",
+            "prompt_cache_key",
+            "store",
         ]
 
         if (
@@ -1647,6 +1649,12 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             elif param == "cache_control" and isinstance(value, dict):
                 # Pass through top-level cache_control for automatic prompt caching
                 optional_params["cache_control"] = value
+            elif param == "store" and value is True:
+                if not (litellm.drop_params or drop_params):
+                    raise litellm.utils.UnsupportedParamsError(
+                        message="Anthropic does not support store=True.",
+                        status_code=400,
+                    )
 
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
