@@ -477,6 +477,7 @@ from litellm.proxy.credential_endpoints.anthropic_oauth import router as anthrop
 from litellm.proxy.credential_endpoints.chatgpt_oauth import register_chatgpt_oauth_credential_hook
 from litellm.proxy.credential_endpoints.chatgpt_oauth import router as chatgpt_oauth_credential_router
 from litellm.proxy.credential_endpoints.endpoints import router as credential_router
+from litellm.proxy.credential_endpoints.subscription_usage import router as credential_subscription_usage_router
 from litellm.proxy.db.create_views import SupportsRawQueries
 from litellm.proxy.db.db_transaction_queue.pod_lock_manager import PodLockManager
 from litellm.proxy.db.db_transaction_queue.spend_log_cleanup import SpendLogCleanup
@@ -19250,6 +19251,7 @@ app.include_router(search_router)
 app.include_router(image_router)
 app.include_router(fine_tuning_router)
 app.include_router(credential_router)
+app.include_router(credential_subscription_usage_router)
 app.include_router(openai_passthrough_router)
 app.include_router(anthropic_oauth_credential_router)
 app.include_router(chatgpt_oauth_credential_router)

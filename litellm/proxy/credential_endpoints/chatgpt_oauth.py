@@ -433,6 +433,14 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             "chatgpt_auth_account_id": tokens.account_id,
         }
 
+    async def get_subscription_usage_auth(self, credential_name: str) -> tuple[str, str | None, str | None]:
+        credential: Final = await self._find_or_load_credential(credential_name)
+        if credential is None or not _is_chatgpt_oauth_credential(credential):
+            raise ValueError("Credential is not a ChatGPT OAuth credential")
+        tokens: Final = await self._get_tokens(credential_name)
+        proxy_url: Final = get_credential_proxy_url(credential_name)
+        return tokens.access_token, proxy_url, tokens.account_id
+
     async def _find_or_load_credential(self, credential_name: str) -> CredentialItem | None:
         cached: Final = _find_credential(credential_name)
         if cached is not None:
@@ -579,7 +587,17 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         return refreshed
 
 
+def get_chatgpt_oauth_credential_hook() -> ChatGPTOAuthCredentialHook:
+    existing: Final = next(
+        (callback for callback in litellm.callbacks if isinstance(callback, ChatGPTOAuthCredentialHook)),
+        None,
+    )
+    if existing is not None:
+        return existing
+    hook: Final = ChatGPTOAuthCredentialHook()
+    litellm.callbacks.append(hook)
+    return hook
+
+
 def register_chatgpt_oauth_credential_hook() -> None:
-    if any(isinstance(callback, ChatGPTOAuthCredentialHook) for callback in litellm.callbacks):
-        return
-    litellm.callbacks.append(ChatGPTOAuthCredentialHook())
+    get_chatgpt_oauth_credential_hook()

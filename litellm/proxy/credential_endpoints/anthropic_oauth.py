@@ -529,6 +529,14 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             raise self._authentication_error(model, credential_name) from None
         return {**kwargs, "api_key": tokens.access_token, "api_base": "https://api.anthropic.com"}
 
+    async def get_subscription_usage_auth(self, credential_name: str) -> tuple[str, str | None, str | None]:
+        credential: Final = await self._find_or_load(credential_name)
+        if credential is None or not _is_managed_credential(credential):
+            raise ValueError("Credential is not an Anthropic OAuth credential")
+        tokens: Final = await self._get_tokens(credential_name)
+        proxy_url: Final = get_credential_proxy_url(credential_name)
+        return tokens.access_token, proxy_url, tokens.account_id
+
     async def recover_rejected_token(self, credential_name: str, rejected_access_token: str) -> str | None:
         if not rejected_access_token.startswith("sk-ant-oat"):
             return None
@@ -680,8 +688,18 @@ class AnthropicOAuthCredentialHook(CustomLogger):
         return refreshed
 
 
-def register_anthropic_oauth_credential_hook() -> None:
+def get_anthropic_oauth_credential_hook() -> AnthropicOAuthCredentialHook:
     callbacks: Final = cast(list[object], litellm.callbacks)
-    if any(isinstance(callback, AnthropicOAuthCredentialHook) for callback in callbacks):
-        return
-    callbacks.append(AnthropicOAuthCredentialHook())
+    existing: Final = next(
+        (callback for callback in callbacks if isinstance(callback, AnthropicOAuthCredentialHook)),
+        None,
+    )
+    if existing is not None:
+        return existing
+    hook: Final = AnthropicOAuthCredentialHook()
+    callbacks.append(hook)
+    return hook
+
+
+def register_anthropic_oauth_credential_hook() -> None:
+    get_anthropic_oauth_credential_hook()
