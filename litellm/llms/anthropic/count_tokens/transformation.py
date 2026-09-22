@@ -11,7 +11,10 @@ from typing import Final
 from pydantic import JsonValue, TypeAdapter
 
 from litellm.constants import ANTHROPIC_TOKEN_COUNTING_BETA_VERSION
-from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
+from litellm.llms.anthropic.common_utils import (
+    prepare_anthropic_subscription_messages,
+    prepare_anthropic_subscription_system,
+)
 from litellm.llms.anthropic.subscription_tools import prepare_subscription_tools
 
 _COUNT_REQUEST: Final = TypeAdapter(dict[str, JsonValue])
@@ -70,6 +73,7 @@ class AnthropicCountTokensConfig:
             return request
         request_with_identity: Final = {
             **request,
+            "messages": prepare_anthropic_subscription_messages(request["messages"], request.get("system")),
             "system": prepare_anthropic_subscription_system(request.get("system")),
         }
         subscription_body, _ = prepare_subscription_tools(request_with_identity)

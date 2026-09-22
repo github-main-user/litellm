@@ -2301,14 +2301,12 @@ def test_prepare_anthropic_subscription_system_is_identity_first_and_idempotent(
     prepared = prepare_anthropic_subscription_system(original)
     prepared_again = prepare_anthropic_subscription_system(prepared)
 
-    assert prepared[0] == cached_identity
-    assert prepared[1:] == [original[0]]
+    assert prepared == [cached_identity]
     assert prepared_again == prepared
     assert original[0]["text"] == "Keep this instruction"
     assert len(original) == 3
     assert prepare_anthropic_subscription_system("Original") == [
-        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
-        {"type": "text", "text": "Original"},
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
     ]
 
 

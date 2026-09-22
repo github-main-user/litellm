@@ -112,8 +112,16 @@ def test_subscription_transform_canonicalizes_identity_and_tools_without_mutatin
         subscription_request=True,
     )
 
-    assert result["system"][0]["text"] == ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["messages"][0] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "<system-reminder>"},
+            {"type": "text", "text": "Keep the user context"},
+            {"type": "text", "text": "</system-reminder>"},
+        ],
+    }
     assert result["tools"][0]["name"] == "Read"
-    assert result["messages"][0]["content"][0]["name"] == "Read"
+    assert result["messages"][1]["content"][0]["name"] == "Read"
     assert messages == original_messages
     assert tools == original_tools

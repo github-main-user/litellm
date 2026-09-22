@@ -6,6 +6,7 @@ import pytest
 
 from litellm.llms.anthropic.common_utils import (
     ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+    prepare_anthropic_subscription_messages,
     prepare_anthropic_subscription_system,
 )
 from litellm.llms.anthropic.oauth_client import AnthropicOAuthClient, AnthropicOAuthTokens
@@ -176,14 +177,33 @@ def test_request_transformations_apply_identity_only_to_managed_oauth(monkeypatc
         assert "x-claude-code-session-id" not in headers
 
 
-def test_existing_billing_attribution_is_preserved_ahead_of_identity_without_fabrication():
+def test_existing_billing_attribution_is_preserved_and_client_system_becomes_a_reminder():
     billing = {"type": "text", "text": "x-anthropic-billing-header: original-attribution;"}
     instruction = {"type": "text", "text": "Keep this instruction", "cache_control": {"type": "ephemeral"}}
     original = [instruction, billing]
     prepared = prepare_anthropic_subscription_system(original)
-    assert prepared == [billing, {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}, instruction]
+    messages = prepare_anthropic_subscription_messages([{"role": "user", "content": "Hello"}], original)
+    assert prepared == [billing, {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "<system-reminder>"},
+        instruction,
+        {"type": "text", "text": "</system-reminder>"},
+        {"type": "text", "text": "Hello"},
+    ]
     assert prepare_anthropic_subscription_system(prepared) == prepared
     assert original == [instruction, billing]
     assert prepare_anthropic_subscription_system(None) == [
         {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
     ]
+
+
+def test_coding_agent_signature_moves_from_system_to_user_reminder():
+    signature = (
+        "custom providers (docs/custom-provider.md), adding models (docs/models.md), "
+        "pi packages (docs/packages.md), environment variables (docs/environment-variables.md)"
+    )
+    system = prepare_anthropic_subscription_system(signature)
+    messages = prepare_anthropic_subscription_messages([{"role": "user", "content": "Hello"}], signature)
+    assert system == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert signature not in json.dumps(system)
+    assert signature in json.dumps(messages)

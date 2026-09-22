@@ -97,6 +97,7 @@ from ..common_utils import (
     AnthropicModelInfo,
     eager_input_streaming_flag,
     is_anthropic_subscription_request,
+    prepare_anthropic_subscription_messages,
     prepare_anthropic_subscription_system,
     process_anthropic_headers,
     strip_advisor_blocks_from_messages,
@@ -1992,6 +1993,10 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 status_code=400,
                 message=f"{e}\nReceived Messages={messages}",
             )  # don't use verbose_logger.exception, if exception is raised
+        if subscription_request:
+            anthropic_messages = prepare_anthropic_subscription_messages(
+                anthropic_messages, translated_system_message_list
+            )
 
         ## Auto-strip advisor blocks from history if advisor tool is absent.
         ## Prevents Anthropic 400: advisor_tool_result in history requires advisor tool.

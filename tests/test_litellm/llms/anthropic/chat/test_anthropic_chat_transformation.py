@@ -6500,8 +6500,12 @@ def test_subscription_transform_preserves_tool_exchange_without_mutating_input(s
         headers={"authorization": "Bearer sk-ant-oat01-test"},
     )
 
-    assert result["system"][0] == {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
-    assert result["system"][1] == original[0]["content"][0]
+    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["messages"][0]["content"][:3] == [
+        {"type": "text", "text": "<system-reminder>"},
+        original[0]["content"][0],
+        {"type": "text", "text": "</system-reminder>"},
+    ]
     content_blocks = [
         block
         for message in result["messages"]
@@ -6528,7 +6532,7 @@ def test_api_key_transform_does_not_add_subscription_identity():
     assert result["system"] == [{"type": "text", "text": "Original"}]
 
 
-def test_native_messages_subscription_transform_adds_identity_without_changing_blocks():
+def test_native_messages_subscription_transform_moves_client_system_to_user_reminder():
     from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
 
     original_system = [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
@@ -6541,9 +6545,12 @@ def test_native_messages_subscription_transform_adds_identity_without_changing_b
         headers={"authorization": "Bearer sk-ant-oat01-test"},
     )
 
-    assert result["system"] == [
-        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["messages"][0]["content"] == [
+        {"type": "text", "text": "<system-reminder>"},
         original_system[0],
+        {"type": "text", "text": "</system-reminder>"},
+        {"type": "text", "text": "Hi"},
     ]
     assert original_system == [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
     api_key_result = AnthropicMessagesConfig().transform_anthropic_messages_request(

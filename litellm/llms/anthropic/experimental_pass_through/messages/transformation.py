@@ -25,6 +25,7 @@ from ...common_utils import (
     AnthropicModelInfo,
     is_anthropic_subscription_request,
     optionally_handle_anthropic_oauth,
+    prepare_anthropic_subscription_messages,
     prepare_anthropic_subscription_system,
     strip_advisor_blocks_from_messages,
     strip_encrypted_reasoning_blocks_from_anthropic_messages,
@@ -499,9 +500,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         subscription_request: Final = is_anthropic_subscription_request(cast(Mapping[object, object], headers))
         litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = {}
         if subscription_request:
-            anthropic_messages_optional_request_params["system"] = prepare_anthropic_subscription_system(
-                anthropic_messages_optional_request_params.get("system")
-            )
+            client_system: Final = anthropic_messages_optional_request_params.get("system")
+            anthropic_messages_optional_request_params["system"] = prepare_anthropic_subscription_system(client_system)
+            messages = cast(list[dict], prepare_anthropic_subscription_messages(messages, client_system))
         if max_tokens is None:
             raise AnthropicError(
                 message="max_tokens is required for Anthropic /v1/messages API",

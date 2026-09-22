@@ -234,12 +234,12 @@ def is_anthropic_subscription_request(headers: Mapping[object, object]) -> bool:
     return is_anthropic_oauth_key(authorization)
 
 
-def prepare_anthropic_subscription_system(system: object) -> list[object]:
+def _anthropic_subscription_system_parts(system: object) -> tuple[list[object], object, list[object]]:
     identity: Final = {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
-    if system is None:
-        return [identity]
     blocks: Final = (
-        [{"type": "text", "text": system}]
+        []
+        if system is None
+        else [{"type": "text", "text": system}]
         if isinstance(system, str)
         else list(system)
         if isinstance(system, Sequence)
@@ -261,7 +261,6 @@ def prepare_anthropic_subscription_system(system: object) -> list[object]:
             and block.get("text") == ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
         )
     ]
-    first_identity: Final = identity_blocks[0] if identity_blocks else identity
     billing_blocks: Final = [
         block
         for block in remaining_blocks
@@ -271,7 +270,42 @@ def prepare_anthropic_subscription_system(system: object) -> list[object]:
         and text.startswith(_CLAUDE_CODE_BILLING_HEADER_PREFIX)
     ]
     instructions: Final = [block for block in remaining_blocks if block not in billing_blocks]
-    return [*billing_blocks, first_identity, *instructions]
+    return billing_blocks, identity_blocks[0] if identity_blocks else identity, instructions
+
+
+def prepare_anthropic_subscription_system(system: object) -> list[object]:
+    billing_blocks, identity, _ = _anthropic_subscription_system_parts(system)
+    return [*billing_blocks, identity]
+
+
+def prepare_anthropic_subscription_messages(messages: Sequence[object], system: object) -> list[object]:
+    _, _, instructions = _anthropic_subscription_system_parts(system)
+    if not instructions:
+        return list(messages)
+    reminder: Final = [
+        {"type": "text", "text": "<system-reminder>"},
+        *instructions,
+        {"type": "text", "text": "</system-reminder>"},
+    ]
+    prepared: Final = list(messages)
+    if prepared and isinstance(prepared[0], Mapping) and prepared[0].get("role") == "user":
+        first: Final = dict(prepared[0])
+        content: Final = first.get("content")
+        first["content"] = [
+            *reminder,
+            *(
+                [{"type": "text", "text": content}]
+                if isinstance(content, str)
+                else list(content)
+                if isinstance(content, Sequence)
+                else [content]
+                if content is not None
+                else []
+            ),
+        ]
+        prepared[0] = first
+        return prepared
+    return [{"role": "user", "content": reminder}, *prepared]
 
 
 def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tuple[dict, str | None]:
