@@ -6,7 +6,7 @@ import re
 import secrets
 import time
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from typing import Final, Protocol, TypeGuard, cast, runtime_checkable
@@ -23,6 +23,7 @@ _ACCESS_TOKEN_PATTERN: Final = re.compile(r"sk-ant-oat[-A-Za-z0-9._~+/]+=*")
 ANTHROPIC_OAUTH_CLIENT_ID: Final = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 ANTHROPIC_OAUTH_AUTHORIZE_URL: Final = "https://claude.com/cai/oauth/authorize"
 ANTHROPIC_OAUTH_TOKEN_URL: Final = "https://platform.claude.com/v1/oauth/token"
+ANTHROPIC_OAUTH_PROFILE_URL: Final = "https://api.anthropic.com/api/oauth/profile"
 ANTHROPIC_OAUTH_REDIRECT_URI: Final = "https://platform.claude.com/oauth/code/callback"
 ANTHROPIC_OAUTH_REFRESH_SCOPES: Final = (
     "user:profile",
@@ -42,6 +43,13 @@ class AsyncHTTPClient(Protocol):
         url: str,
         *,
         json: Mapping[str, str],
+        headers: Mapping[str, str] | None = None,
+    ) -> httpx.Response: ...
+
+    async def get(
+        self,
+        url: str,
+        *,
         headers: Mapping[str, str] | None = None,
     ) -> httpx.Response: ...
 
@@ -200,7 +208,27 @@ class AnthropicOAuthClient:
             raise AnthropicOAuthError(operation, 503) from None
         except ValueError:
             raise AnthropicOAuthError(operation) from None
-        return self._parse_tokens(payload, previous, operation)
+        tokens: Final = self._parse_tokens(payload, previous, operation)
+        if tokens.account_id is not None:
+            return tokens
+        account_id: Final = await self._fetch_account_id(tokens.access_token)
+        return replace(tokens, account_id=account_id) if account_id is not None else tokens
+
+    async def _fetch_account_id(self, access_token: str) -> str | None:
+        try:
+            async with asyncio.timeout(ANTHROPIC_OAUTH_TIMEOUT_SECONDS):
+                response: Final = await self._get(
+                    {
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/json",
+                        "Cache-Control": "no-cache",
+                    }
+                )
+            response.raise_for_status()
+            payload: Final = _OAUTH_OBJECT_ADAPTER.validate_json(response.content)
+            return _nested_id(payload.get("account"))
+        except (httpx.HTTPError, TimeoutError, ValueError, AttributeError):
+            return None
 
     async def _post(self, body: Mapping[str, str], headers: Mapping[str, str] | None) -> httpx.Response:
         if self._http_client is not None:
@@ -213,6 +241,18 @@ class AnthropicOAuthClient:
             trust_env=False,
         ) as client:
             return await client.post(ANTHROPIC_OAUTH_TOKEN_URL, json=body, headers=headers)
+
+    async def _get(self, headers: Mapping[str, str]) -> httpx.Response:
+        if self._http_client is not None:
+            return await self._http_client.get(ANTHROPIC_OAUTH_PROFILE_URL, headers=headers)
+        transport: Final = httpx.AsyncHTTPTransport(retries=0) if self._proxy_url is None else None
+        async with httpx.AsyncClient(
+            timeout=ANTHROPIC_OAUTH_TIMEOUT_SECONDS,
+            transport=transport,
+            proxy=self._proxy_url,
+            trust_env=False,
+        ) as client:
+            return await client.get(ANTHROPIC_OAUTH_PROFILE_URL, headers=headers)
 
     @staticmethod
     def _parse_tokens(

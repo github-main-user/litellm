@@ -9,6 +9,7 @@ import pytest
 
 from litellm.llms.anthropic.oauth_client import (
     ANTHROPIC_OAUTH_AUTHORIZE_URL,
+    ANTHROPIC_OAUTH_PROFILE_URL,
     ANTHROPIC_OAUTH_REDIRECT_URI,
     ANTHROPIC_OAUTH_REFRESH_SCOPES,
     ANTHROPIC_OAUTH_TOKEN_URL,
@@ -26,7 +27,7 @@ def test_begin_authorization_has_state_and_pkce() -> None:
     assert query["state"] == [authorization.state]
     assert query["code_challenge_method"] == ["S256"]
     assert query["code"] == ["true"]
-    # Claude Code 2.1.278 public binary constants inspected 2026-09-20.
+    # Claude Code 2.1.280 public binary constants inspected 2026-09-23.
     assert ANTHROPIC_OAUTH_AUTHORIZE_URL == "https://claude.com/cai/oauth/authorize"
     assert ANTHROPIC_OAUTH_REDIRECT_URI == "https://platform.claude.com/oauth/code/callback"
     assert query["redirect_uri"] == [ANTHROPIC_OAUTH_REDIRECT_URI]
@@ -118,7 +119,7 @@ async def test_exchange_reads_nested_account_uuid_and_refresh_preserves_it() -> 
         refreshed = await client.refresh(initial)
 
     assert initial.account_id == "account-a"
-    # Claude Code 2.1.278 public token exchange inspected 2026-09-20.
+    # Claude Code 2.1.280 public token exchange inspected 2026-09-23.
     assert requests[0] == {
         "grant_type": "authorization_code",
         "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -135,9 +136,31 @@ async def test_exchange_reads_nested_account_uuid_and_refresh_preserves_it() -> 
 
 
 @pytest.mark.asyncio
+async def test_exchange_fetches_profile_when_token_response_omits_account() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert str(request.url) == ANTHROPIC_OAUTH_PROFILE_URL
+            assert request.headers["authorization"] == "Bearer sk-ant-oat-access"
+            return httpx.Response(200, json={"account": {"uuid": "account-from-profile"}})
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "sk-ant-oat-access",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        tokens = await AnthropicOAuthClient(http_client).exchange_code("code", "state", "verifier")
+
+    assert tokens.account_id == "account-from-profile"
+
+
+@pytest.mark.asyncio
 async def test_refresh_replaces_rotated_token() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        # Claude Code 2.1.278 public binary constant inspected 2026-09-20.
+        # Claude Code 2.1.280 public binary constant inspected 2026-09-23.
         assert ANTHROPIC_OAUTH_TOKEN_URL == "https://platform.claude.com/v1/oauth/token"
         assert str(request.url) == ANTHROPIC_OAUTH_TOKEN_URL
         assert "anthropic-sdk-typescript" not in request.headers.get("user-agent", "")
