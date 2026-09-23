@@ -104,6 +104,10 @@ from litellm.litellm_core_utils.sensitive_data_masker import (
 )
 from litellm.litellm_core_utils.token_counter import offload_token_count
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+from litellm.llms.anthropic.subscription_rate_limits import (
+    anthropic_subscription_identity,
+    classify_anthropic_subscription_rate_limit,
+)
 from litellm.llms.base_llm.passthrough.transformation import replace_path_segment
 from litellm.llms.base_llm.vector_store.transformation import (
     RouterVectorStoreEmbeddingExecutor,
@@ -7642,6 +7646,7 @@ class Router:
                     context_window_fallbacks=context_window_fallbacks,
                     regular_fallbacks=fallbacks,
                     content_policy_fallbacks=content_policy_fallbacks,
+                    request_kwargs=kwargs,
                 )
             # Update max_retries after overrides (deployment_num_retries / retry_policy)
             _metadata["max_retries"] = num_retries
@@ -7720,6 +7725,7 @@ class Router:
                                 context_window_fallbacks=context_window_fallbacks,
                                 regular_fallbacks=fallbacks,
                                 content_policy_fallbacks=content_policy_fallbacks,
+                                request_kwargs=kwargs,
                             )
                         except Exception:
                             raise e
@@ -7799,6 +7805,7 @@ class Router:
         context_window_fallbacks: list | None = None,
         content_policy_fallbacks: list | None = None,
         regular_fallbacks: list | None = None,
+        request_kwargs: Mapping[str, object] | None = None,
     ):
         """
         1. raise an exception for ContextWindowExceededError if context_window_fallbacks is not None
@@ -7817,6 +7824,16 @@ class Router:
             _num_all_deployments = len(all_deployments)
 
         ### CHECK IF RATE LIMIT / CONTEXT WINDOW ERROR / CONTENT POLICY VIOLATION ERROR w/ fallbacks available / Bad Request Error
+        if request_kwargs is not None and getattr(error, "litellm_anthropic_rate_limit_scope", None) is None:
+            nested_params: Final = request_kwargs.get("litellm_params")
+            classification_params: Final = nested_params if isinstance(nested_params, Mapping) else request_kwargs
+            subscription_rate_limit_scope: Final = classify_anthropic_subscription_rate_limit(
+                error, classification_params
+            )
+            if subscription_rate_limit_scope is not None:
+                setattr(error, "litellm_anthropic_rate_limit_scope", subscription_rate_limit_scope)
+        if getattr(error, "litellm_anthropic_rate_limit_scope", None) == "request":
+            raise error
         if isinstance(error, litellm.ContextWindowExceededError) and context_window_fallbacks is not None:
             raise error
 
@@ -8201,6 +8218,19 @@ class Router:
             exception_headers: Final = litellm.litellm_core_utils.exception_mapping_utils._get_response_headers(
                 original_exception=exception
             )
+            subscription_rate_limit_scope: Final = (
+                classify_anthropic_subscription_rate_limit(exception, litellm_params)
+                if isinstance(exception, Exception) and isinstance(litellm_params, Mapping)
+                else None
+            )
+            if subscription_rate_limit_scope is not None and isinstance(exception, Exception):
+                setattr(exception, "litellm_anthropic_rate_limit_scope", subscription_rate_limit_scope)
+            if subscription_rate_limit_scope == "request":
+                verbose_router_logger.debug(
+                    "Router: Exiting 'deployment_callback_on_failure' without cooldown. "
+                    "Anthropic subscription rejection is request-scoped."
+                )
+                return False
 
             # Determine cooldown time with priority: deployment config > response header > router default
             deployment_cooldown: Final = _first_present(
@@ -8229,19 +8259,43 @@ class Router:
                 deployment_id: Final[str | None] = _model_info.get("id")
                 if deployment_id is None:
                     return False
-                increment_deployment_failures_for_current_minute(
-                    litellm_router_instance=self,
-                    deployment_id=deployment_id,
-                )
-                result: Final = _set_cooldown_deployments(
-                    litellm_router_instance=self,
-                    exception_status=exception_status,
-                    original_exception=exception,
-                    deployment=deployment_id,
-                    time_to_cooldown=_time_to_cooldown,
-                    requested_model_group=(get_litellm_metadata_from_kwargs(kwargs) or {}).get("model_group"),
-                )  # setting deployment_id in cooldown deployments
-
+                cooldown_deployment_ids: Final = [deployment_id]
+                if subscription_rate_limit_scope == "account":
+                    credential_name: Final = litellm_params.get("litellm_credential_name")
+                    if isinstance(credential_name, str):
+                        account_identity: Final = anthropic_subscription_identity(credential_name)
+                        cooldown_deployment_ids = [
+                            cast(str, candidate_id)
+                            for deployment in self.model_list
+                            if isinstance(deployment, Mapping)
+                            and isinstance((candidate_params := deployment.get("litellm_params")), Mapping)
+                            and (
+                                candidate_params.get("custom_llm_provider") == "anthropic"
+                                or str(candidate_params.get("model", "")).startswith("anthropic/")
+                            )
+                            and isinstance((candidate_name := candidate_params.get("litellm_credential_name")), str)
+                            and anthropic_subscription_identity(candidate_name) == account_identity
+                            and isinstance((candidate_info := deployment.get("model_info")), Mapping)
+                            and isinstance((candidate_id := candidate_info.get("id")), (str, int))
+                            and not isinstance(candidate_id, bool)
+                        ] or [deployment_id]
+                result = False
+                for cooldown_deployment_id in cooldown_deployment_ids:
+                    increment_deployment_failures_for_current_minute(
+                        litellm_router_instance=self,
+                        deployment_id=cooldown_deployment_id,
+                    )
+                    result = (
+                        _set_cooldown_deployments(
+                            litellm_router_instance=self,
+                            exception_status=exception_status,
+                            original_exception=exception,
+                            deployment=cooldown_deployment_id,
+                            time_to_cooldown=_time_to_cooldown,
+                            requested_model_group=(get_litellm_metadata_from_kwargs(kwargs) or {}).get("model_group"),
+                        )
+                        or result
+                    )
                 return result
             else:
                 verbose_router_logger.debug(

@@ -635,6 +635,116 @@ def test_deployment_callback_respects_cooldown_time(model_list):
         assert mock_set.call_args.kwargs["time_to_cooldown"] == 0
 
 
+def test_anthropic_request_rate_limit_skips_cooldown(model_list):
+    import httpx
+    import time
+
+    router = Router(model_list=model_list)
+    exception = litellm.RateLimitError(
+        message="Usage credits are required for fast mode.",
+        llm_provider="anthropic",
+        model="claude",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+    )
+    kwargs = {
+        "exception": exception,
+        "litellm_params": {
+            "custom_llm_provider": "anthropic",
+            "litellm_credential_name": "subscription-a",
+            "metadata": {"model_group": "claude"},
+            "model_info": {"id": "deployment-a"},
+        },
+    }
+
+    with pytest.raises(litellm.RateLimitError):
+        router.should_retry_this_error(error=exception, request_kwargs=kwargs["litellm_params"])
+
+    with patch("litellm.router._set_cooldown_deployments") as mock_set:
+        result = router.deployment_callback_on_failure(
+            kwargs=kwargs,
+            completion_response=None,
+            start_time=time.time(),
+            end_time=time.time(),
+        )
+
+    assert result is False
+    assert exception.litellm_anthropic_rate_limit_scope == "request"
+    mock_set.assert_not_called()
+
+
+def test_anthropic_account_rate_limit_cools_shared_account_deployments(model_list):
+    import httpx
+    import time
+
+    router = Router(model_list=model_list)
+    router.model_list = [
+        {
+            "model_name": "claude-a",
+            "litellm_params": {
+                "model": "anthropic/claude-a",
+                "litellm_credential_name": "subscription-a",
+            },
+            "model_info": {"id": "deployment-a"},
+        },
+        {
+            "model_name": "claude-b",
+            "litellm_params": {
+                "model": "anthropic/claude-b",
+                "litellm_credential_name": "subscription-b",
+            },
+            "model_info": {"id": "deployment-b"},
+        },
+        {
+            "model_name": "claude-c",
+            "litellm_params": {
+                "model": "anthropic/claude-c",
+                "litellm_credential_name": "subscription-c",
+            },
+            "model_info": {"id": "deployment-c"},
+        },
+    ]
+    exception = litellm.RateLimitError(
+        message="shared subscription window exhausted",
+        llm_provider="anthropic",
+        model="claude",
+        response=httpx.Response(
+            429,
+            headers={"anthropic-ratelimit-unified-5h-status": "rejected"},
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        ),
+    )
+    kwargs = {
+        "exception": exception,
+        "litellm_params": {
+            "custom_llm_provider": "anthropic",
+            "litellm_credential_name": "subscription-a",
+            "metadata": {"model_group": "claude-a"},
+            "model_info": {"id": "deployment-a"},
+        },
+    }
+
+    identities = {
+        "subscription-a": "account-shared",
+        "subscription-b": "account-shared",
+        "subscription-c": "account-other",
+    }
+    with (
+        patch("litellm.router.anthropic_subscription_identity", side_effect=identities.__getitem__),
+        patch("litellm.router.increment_deployment_failures_for_current_minute"),
+        patch("litellm.router._set_cooldown_deployments", return_value=True) as mock_set,
+    ):
+        result = router.deployment_callback_on_failure(
+            kwargs=kwargs,
+            completion_response=None,
+            start_time=time.time(),
+            end_time=time.time(),
+        )
+
+    assert result is True
+    assert exception.litellm_anthropic_rate_limit_scope == "account"
+    assert [call.kwargs["deployment"] for call in mock_set.call_args_list] == ["deployment-a", "deployment-b"]
+
+
 @pytest.mark.parametrize("metadata_key", ["metadata", "litellm_metadata"])
 def test_log_retry(model_list: list[DeploymentTypedDict], metadata_key: str) -> None:
     """log_retry appends one flat record per failed attempt, copies neither the request kwargs nor the
