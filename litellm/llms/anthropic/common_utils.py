@@ -78,7 +78,7 @@ _CLAUDE_CODE_USER_AGENT_PREFIXES: Final = ("claude-cli/", "claude-code/")
 ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 ANTHROPIC_SUBSCRIPTION_APP_HEADER: Final = "cli"
 ANTHROPIC_SUBSCRIPTION_BETA_HEADER: Final = "claude-code-20250219"
-ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.278 (external, cli)"
+ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.280 (external, cli)"
 
 
 def supports_anthropic_cache_control(model: str, custom_llm_provider: str | None) -> bool:

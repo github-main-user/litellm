@@ -2325,6 +2325,7 @@ def test_subscription_sets_single_claude_cli_user_agent(forwarded, header_name):
     repeated, _ = optionally_handle_anthropic_oauth(result, token)
 
     assert token == FAKE_OAUTH_TOKEN
+    assert ANTHROPIC_SUBSCRIPTION_USER_AGENT == "claude-cli/2.1.280 (external, cli)"
     assert [(name, value) for name, value in result.items() if name.lower() == "user-agent"] == [
         ("user-agent", ANTHROPIC_SUBSCRIPTION_USER_AGENT)
     ]
