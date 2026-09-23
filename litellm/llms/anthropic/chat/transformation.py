@@ -513,8 +513,6 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             "speed",
             "context_management",
             "cache_control",
-            "prompt_cache_key",
-            "store",
         ]
 
         if (
@@ -529,6 +527,24 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             params.append("reasoning_effort")
 
         return params
+
+    def get_ignored_openai_params(self, model: str) -> list[str]:
+        return [
+            "audio",
+            "frequency_penalty",
+            "logit_bias",
+            "logprobs",
+            "metadata",
+            "modalities",
+            "prediction",
+            "presence_penalty",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "seed",
+            "service_tier",
+            "store",
+            "top_logprobs",
+        ]
 
     @staticmethod
     def filter_anthropic_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -1649,12 +1665,6 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             elif param == "cache_control" and isinstance(value, dict):
                 # Pass through top-level cache_control for automatic prompt caching
                 optional_params["cache_control"] = value
-            elif param == "store" and value is True:
-                if not (litellm.drop_params or drop_params):
-                    raise litellm.utils.UnsupportedParamsError(
-                        message="Anthropic does not support store=True.",
-                        status_code=400,
-                    )
 
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(

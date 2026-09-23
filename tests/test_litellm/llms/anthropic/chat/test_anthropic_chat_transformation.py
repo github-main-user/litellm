@@ -4000,44 +4000,36 @@ def test_cache_control_in_supported_params():
 
 @pytest.mark.parametrize(
     ("param", "value"),
-    [("prompt_cache_key", "pi-session"), ("store", False)],
+    [
+        ("prompt_cache_key", "pi-session"),
+        ("store", False),
+        ("store", True),
+    ],
 )
-def test_openai_only_params_are_accepted_and_dropped(param, value):
+def test_openai_only_params_are_ignored_by_anthropic(param, value):
     config = AnthropicConfig()
 
-    supported_params = config.get_supported_openai_params(model="claude-sonnet-5")
-    result = config.map_openai_params(
-        non_default_params={param: value},
-        optional_params={},
+    assert param not in config.get_supported_openai_params(model="claude-sonnet-5")
+    assert param in config.get_ignored_openai_params(model="claude-sonnet-5")
+
+    result = litellm.get_optional_params(
         model="claude-sonnet-5",
-        drop_params=False,
+        custom_llm_provider="anthropic",
+        **{param: value},
     )
 
-    assert param in supported_params
     assert param not in result
 
 
-def test_store_true_remains_unsupported():
-    config = AnthropicConfig()
-
-    with pytest.raises(litellm.UnsupportedParamsError, match="store=True"):
-        config.map_openai_params(
-            non_default_params={"store": True},
-            optional_params={},
-            model="claude-sonnet-5",
-            drop_params=False,
-        )
-
-
-def test_store_true_is_dropped_when_drop_params_enabled():
-    result = AnthropicConfig().map_openai_params(
-        non_default_params={"store": True},
-        optional_params={},
+def test_ignored_openai_param_can_be_explicitly_forwarded():
+    result = litellm.get_optional_params(
         model="claude-sonnet-5",
-        drop_params=True,
+        custom_llm_provider="anthropic",
+        store=True,
+        allowed_openai_params=["store"],
     )
 
-    assert "store" not in result
+    assert result["store"] is True
 
 
 def test_map_openai_params_with_cache_control():
