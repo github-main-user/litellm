@@ -21,6 +21,8 @@ from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
 from litellm.proxy.credential_endpoints.anthropic_oauth import (
     ANTHROPIC_CREDENTIAL_VALUE_KEY,
+    ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY,
+    ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY,
     CREDENTIAL_PROXY_VALUE_KEY,
     AnthropicOAuthAttempt,
     AnthropicOAuthCompleteRequest,
@@ -919,6 +921,42 @@ async def test_recovery_ignores_api_keys_and_preserves_transient_refresh_error()
 
     assert caught.value is transient
     assert caught.value.response_headers == {"Retry-After": "9"}
+    client.refresh.assert_awaited_once_with(rejected)
+
+
+@pytest.mark.asyncio
+async def test_refresh_429_blocks_same_refresh_token_across_requests() -> None:
+    rejected = AnthropicOAuthTokens("sk-ant-oat-rejected", "refresh-old", time.time() + 3600, "account-a")
+    database = _AdvisoryLockDatabase(
+        SimpleNamespace(
+            credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: rejected.to_json()},
+            credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        )
+    )
+    client = MagicMock()
+    client.refresh = AsyncMock(side_effect=AnthropicOAuthError("token refresh", 429, "120"))
+    with (
+        patch.object(litellm, "credential_list", [_credential("subscription", rejected)]),
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch(
+            "litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper",
+            side_effect=lambda value, *args, **kwargs: value,
+        ),
+        patch(
+            "litellm.proxy.credential_endpoints.anthropic_oauth.encrypt_value_helper", side_effect=lambda value: value
+        ),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type", AsyncMock()),
+    ):
+        hook = AnthropicOAuthCredentialHook(client)
+        with pytest.raises(AnthropicOAuthError) as first:
+            await hook.recover_rejected_token("subscription", rejected.access_token)
+        with pytest.raises(AnthropicOAuthError) as blocked:
+            await hook.recover_rejected_token("subscription", rejected.access_token)
+
+    assert first.value.retry_after == "120"
+    assert 1 <= int(blocked.value.retry_after or "0") <= 120
+    assert ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY in database.row.credential_info
+    assert database.row.credential_info[ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY] > time.time()
     client.refresh.assert_awaited_once_with(rejected)
 
 

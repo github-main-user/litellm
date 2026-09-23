@@ -1,12 +1,14 @@
 import asyncio
 import hashlib
 import json
+import math
 import re
 import secrets
 import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import timedelta
+from email.utils import parsedate_to_datetime
 from typing import Annotated, Final, Literal, Protocol, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -41,6 +43,9 @@ ANTHROPIC_CREDENTIAL_AUTH_TYPE: Final = "oauth"
 ANTHROPIC_ATTEMPT_LIFETIME_SECONDS: Final = 10 * 60
 ANTHROPIC_EXPIRY_SKEW_SECONDS: Final = 5 * 60
 ANTHROPIC_REFRESH_TRANSACTION_TIMEOUT: Final = timedelta(minutes=2)
+ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY: Final = "anthropic_refresh_blocked_until"
+ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY: Final = "anthropic_refresh_blocked_token"
+ANTHROPIC_REFRESH_DEFAULT_BACKOFF_SECONDS: Final = 60
 _CREDENTIAL_NAME_PATTERN: Final = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")
 
 router: Final = APIRouter()
@@ -263,6 +268,33 @@ def _lock_key(identity: str, namespace: str = "credential") -> int:
     return int.from_bytes(
         hashlib.blake2b(f"anthropic-oauth:{namespace}:{identity}".encode(), digest_size=8).digest(), "big", signed=True
     )
+
+
+def _refresh_token_fingerprint(refresh_token: str) -> str:
+    return hashlib.sha256(refresh_token.encode()).hexdigest()
+
+
+def _refresh_blocked_until(retry_after: str | None) -> float:
+    now: Final = time.time()
+    if retry_after is not None and retry_after.isdigit():
+        return now + max(1, int(retry_after))
+    if retry_after is not None:
+        try:
+            deadline: Final = parsedate_to_datetime(retry_after).timestamp()
+            if deadline > now:
+                return deadline
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return now + ANTHROPIC_REFRESH_DEFAULT_BACKOFF_SECONDS
+
+
+def _active_refresh_block(info: Mapping[str, object], refresh_token: str) -> int | None:
+    blocked_token: Final = info.get(ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY)
+    blocked_until: Final = info.get(ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY)
+    if blocked_token != _refresh_token_fingerprint(refresh_token) or not isinstance(blocked_until, (int, float)):
+        return None
+    remaining: Final = math.ceil(float(blocked_until) - time.time())
+    return remaining if remaining > 0 else None
 
 
 def _find_cached(credential_name: str) -> CredentialItem | None:
@@ -616,6 +648,7 @@ class AnthropicOAuthCredentialHook(CustomLogger):
         if prisma_client is None:
             raise RuntimeError("Database not connected")
         database: Final = cast(_PrismaClient, prisma_client).db
+        refresh_error: AnthropicOAuthError | None = None
         async with database.tx(timeout=ANTHROPIC_REFRESH_TRANSACTION_TIMEOUT) as transaction:
             await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", _lock_key(credential_name))
             await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", _lock_key(identity, "account"))
@@ -640,11 +673,34 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                 rejected_access_token is not None and not token_was_rotated
             )
             proxy_url = _proxy_from_row(row)
+            if should_refresh and (remaining := _active_refresh_block(info, stored.refresh_token)) is not None:
+                raise AnthropicOAuthError("token refresh", 429, str(remaining))
             refresh_client: Final = (
                 AnthropicOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
             )
-            refreshed: Final = await refresh_client.refresh(stored) if should_refresh else stored
-            if should_refresh:
+            try:
+                refreshed: Final = await refresh_client.refresh(stored) if should_refresh else stored
+            except AnthropicOAuthError as error:
+                if error.status_code != 429:
+                    raise
+                refresh_error = error
+                refreshed = stored
+                info = {
+                    **info,
+                    ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY: _refresh_token_fingerprint(stored.refresh_token),
+                    ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY: _refresh_blocked_until(error.retry_after),
+                }
+                await transaction.litellm_credentialstable.update(
+                    where={"credential_name": credential_name},
+                    data=_database_data(
+                        {
+                            "credential_values": row.credential_values,
+                            "credential_info": info,
+                            "updated_by": "litellm-anthropic-oauth",
+                        }
+                    ),
+                )
+            if should_refresh and refresh_error is None:
                 if stored.account_id is not None and refreshed.account_id != stored.account_id:
                     raise ValueError("Anthropic account identity changed during refresh")
                 latest_row: Final = await transaction.litellm_credentialstable.find_unique(
@@ -661,6 +717,8 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                 values = latest_values
                 proxy_url = latest_proxy
                 info = _credential_info_from_row(latest_row)
+                info.pop(ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY, None)
+                info.pop(ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY, None)
                 encrypted: Final = encrypt_value_helper(refreshed.to_json())
                 if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime crypto boundary
                     encrypted, str
@@ -681,10 +739,10 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                         }
                     ),
                 )
-        CredentialAccessor.upsert_credentials(
-            [_plaintext_credential(credential_name, refreshed, proxy_url, info)]
-        )
+        CredentialAccessor.upsert_credentials([_plaintext_credential(credential_name, refreshed, proxy_url, info)])
         await publish_config_change_for_object_type("litellm_credentialstable")
+        if refresh_error is not None:
+            raise refresh_error
         return refreshed
 
 
