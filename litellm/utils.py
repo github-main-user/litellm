@@ -4169,6 +4169,22 @@ def pre_process_non_default_params(
         additional_endpoint_specific_params=["messages"],
     )
 
+    if provider_config is not None:
+        allowed_openai_params: Final = set(
+            passed_params.get("allowed_openai_params") or []
+        )
+        ignored_openai_params: Final = (
+            set(provider_config.get_ignored_openai_params(model))
+            - allowed_openai_params
+        )
+        for param in ignored_openai_params.intersection(non_default_params):
+            verbose_logger.debug(
+                "Ignoring unsupported OpenAI parameter %s for provider %s",
+                param,
+                custom_llm_provider,
+            )
+            non_default_params.pop(param)
+
     if "response_format" in non_default_params:
         if provider_config is not None:
             non_default_params["response_format"] = provider_config.get_json_schema_from_pydantic_object(

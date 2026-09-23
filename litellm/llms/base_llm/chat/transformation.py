@@ -187,6 +187,9 @@ class BaseConfig(ABC):
     def get_supported_openai_params(self, model: str) -> list:
         pass
 
+    def get_ignored_openai_params(self, model: str) -> list[str]:
+        return []
+
     def _add_response_format_to_tools(
         self,
         optional_params: dict,
