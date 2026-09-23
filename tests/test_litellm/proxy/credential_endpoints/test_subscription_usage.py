@@ -16,7 +16,9 @@ from litellm.proxy.credential_endpoints.subscription_usage import (
     SubscriptionUsageAuth,
     SubscriptionUsageService,
     get_credential_subscription_usage,
+    reset_credential_subscription_usage,
     parse_anthropic_usage,
+    parse_chatgpt_reset_credits,
     parse_chatgpt_usage,
 )
 
@@ -95,6 +97,8 @@ def test_chatgpt_parser_uses_window_durations_and_rejects_invalid_numbers() -> N
     )
 
     assert plan == "plus"
+    assert parse_chatgpt_reset_credits({"rate_limit_reset_credits": {"available_count": 0}}) == 0
+    assert parse_chatgpt_reset_credits({"rate_limit_reset_credits": {"available_count": True}}) is None
     assert [window.model_dump(mode="json") for window in windows] == [
         {
             "key": "primary_window",
@@ -157,6 +161,7 @@ async def test_service_returns_sanitized_unavailable_without_fake_windows() -> N
         "plan_type": None,
         "windows": [],
         "error": "Usage provider request failed",
+        "reset_credits_available": None,
     }
 
 
@@ -189,6 +194,9 @@ async def test_endpoint_is_admin_only() -> None:
         await get_credential_subscription_usage("subscription", non_admin, SubscriptionUsageService())
 
     assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as reset_denied:
+        await reset_credential_subscription_usage("subscription", non_admin, SubscriptionUsageService())
+    assert reset_denied.value.status_code == 403
 
 
 @contextmanager
@@ -198,6 +206,16 @@ def _local_proxy(body):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             received.append((self.path, dict(self.headers)))
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append((self.path, dict(self.headers), json.loads(self.rfile.read(length))))
             payload = json.dumps(body).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -240,6 +258,83 @@ async def test_real_proxy_routing_isolates_accounts_and_ignores_no_proxy(monkeyp
     assert second[0][1]["Authorization"] == "Bearer second-token"
     assert second[0][1]["ChatGPT-Account-Id"] == "account-two"
     assert first[0][1]["Proxy-Authorization"].startswith("Basic ")
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_reset_uses_credential_proxy_and_invalidates_cached_usage(monkeypatch):
+    from litellm.proxy.credential_endpoints import subscription_usage
+
+    monkeypatch.setattr(subscription_usage, "CHATGPT_RESET_URL", "http://reset.invalid/consume")
+    monkeypatch.setenv("NO_PROXY", "*")
+    calls = []
+
+    async def find(name):
+        return _oauth_credential("chatgpt")
+
+    async def request(*args):
+        calls.append(True)
+        return {
+            "rate_limit": {"primary_window": {"used_percent": len(calls)}},
+            "rate_limit_reset_credits": {"available_count": 1 if len(calls) == 1 else 0},
+        }
+
+    with _local_proxy({"code": "reset", "windows_reset": 2}) as (proxy, received):
+        async def auth(provider, name):
+            return SubscriptionUsageAuth("chatgpt", "secret-token", proxy, "account-id")
+
+        service = SubscriptionUsageService(request, find, auth)
+        assert (await service.get("subscription")).reset_credits_available == 1
+        result = await service.reset_chatgpt("subscription")
+        assert result.windows_reset == 2
+        assert (await service.get("subscription")).reset_credits_available == 0
+
+    assert len(calls) == 2
+    assert received[0][0] == "http://reset.invalid/consume"
+    assert received[0][1]["Authorization"] == "Bearer secret-token"
+    assert received[0][1]["ChatGPT-Account-Id"] == "account-id"
+    assert received[0][1]["Proxy-Authorization"].startswith("Basic ")
+    assert received[0][2]["redeem_request_id"]
+
+
+@pytest.mark.asyncio
+async def test_reset_without_credit_does_not_invalidate_usage(monkeypatch):
+    from litellm.proxy.credential_endpoints import subscription_usage
+
+    monkeypatch.setattr(subscription_usage, "CHATGPT_RESET_URL", "http://reset.invalid/consume")
+
+    async def find(name):
+        return _oauth_credential("chatgpt")
+
+    with _local_proxy({"code": "no_credit", "windows_reset": 0}) as (proxy, _):
+        async def auth(provider, name):
+            return SubscriptionUsageAuth("chatgpt", "secret-token", proxy, None)
+
+        with pytest.raises(HTTPException) as error:
+            await SubscriptionUsageService(credential_finder=find, auth_resolver=auth).reset_chatgpt("subscription")
+    assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reset_with_dead_proxy_never_reaches_direct_endpoint(monkeypatch):
+    from litellm.proxy.credential_endpoints import subscription_usage
+
+    with _local_proxy({"code": "reset", "windows_reset": 2}) as (origin, received):
+        dead_server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        dead_proxy = f"http://127.0.0.1:{dead_server.server_port}"
+        dead_server.server_close()
+        monkeypatch.setattr(subscription_usage, "CHATGPT_RESET_URL", f"http://{origin.rsplit('@', 1)[1]}/reset")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+        async def find(name):
+            return _oauth_credential("chatgpt")
+
+        async def auth(provider, name):
+            return SubscriptionUsageAuth("chatgpt", "secret", dead_proxy, None)
+
+        with pytest.raises(HTTPException) as error:
+            await SubscriptionUsageService(credential_finder=find, auth_resolver=auth).reset_chatgpt("subscription")
+        assert error.value.status_code == 502
+        assert not received
 
 
 @pytest.mark.asyncio

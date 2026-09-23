@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import math
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ CredentialFinder = Callable[[str], Awaitable[CredentialItem | None]]
 
 ANTHROPIC_USAGE_URL: Final = "https://api.anthropic.com/api/oauth/usage"
 CHATGPT_USAGE_URL: Final = "https://chatgpt.com/backend-api/wham/usage"
+CHATGPT_RESET_URL: Final = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 _SUCCESS_TTL_SECONDS: Final = 60.0
 _ERROR_TTL_SECONDS: Final = 15.0
 _MAX_CACHE_ENTRIES: Final = 256
@@ -52,6 +54,13 @@ class SubscriptionUsageResponse(BaseModel):
     plan_type: str | None
     windows: tuple[SubscriptionUsageWindow, ...]
     error: str | None
+    reset_credits_available: int | None = None
+
+
+class SubscriptionResetResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    windows_reset: int = Field(ge=0)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -217,6 +226,12 @@ def _chatgpt_window(
     )
 
 
+def parse_chatgpt_reset_credits(payload: Mapping[str, object]) -> int | None:
+    credits: Final = _mapping(payload.get("rate_limit_reset_credits"))
+    count: Final = credits.get("available_count") if credits is not None else None
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+
+
 def parse_chatgpt_usage(payload: Mapping[str, object]) -> tuple[str | None, tuple[SubscriptionUsageWindow, ...]]:
     rate_limit: Final = _mapping(payload.get("rate_limit"))
     windows: Final = tuple(
@@ -275,6 +290,61 @@ class SubscriptionUsageService:
             if existing is None:
                 self._inflight[cache_key] = task
         return await asyncio.shield(task)
+
+    async def reset_chatgpt(self, credential_name: str) -> SubscriptionResetResponse:
+        credential: Final = await self._credential_finder(credential_name)
+        if credential is None:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        if self._supported_provider(credential) != "chatgpt":
+            raise HTTPException(status_code=409, detail="Credential is not a ChatGPT OAuth subscription")
+        try:
+            auth: Final = await self._auth_resolver("chatgpt", credential_name)
+            headers: Final = {
+                "Authorization": f"Bearer {auth.access_token}",
+                "Accept": "application/json",
+                **({"ChatGPT-Account-Id": auth.account_id} if auth.account_id is not None else {}),
+            }
+            async with httpx.AsyncClient(
+                proxy=auth.proxy_url,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                trust_env=auth.proxy_url is None,
+                follow_redirects=False,
+            ) as client:
+                response: Final = await client.post(
+                    CHATGPT_RESET_URL,
+                    headers=headers,
+                    json={"redeem_request_id": str(uuid.uuid4())},
+                )
+            if response.status_code != 200:
+                raise _UsageFetchError
+            payload: Final = _PAYLOAD_ADAPTER.validate_json(response.content, strict=True)
+            code: Final = payload.get("code")
+            if code != "reset":
+                if code in ("no_credit", "nothing_to_reset", "already_redeemed"):
+                    raise HTTPException(status_code=409, detail="No applicable reset credit is available")
+                raise _UsageFetchError
+            windows_reset: Final = payload.get("windows_reset")
+            if not isinstance(windows_reset, int) or isinstance(windows_reset, bool) or windows_reset < 0:
+                raise _UsageFetchError
+        except HTTPException as error:
+            if error.status_code == 409:
+                await self._invalidate_usage(credential_name, auth)
+            raise
+        except (httpx.HTTPError, ValueError, ValidationError, _UsageFetchError):
+            raise HTTPException(status_code=502, detail="Subscription reset is unavailable") from None
+        except Exception:
+            raise HTTPException(status_code=502, detail="Subscription reset is unavailable") from None
+        await self._invalidate_usage(credential_name, auth)
+        return SubscriptionResetResponse(windows_reset=windows_reset)
+
+    async def _invalidate_usage(self, credential_name: str, auth: SubscriptionUsageAuth) -> None:
+        cache_key: Final = self._cache_key(credential_name, auth)
+        async with self._lock:
+            inflight: Final = self._inflight.get(cache_key)
+        if inflight is not None:
+            await asyncio.shield(inflight)
+        async with self._lock:
+            self._cache.pop(cache_key, None)
 
     async def _find_credential(self, credential_name: str) -> CredentialItem | None:
         cached: Final = CredentialAccessor.find_credential(credential_name)
@@ -362,6 +432,9 @@ class SubscriptionUsageService:
                 plan_type=plan,
                 windows=windows,
                 error=None,
+                reset_credits_available=(
+                    parse_chatgpt_reset_credits(payload) if auth.provider == "chatgpt" else None
+                ),
             )
         except _UsageFetchError as error:
             return self._unavailable(credential_name, auth.provider, str(error))
@@ -449,3 +522,18 @@ async def get_credential_subscription_usage(
     if user.user_role not in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value):
         raise HTTPException(status_code=403, detail="Only proxy administrators may view credential usage")
     return await service.get(credential_name)
+
+
+@router.post(
+    "/credentials/{credential_name:path}/usage/reset",
+    response_model=SubscriptionResetResponse,
+    tags=["credential management"],
+)
+async def reset_credential_subscription_usage(
+    credential_name: Annotated[str, Path(description="The ChatGPT OAuth credential name")],
+    user: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+    service: Annotated[SubscriptionUsageService, Depends(get_subscription_usage_service)],
+) -> SubscriptionResetResponse:
+    if user.user_role not in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value):
+        raise HTTPException(status_code=403, detail="Only proxy administrators may reset credential usage")
+    return await service.reset_chatgpt(credential_name)
