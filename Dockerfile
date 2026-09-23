@@ -104,7 +104,10 @@ COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
 # Install project and workspace packages (fast - deps already cached)
-RUN uv sync --frozen --no-default-groups --no-editable \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/tmp/litellm-cargo-target,sharing=locked \
+    CARGO_TARGET_DIR=/tmp/litellm-cargo-target uv sync --frozen --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \

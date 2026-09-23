@@ -22,8 +22,10 @@ hive-mind-prompt-*.txt
 
 # Python virtual environments and version managers
 .venv/
+.venv-typecheck/
 venv/
 **/.venv/
+**/.venv-typecheck/
 **/venv/
 .python-version
 .pyenv/
