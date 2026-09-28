@@ -1770,3 +1770,17 @@ model LiteLLM_WorkflowMessage {
   @@unique([run_id, sequence_number])
   @@index([run_id])
 }
+
+model LiteLLM_PublicInferenceId {
+  public_id   String   @id
+  owner       String
+  kind        String
+  fingerprint String
+  value       String
+  created_at  DateTime @default(now())
+  updated_at  DateTime @default(now()) @updatedAt
+  expires_at  DateTime
+
+  @@unique([owner, kind, fingerprint])
+  @@index([expires_at])
+}
