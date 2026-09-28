@@ -33,6 +33,19 @@ from litellm.router import Router
 from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo, updateDeployment, updateLiteLLMParams
 
 
+def _mock_db() -> MagicMock:
+    db = MagicMock()
+    db.litellm_canonicalmodel.find_unique = AsyncMock(return_value=None)
+    db.litellm_canonicalmodelconnection.find_unique = AsyncMock(return_value=None)
+    return db
+
+
+def _mock_prisma() -> MagicMock:
+    prisma = MagicMock()
+    prisma.db = _mock_db()
+    return prisma
+
+
 async def _passthrough_row(update_data):
     return update_data
 
@@ -323,7 +336,7 @@ class TestModelManagementAuthChecks:
             add_new_model,
         )
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         with (
             patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
             patch("litellm.proxy.proxy_server.store_model_in_db", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
@@ -453,7 +466,8 @@ class TestModelManagementAuthChecks:
             add_new_model,
         )
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db.litellm_canonicalmodel.find_unique = AsyncMock(return_value=None)
         with (
             patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
             patch("litellm.proxy.proxy_server.store_model_in_db", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
@@ -546,7 +560,7 @@ class TestModelManagementAuthChecks:
         )
         existing_row = MagicMock()
         existing_row.model_dump.return_value = existing.model_dump()
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
         mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
         with (
@@ -728,7 +742,7 @@ class TestClearCache:
             return_value=ReconcileOutcome(still_desired=frozenset(), live_after=frozenset())
         )
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_logging = MagicMock()
 
         with (
@@ -786,7 +800,7 @@ class TestClearCache:
             return_value=ReconcileOutcome(still_desired=frozenset(), live_after=frozenset())
         )
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_logging = MagicMock()
 
         with (
@@ -1062,8 +1076,8 @@ class TestDeleteModelClearsRouterRegistry:
             updated_by="admin",
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=db_row)
@@ -1124,8 +1138,8 @@ class TestDeleteModelClearsRouterRegistry:
             updated_by="admin",
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=db_row)
@@ -1201,7 +1215,7 @@ class TestUpdateModel:
         updated_row = MagicMock()
         updated_row.model_dump_json.return_value = "{}"
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
             return_value=existing_row
         )
@@ -2301,8 +2315,8 @@ class TestAddAndDeleteModelLifecycle:
             updated_by="test-admin",
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.create = AsyncMock(return_value=db_row)
@@ -2310,6 +2324,8 @@ class TestAddAndDeleteModelLifecycle:
             return_value=db_row
         )
         mock_prisma.db.litellm_proxymodeltable.delete = AsyncMock(return_value=db_row)
+        mock_prisma.db.litellm_canonicalmodel.find_unique = AsyncMock(return_value=None)
+        mock_prisma.db.litellm_canonicalmodelconnection.find_unique = AsyncMock(return_value=None)
 
         mock_proxy_config = MagicMock()
         mock_proxy_config._add_deployment_locked = AsyncMock(
@@ -2414,8 +2430,8 @@ class TestDeleteTeamBYOKModelGhost:
         team_row = _team([public_name, kept_name])
         updated_team_row = _team([kept_name])
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2497,8 +2513,8 @@ class TestDeleteTeamBYOKModelGhost:
             models=[public_name, "kept"],
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2574,8 +2590,8 @@ class TestDeleteTeamBYOKModelGhost:
             models=[public_name],
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2660,8 +2676,8 @@ class TestDeleteTeamBYOKModelGhost:
         alias_row.team = MagicMock()
         alias_row.team.team_id = team_id
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2742,8 +2758,8 @@ class TestDeleteTeamBYOKModelGhost:
             models=["gpt-4"],
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2812,8 +2828,8 @@ class TestDeleteModelTeamAuth:
             created_by="admin",
             updated_by="admin",
         )
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -2931,8 +2947,8 @@ class TestDeleteModelTeamAuth:
             members_with_roles=[Member(user_id="admin", role="admin")],
             models=["live-gpt"],
         )
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.query_raw = AsyncMock(return_value=[])
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
@@ -3907,10 +3923,11 @@ class TestModelInfoServerDerivedPricingFilter:
             updated_by="test-admin",
         )
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.litellm_proxymodeltable.create = AsyncMock(return_value=db_row)
+        mock_prisma.db.litellm_canonicalmodel.find_unique = AsyncMock(return_value=None)
 
         mock_proxy_config = MagicMock()
         mock_proxy_config.add_deployment = AsyncMock(return_value=ReconcileOutcome(still_desired=None, live_after=None))
@@ -4046,7 +4063,7 @@ class TestPatchModelBlockedAuthGate:
         }
         existing_row.model_dump_json.return_value = "{}"
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
             return_value=existing_row
         )
@@ -4089,7 +4106,7 @@ class TestPatchModelBlockedAuthGate:
         updated_row = MagicMock()
         updated_row.model_dump_json.return_value = "{}"
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
             return_value=existing_row
         )
@@ -4144,7 +4161,7 @@ class TestPatchModelRowDeletedBeforeWrite:
         }
         existing_row.model_dump_json.return_value = "{}"
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(
             return_value=existing_row
         )
@@ -4524,7 +4541,7 @@ class TestDeleteEvictionsHoldTheReconcileLock:
         table.find_unique = AsyncMock(return_value=row)
         table.delete = AsyncMock(return_value=row)
 
-        prisma = MagicMock()
+        prisma = _mock_prisma()
         prisma.db.litellm_proxymodeltable = table
         prisma.db.query_raw = AsyncMock(return_value=[])
 
@@ -4959,7 +4976,7 @@ class TestStrategyRouterWriteValidation:
         )
 
         admin = UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN)
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
 
         with (
             patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
@@ -5106,6 +5123,8 @@ class TestStrategyRouterWriteValidation:
         ) -> None:
             self.db = self
             self.tx_obj = TestStrategyRouterWriteValidation._FakeTx(db_models, tuning_rows=tuning_rows)
+            self.litellm_canonicalmodel = MagicMock(find_unique=AsyncMock(return_value=None))
+            self.litellm_canonicalmodelconnection = MagicMock(find_unique=AsyncMock(return_value=None))
             self.litellm_proxymodeltable = MagicMock(
                 create=AsyncMock(), update=AsyncMock(), find_unique=AsyncMock(return_value=existing_row)
             )
@@ -5738,7 +5757,7 @@ class TestStrategyRouterWriteValidation:
             "model_info": {"id": model_id},
         }
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
         mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
 
@@ -6154,7 +6173,7 @@ class TestBlockModelResponseSerialization:
         existing_row = prisma_models.LiteLLM_ProxyModelTable(blocked=not blocked, **row_fields)
         updated_row = prisma_models.LiteLLM_ProxyModelTable(blocked=blocked, **row_fields)
 
-        mock_prisma = MagicMock()
+        mock_prisma = _mock_prisma()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
         mock_prisma.db.litellm_proxymodeltable.update = AsyncMock(return_value=updated_row)
 
@@ -6236,8 +6255,8 @@ class TestAccessGroupModelSync:
             assert sql.startswith("WITH ")
             return TestAccessGroupModelSync._ALLOWLIST_ROWS
 
-        mock_prisma = MagicMock()
-        mock_prisma.db = MagicMock()
+        mock_prisma = _mock_prisma()
+        mock_prisma.db = _mock_db()
         mock_prisma.db.query_raw = AsyncMock(side_effect=query_raw)
         mock_prisma.db.litellm_proxymodeltable = AsyncMock()
         mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=row)
@@ -6561,6 +6580,8 @@ class TestTeamMemberAutoRouterWrites:
             litellm_teamtable=MagicMock(find_unique=AsyncMock(return_value=team)),
             litellm_teammembership=MagicMock(find_unique=AsyncMock(return_value=None)),
             litellm_proxymodeltable=table,
+            litellm_canonicalmodel=MagicMock(find_unique=AsyncMock(return_value=None)),
+            litellm_canonicalmodelconnection=MagicMock(find_unique=AsyncMock(return_value=None)),
             tx=MagicMock(return_value=context),
         )
         return MagicMock(db=db, transaction=transaction)

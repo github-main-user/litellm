@@ -591,6 +591,7 @@ from litellm.proxy.management_endpoints.management_v1 import (
     router as management_v1_router,
 )
 from litellm.proxy.management_endpoints.management_v1.common import MANAGEMENT_V1_PREFIX
+from litellm.proxy.management_endpoints.canonical_model_endpoints import router as canonical_model_router
 from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
     router as model_access_group_management_router,
 )
@@ -19278,6 +19279,7 @@ app.include_router(user_banner_endpoints_router)
 app.include_router(team_callback_router)
 app.include_router(budget_management_router)
 app.include_router(model_management_router)
+app.include_router(canonical_model_router)
 app.include_router(model_access_group_management_router)
 app.include_router(auto_router_management_router)
 app.include_router(tag_management_router)

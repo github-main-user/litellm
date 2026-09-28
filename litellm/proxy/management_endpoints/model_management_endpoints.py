@@ -66,6 +66,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
 )
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
+from litellm.proxy.management_endpoints.canonical_model_endpoints import reject_canonical_deployment
 from litellm.proxy.management_endpoints.common_utils import _is_user_team_admin
 from litellm.proxy.management_endpoints.team_endpoints import (
     _refresh_cached_team,
@@ -1092,6 +1093,7 @@ async def patch_model(
             existing_params=db_model.litellm_params,
         )
 
+        await reject_canonical_deployment(prisma_client, model_id)
         effective_params: Final = _effective_complexity_router_params(
             patch_data.litellm_params, db_model.litellm_params
         )
@@ -1248,6 +1250,7 @@ async def _set_model_blocked_status(
                 param=None,
             )
 
+        await reject_canonical_deployment(prisma_client, data.model_id)
         updated_model: Final = await ModelRepository(prisma_client).table.update(
             where={"model_id": data.model_id},
             data={
@@ -2083,6 +2086,7 @@ async def delete_model(
                 },
             )
 
+        await reject_canonical_deployment(prisma_client, model_info.id)
         model_in_db: Final = await _proxy_model_table(prisma_client).find_unique(where={"model_id": model_info.id})
         if model_in_db is None:
             raise HTTPException(
@@ -2310,6 +2314,15 @@ async def add_new_model(
             enforced=bool(general_settings.get(ENFORCE_RPM_TPM_ON_MODEL_ADD_SETTING, False)),
         )
 
+        canonical_name: Final = await WriterPinnedClient(prisma_client.db).db.litellm_canonicalmodel.find_unique(
+            where={"name": model_params.model_name}
+        )
+        if canonical_name is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "canonical_managed", "message": "Manage this name through /canonical/models"},
+            )
+
         clean_model_info: Final = ModelInfo(
             **without_server_derived_pricing(model_params.model_info.model_dump(exclude_none=True))
         )
@@ -2470,6 +2483,7 @@ async def update_model(
         if _model_id is None:
             raise Exception("model_info.id not provided")
 
+        await reject_canonical_deployment(prisma_client, _model_id)
         _existing_litellm_params = await ModelRepository(prisma_client).table.find_unique(where={"model_id": _model_id})
 
         if _existing_litellm_params is None:

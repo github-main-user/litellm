@@ -32,13 +32,18 @@ class _PrismaClientView(Protocol):
 class ModelRepository(BaseRepository[LiteLLM_ProxyModelTable]):
     """Repository for proxy model database operations with encryption support."""
 
-    def __init__(self, prisma_client: object, encryption_key: str | None = None) -> None:
+    def __init__(
+        self, prisma_client: object, encryption_key: str | None = None, *, publish_on_write: bool = True
+    ) -> None:
         super().__init__(prisma_client)
         self._encryption_key = encryption_key
+        self._publish_on_write = publish_on_write
 
     @property
     def table(self) -> TableActions["prisma_models.LiteLLM_ProxyModelTable"]:
         client: Final[_PrismaClientView] = self.prisma_client
+        if not self._publish_on_write:
+            return client.db.litellm_proxymodeltable
         return wrap_table_actions_for_config_sync(
             actions=client.db.litellm_proxymodeltable,
             table_name="litellm_proxymodeltable",

@@ -26,6 +26,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helpe
 from litellm.proxy.utils import handle_exception_on_proxy, jsonify_object
 from litellm.repositories.base_repository import is_unique_violation
 from litellm.repositories.credentials_repository import CredentialsRepository
+from litellm.repositories.model_repository import ModelRepository
 from litellm.types.utils import CreateCredentialItem, CredentialItem
 
 router: Final = APIRouter()
@@ -104,6 +105,20 @@ def _credential_exists_detail(credential_name: str) -> str:
         f"Credential '{credential_name}' already exists. "
         f"Update it with PATCH /credentials/{credential_name}, or delete it first."
     )
+
+
+def _credential_write_error(exc: Exception, *, renamed_to: str | None = None) -> HTTPException | None:
+    if getattr(exc, "code", None) in ("P2034", "40P01", "40001"):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "concurrent_write", "message": "Concurrent credential write; retry the request"},
+        )
+    if renamed_to is not None and (is_unique_violation(exc) or getattr(exc, "code", None) == "23505"):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "conflict", "message": _credential_exists_detail(renamed_to)},
+        )
+    return None
 
 
 def get_llm_router() -> litellm.Router | None:
@@ -332,17 +347,40 @@ async def delete_credential(
                 status_code=500,
                 detail={"error": CommonProxyErrors.db_not_connected_error.value},
             )
-        deleted: Final = await CredentialsRepository(prisma_client).delete_by_name(credential_name)
-        if deleted is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Credential not found. Got credential name: " + credential_name,
+        from litellm.proxy.management_endpoints.canonical_model_endpoints import _TxClient
+
+        async with prisma_client.db.tx() as transaction:
+            await transaction.query_raw(
+                'SELECT credential_id FROM "LiteLLM_CredentialsTable" WHERE credential_name = $1 FOR UPDATE',
+                credential_name,
             )
+            credential_row: Final = await transaction.litellm_credentialstable.find_unique(
+                where={"credential_name": credential_name}
+            )
+            if credential_row is None:
+                raise HTTPException(status_code=404, detail="Credential not found. Got credential name: " + credential_name)
+            connections: Final = await transaction.litellm_canonicalmodelconnection.find_many(
+                where={"provider_connection": credential_name}
+            )
+            repo: Final = ModelRepository(_TxClient(transaction), publish_on_write=False)
+            for connection in sorted(connections, key=lambda row: row.deployment_id):
+                await transaction.litellm_canonicalmodelconnection.delete(where={"id": connection.id})
+                await repo.delete_model(connection.deployment_id)
+            await transaction.litellm_credentialstable.delete(where={"credential_name": credential_name})
+        await publish_config_change_for_object_type("litellm_credentialstable")
+        if connections:
+            from litellm.proxy.management_endpoints.model_management_endpoints import clear_cache
+
+            await publish_config_change_for_object_type("litellm_proxymodeltable")
+            await clear_cache()
 
         ## DELETE FROM LITELLM ##
         litellm.credential_list = [cred for cred in litellm.credential_list if cred.credential_name != credential_name]
         return {"success": True, "message": "Credential deleted successfully"}
     except Exception as e:
+        mapped = _credential_write_error(e)
+        if mapped is not None:
+            raise mapped from e
         raise handle_exception_on_proxy(e)
 
 
@@ -400,6 +438,8 @@ async def _update_credential_under_oauth_locks(
     database = getattr(prisma_client, "db", None)
     tx_factory = getattr(database, "tx", None) if database is not None else None
     if not callable(tx_factory):
+        if patch.credential_name != credential_name:
+            raise HTTPException(status_code=503, detail="Credential rename requires database transactions")
         db_credential = await credentials_repository.find_by_name(credential_name)
         if db_credential is None:
             raise HTTPException(status_code=404, detail="Credential not found in DB.")
@@ -420,11 +460,35 @@ async def _update_credential_under_oauth_locks(
             raise HTTPException(status_code=404, detail="Credential not found in DB.")
         merged = update_db_credential(db_credential, patch, clear_proxy=clear_proxy)
         jsonified = cast("dict[str, object]", jsonify_object(merged.model_dump()))
+        await transaction.query_raw(
+            'SELECT credential_id FROM "LiteLLM_CredentialsTable" WHERE credential_name = $1 FOR UPDATE',
+            credential_name,
+        )
+        connections: Final = await transaction.litellm_canonicalmodelconnection.find_many(
+            where={"provider_connection": credential_name}
+        )
         await transaction.litellm_credentialstable.update(
             where={"credential_name": credential_name},
             data={**jsonified, "updated_by": updated_by},
         )
+        if merged.credential_name != credential_name:
+            from litellm.proxy.management_endpoints.canonical_model_endpoints import _TxClient
+
+            repo: Final = ModelRepository(_TxClient(transaction), publish_on_write=False)
+            for connection in sorted(connections, key=lambda row: row.deployment_id):
+                deployment: Final = await repo.find_by_id(connection.deployment_id)
+                if deployment is not None:
+                    await repo.update_model(
+                        connection.deployment_id,
+                        updated_by or "proxy-admin",
+                        litellm_params={**deployment.litellm_params, "litellm_credential_name": merged.credential_name},
+                    )
     await publish_config_change_for_object_type("litellm_credentialstable")
+    if connections and merged.credential_name != credential_name:
+        from litellm.proxy.management_endpoints.model_management_endpoints import clear_cache
+
+        await publish_config_change_for_object_type("litellm_proxymodeltable")
+        await clear_cache()
     return merged
 
 
@@ -504,4 +568,9 @@ async def update_credential(
 
         return {"success": True, "message": "Credential updated successfully"}
     except Exception as e:
+        mapped = _credential_write_error(
+            e, renamed_to=credential.credential_name if credential.credential_name != credential_name else None
+        )
+        if mapped is not None:
+            raise mapped from e
         raise handle_exception_on_proxy(e)

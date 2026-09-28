@@ -5,6 +5,7 @@ datasource client {
 
 generator client {
   provider = "prisma-client-py"
+  enable_experimental_decimal = true
   recursive_type_depth = -1
   binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x", "linux-musl", "linux-musl-openssl-3.0.x"]
 }
@@ -48,6 +49,38 @@ model LiteLLM_CredentialsTable {
   created_by String
   updated_at    DateTime               @default(now()) @updatedAt @map("updated_at")
   updated_by String
+  canonical_connections LiteLLM_CanonicalModelConnection[]
+}
+
+model LiteLLM_CanonicalModel {
+  id String @id @default(uuid())
+  name String @unique
+  group String?
+  input_price_per_million_tokens Decimal @client.Decimal(24, 12)
+  output_price_per_million_tokens Decimal @client.Decimal(24, 12)
+  cache_read_price_per_million_tokens Decimal @client.Decimal(24, 12)
+  cache_write_price_per_million_tokens Decimal @client.Decimal(24, 12)
+  created_at DateTime @default(now())
+  created_by String
+  updated_at DateTime @default(now()) @updatedAt
+  updated_by String
+  connections LiteLLM_CanonicalModelConnection[]
+}
+
+model LiteLLM_CanonicalModelConnection {
+  id String @id @default(uuid())
+  canonical_model_id String
+  provider_connection String?
+  provider_model String
+  mode String
+  position Int @default(0)
+  deployment_id String @unique
+  canonical_model LiteLLM_CanonicalModel @relation(fields: [canonical_model_id], references: [id], onDelete: Cascade)
+  credential LiteLLM_CredentialsTable? @relation(fields: [provider_connection], references: [credential_name], onDelete: Restrict, onUpdate: Cascade)
+  deployment LiteLLM_ProxyModelTable @relation(fields: [deployment_id], references: [model_id], onDelete: Restrict)
+
+  @@index([canonical_model_id])
+  @@index([provider_connection])
 }
 
 // Models on proxy
@@ -61,6 +94,7 @@ model LiteLLM_ProxyModelTable {
   created_by String
   updated_at    DateTime               @default(now()) @updatedAt @map("updated_at")
   updated_by String
+  canonical_connection LiteLLM_CanonicalModelConnection?
 }
 
 

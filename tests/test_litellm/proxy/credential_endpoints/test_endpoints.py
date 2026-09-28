@@ -13,6 +13,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.credential_endpoints.endpoints import get_llm_router
 from litellm.proxy.proxy_server import app
 from litellm.types.utils import CredentialItem
+from litellm.repositories.credentials_repository import CredentialsRepository
 
 client = TestClient(app)
 
@@ -61,11 +62,25 @@ def credential_store():
     ) -> None:
         # This fixture exercises the repository fallback used by lightweight DB
         # adapters. Transaction/race behavior has a dedicated fake below.
-        patch("litellm.proxy.proxy_server.prisma_client", object() if connected else None).start()
+        database = object()
+        if "delete_by_name" in repository_calls:
+            transaction = MagicMock()
+            transaction.query_raw = AsyncMock(return_value=[])
+            transaction.litellm_credentialstable.find_unique = AsyncMock(
+                return_value=repository_calls["delete_by_name"].return_value
+            )
+            transaction.litellm_credentialstable.delete = AsyncMock()
+            transaction.litellm_canonicalmodelconnection.find_many = AsyncMock(return_value=[])
+            database = MagicMock()
+            database.db.tx.return_value.__aenter__ = AsyncMock(return_value=transaction)
+            database.db.tx.return_value.__aexit__ = AsyncMock(return_value=None)
+            patch("litellm.proxy.credential_endpoints.endpoints.publish_config_change_for_object_type", new_callable=AsyncMock).start()
+        patch("litellm.proxy.proxy_server.prisma_client", database if connected else None).start()
         patch("litellm.proxy.proxy_server.master_key", "sk-test-master").start()
         patch.object(litellm, "credential_list", list(in_memory)).start()
         app.dependency_overrides[get_llm_router] = lambda: llm_router
         repository = patch("litellm.proxy.credential_endpoints.endpoints.CredentialsRepository").start()
+        repository._to_model = CredentialsRepository._to_model
         for call_name, result in repository_calls.items():
             setattr(repository.return_value, call_name, result)
 
@@ -522,11 +537,17 @@ async def test_generic_patch_rereads_after_both_oauth_advisory_locks(monkeypatch
     class Transaction:
         def __init__(self):
             self.litellm_credentialstable = Table()
+            self.litellm_canonicalmodelconnection = MagicMock()
+            self.litellm_canonicalmodelconnection.find_many = AsyncMock(return_value=[])
             self.locks = []
             self.committed = False
 
         async def execute_raw(self, sql, lock_key):
             self.locks.append(lock_key)
+
+        async def query_raw(self, sql, credential_name):
+            assert credential_name == "oauth-credential"
+            return []
 
     class TransactionContext:
         def __init__(self, transaction):
@@ -581,6 +602,97 @@ async def test_generic_patch_rereads_after_both_oauth_advisory_locks(monkeypatch
     assert written_values["litellm_internal_proxy_url"] == "encrypted:http://proxy.example:8080"
     repository.find_by_name.assert_not_awaited()
     publish.assert_awaited_once()
+
+
+class _DatabaseWriteError(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__("database write failed")
+
+
+@pytest.mark.parametrize("code", ["40P01", "40001", "P2034"])
+def test_credential_rename_reports_retryable_transaction_conflict(credential_store, code):
+    stored = CredentialItem(credential_name="old", credential_values={"api_key": "encrypted"}, credential_info={})
+    transaction = MagicMock()
+    transaction.execute_raw = AsyncMock()
+    transaction.query_raw = AsyncMock(return_value=[{"credential_id": "id"}])
+    transaction.litellm_credentialstable.find_unique = AsyncMock(return_value=stored.model_dump())
+    transaction.litellm_canonicalmodelconnection.find_many = AsyncMock(return_value=[])
+    transaction.litellm_credentialstable.update = AsyncMock(side_effect=_DatabaseWriteError(code))
+    database = MagicMock()
+    database.db.tx.return_value.__aenter__ = AsyncMock(return_value=transaction)
+    database.db.tx.return_value.__aexit__ = AsyncMock(return_value=None)
+    credential_store(in_memory=(stored,))
+    with patch("litellm.proxy.proxy_server.prisma_client", database), patch(
+        "litellm.proxy.credential_endpoints.endpoints.publish_config_change_for_object_type", new_callable=AsyncMock
+    ) as publish:
+        response = _patch_credential("old", {"credential_name": "new", "credential_info": {}})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "concurrent_write"
+    assert "retry" in response.json()["detail"]["message"]
+    assert [item.credential_name for item in litellm.credential_list] == ["old"]
+    publish.assert_not_awaited()
+
+
+def test_credential_rename_reports_commit_time_conflict(credential_store):
+    stored = CredentialItem(credential_name="old", credential_values={}, credential_info={})
+    transaction = MagicMock()
+    transaction.execute_raw = AsyncMock()
+    transaction.query_raw = AsyncMock(return_value=[{"credential_id": "id"}])
+    transaction.litellm_credentialstable.find_unique = AsyncMock(return_value=stored.model_dump())
+    transaction.litellm_canonicalmodelconnection.find_many = AsyncMock(return_value=[])
+    transaction.litellm_credentialstable.update = AsyncMock()
+    database = MagicMock()
+    database.db.tx.return_value.__aenter__ = AsyncMock(return_value=transaction)
+    database.db.tx.return_value.__aexit__ = AsyncMock(side_effect=_DatabaseWriteError("40P01"))
+    credential_store(in_memory=(stored,))
+    with patch("litellm.proxy.proxy_server.prisma_client", database), patch(
+        "litellm.proxy.credential_endpoints.endpoints.publish_config_change_for_object_type", new_callable=AsyncMock
+    ) as publish:
+        response = _patch_credential("old", {"credential_name": "new", "credential_info": {}})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "concurrent_write"
+    assert [item.credential_name for item in litellm.credential_list] == ["old"]
+    publish.assert_not_awaited()
+
+
+def test_credential_rename_reports_unique_name_conflict(credential_store):
+    stored = CredentialItem(credential_name="old", credential_values={}, credential_info={})
+    transaction = MagicMock()
+    transaction.execute_raw = AsyncMock()
+    transaction.query_raw = AsyncMock(return_value=[{"credential_id": "id"}])
+    transaction.litellm_credentialstable.find_unique = AsyncMock(return_value=stored.model_dump())
+    transaction.litellm_canonicalmodelconnection.find_many = AsyncMock(return_value=[])
+    transaction.litellm_credentialstable.update = AsyncMock(side_effect=_UniqueViolation("duplicate"))
+    database = MagicMock()
+    database.db.tx.return_value.__aenter__ = AsyncMock(return_value=transaction)
+    database.db.tx.return_value.__aexit__ = AsyncMock(return_value=None)
+    credential_store(in_memory=(stored,))
+    with patch("litellm.proxy.proxy_server.prisma_client", database):
+        response = _patch_credential("old", {"credential_name": "new", "credential_info": {}})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "conflict"
+    assert "'new' already exists" in response.json()["detail"]["message"]
+    assert [item.credential_name for item in litellm.credential_list] == ["old"]
+
+
+@pytest.mark.parametrize("code", ["40P01", "40001", "P2034"])
+def test_credential_delete_reports_retryable_transaction_conflict(credential_store, code):
+    stored = CredentialItem(credential_name="old", credential_values={}, credential_info={})
+    transaction = MagicMock()
+    transaction.query_raw = AsyncMock(side_effect=_DatabaseWriteError(code))
+    database = MagicMock()
+    database.db.tx.return_value.__aenter__ = AsyncMock(return_value=transaction)
+    database.db.tx.return_value.__aexit__ = AsyncMock(return_value=None)
+    credential_store(in_memory=(stored,))
+    with patch("litellm.proxy.proxy_server.prisma_client", database), patch(
+        "litellm.proxy.credential_endpoints.endpoints.publish_config_change_for_object_type", new_callable=AsyncMock
+    ) as publish:
+        response = _delete_credential("old")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "concurrent_write"
+    assert [item.credential_name for item in litellm.credential_list] == ["old"]
+    publish.assert_not_awaited()
 
 
 def test_update_credential_still_accepts_a_body_without_credential_values(credential_store):
