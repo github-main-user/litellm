@@ -177,7 +177,8 @@ class TestChatGPTResponsesAPITransformation:
             "chatgpt/gpt-5.3-codex",
         ],
     )
-    def test_chatgpt_forces_streaming_and_reasoning_include(self, model_name):
+    def test_chatgpt_forces_streaming_and_reasoning_include(self, model_name, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("CHATGPT_DEFAULT_INSTRUCTIONS", raising=False)
         config = ChatGPTResponsesAPIConfig()
         request = config.transform_responses_api_request(
             model=model_name,
@@ -189,7 +190,52 @@ class TestChatGPTResponsesAPITransformation:
 
         assert request["stream"] is True
         assert "reasoning.encrypted_content" in request["include"]
-        assert request["instructions"].startswith("You are Codex, based on GPT-5.")
+        assert request["instructions"] == "You are a helpful assistant."
+
+    def test_chatgpt_preserves_client_and_bridged_instructions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            LiteLLMResponsesTransformationHandler,
+        )
+
+        monkeypatch.setenv("CHATGPT_DEFAULT_INSTRUCTIONS", "operator fallback")
+        input_items, bridged_instructions = (
+            LiteLLMResponsesTransformationHandler().convert_chat_completion_messages_to_responses_api(
+                [
+                    {"role": "system", "content": "Follow the user's format"},
+                    {"role": "developer", "content": "Answer briefly"},
+                    {"role": "user", "content": "Hello"},
+                ]
+            )
+        )
+        config: Final = ChatGPTResponsesAPIConfig()
+        request: Final = config.transform_responses_api_request(
+            model="gpt-5.3-codex",
+            input=input_items,
+            response_api_optional_request_params={"instructions": bridged_instructions},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["instructions"] == "Follow the user's format"
+        assert any(isinstance(item, dict) and item.get("role") == "developer" for item in request["input"])
+
+        direct_request: Final = config.transform_responses_api_request(
+            model="gpt-5.3-codex",
+            input="Hello",
+            response_api_optional_request_params={"instructions": "Use my own instructions"},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert direct_request["instructions"] == "Use my own instructions"
+
+        fallback_request: Final = config.transform_responses_api_request(
+            model="gpt-5.3-codex",
+            input="Hello",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert fallback_request["instructions"] == "operator fallback"
 
     @pytest.mark.parametrize(
         "model_name",
