@@ -19328,6 +19328,13 @@ if _server_root_paths:
         )
     app.add_middleware(PerRequestRootPathMiddleware, root_paths=_server_root_paths)
 
+if os.getenv("LITELLM_PUBLIC_API_BRAND"):
+    from litellm.proxy.middleware.public_inference_boundary import PublicInferenceBoundary
+
+    app.add_middleware(
+        PublicInferenceBoundary, brand=os.environ["LITELLM_PUBLIC_API_BRAND"]
+    )
+
 
 async def _stream_mcp_asgi_response(handle_fn, scope: dict, receive) -> "StreamingResponse":
     """
