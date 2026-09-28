@@ -1,3 +1,4 @@
+import json
 import time
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
@@ -21,12 +22,12 @@ CHATGPT_B = "chatgpt-subscription-b"
 OPENAI_API = "openai-api"
 
 
-def _credential(name: str, account_id: str, access_token: str) -> CredentialItem:
+def _credential(name: str, account_id: str, access_token: str, *, expired: bool = False) -> CredentialItem:
     tokens = ChatGPTTokens(
         access_token=access_token,
         refresh_token=f"refresh-{account_id}",
         id_token=f"id-{account_id}",
-        expires_at=int(time.time()) + 3600,
+        expires_at=int(time.time()) - 3600 if expired else int(time.time()) + 3600,
         account_id=account_id,
     )
     return CredentialItem(
@@ -37,11 +38,7 @@ def _credential(name: str, account_id: str, access_token: str) -> CredentialItem
 
 
 def _deployment_by_id(deployments: list[dict], deployment_id: str) -> dict:
-    return next(
-        deployment
-        for deployment in deployments
-        if deployment["model_info"]["id"] == deployment_id
-    )
+    return next(deployment for deployment in deployments if deployment["model_info"]["id"] == deployment_id)
 
 
 def _response(sequence: int) -> ResponsesAPIResponse:
@@ -120,6 +117,99 @@ def mixed_router() -> Iterator[litellm.Router]:
 
     try:
         yield router
+    finally:
+        router.discard()
+        litellm.credential_list = previous_credentials
+        litellm.callbacks = previous_callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["aresponses", "acompletion"])
+async def test_expired_managed_credentials_fail_over_to_third_account(
+    api: str,
+) -> None:
+    previous_credentials = litellm.credential_list
+    previous_callbacks = list(litellm.callbacks)
+    names = ("subscription-a", "subscription-b", "subscription-c")
+    ids = ("account-a-deployment", "account-b-deployment", "account-c-deployment")
+    litellm.credential_list = [
+        _credential(name, f"account-{letter}", f"access-{letter}", expired=letter != "c")
+        for name, letter in zip(names, "abc")
+    ]
+    hook = ChatGPTOAuthCredentialHook()
+    litellm.callbacks = [hook]
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": MODEL_GROUP,
+                "litellm_params": {"model": "chatgpt/gpt-5.4", "litellm_credential_name": name},
+                "model_info": {"id": deployment_id},
+            }
+            for name, deployment_id in zip(names, ids)
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=2,
+        max_fallbacks=5,
+        enable_weighted_failover=True,
+    )
+    selections: list[str] = []
+    requests: list[httpx.Request] = []
+
+    def select(deployments: list[dict]) -> dict:
+        selected = next(item for item in deployments if item["model_info"]["id"] not in selections)
+        selections.append(selected["model_info"]["id"])
+        return selected
+
+    def upstream(request: httpx.Request, **_kwargs: object) -> httpx.Response:
+        assert request.url.host == "chatgpt.com"
+        requests.append(request)
+        if api == "acompletion":
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "id": "chatcmpl-third",
+                    "object": "chat.completion",
+                    "created": 1741476542,
+                    "model": "gpt-5.4",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+        response = _response(3).model_dump()
+        response["object"] = "response"
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=("data: " + json.dumps({"type": "response.completed", "response": response}) + "\n\n").encode(),
+        )
+
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", None),
+            patch("litellm.router_strategy.simple_shuffle.random.choice", side_effect=select),
+            patch.object(httpx.AsyncClient, "send", new=AsyncMock(side_effect=upstream)),
+        ):
+            for name in names[:2]:
+                with pytest.raises(
+                    litellm.AuthenticationError, match=f"ChatGPT credential '{name}' is unavailable"
+                ) as error:
+                    await hook.async_pre_call_deployment_hook(
+                        {"model": "chatgpt/gpt-5.4", "litellm_credential_name": name}, None
+                    )
+                assert isinstance(error.value.__cause__, RuntimeError)
+            if api == "aresponses":
+                result = await router.aresponses(model=MODEL_GROUP, input="hello")
+            else:
+                result = await router.acompletion(model=MODEL_GROUP, messages=[{"role": "user", "content": "hello"}])
+        assert result._hidden_params["model_id"] == ids[2]
+        assert selections == list(ids)
+        assert len(requests) == 1
+        assert requests[0].headers["authorization"] == "Bearer access-c"
+        assert requests[0].headers["chatgpt-account-id"] == "account-c"
     finally:
         router.discard()
         litellm.credential_list = previous_credentials

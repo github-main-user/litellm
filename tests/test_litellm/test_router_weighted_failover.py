@@ -8,7 +8,6 @@ cross-group fallback runs.
 """
 
 from collections import Counter
-from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -17,13 +16,12 @@ import litellm
 from litellm import Router
 from litellm.utils import get_excluded_filtered_deployments
 
-
 # ---------------------------------------------------------------------------
 # Unit tests for get_excluded_filtered_deployments
 # ---------------------------------------------------------------------------
 
 
-def _make_dep(dep_id: str, weight: Optional[int] = None) -> dict:
+def _make_dep(dep_id: str, weight: int | None = None) -> dict:
     params: dict = {"model": "gpt-4o", "api_key": "key"}
     if weight is not None:
         params["weight"] = weight
@@ -975,3 +973,36 @@ async def test_failover_falls_through_to_external_fallback_when_remaining_in_coo
         )
 
     assert response._hidden_params["model_id"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_missing_managed_credential_fails_over_with_no_retries():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "chatgpt/gpt-5.4",
+                    "litellm_credential_name": "missing-weighted-failover-credential",
+                    "weight": 1,
+                },
+                "model_info": {"id": "missing"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "openai/gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "ok",
+                    "weight": 0,
+                },
+                "model_info": {"id": "available"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        enable_weighted_failover=True,
+    )
+
+    response = await router.acompletion(model="test-model", messages=[{"role": "user", "content": "hi"}])
+    assert response._hidden_params["model_id"] == "available"

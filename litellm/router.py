@@ -3943,6 +3943,8 @@ class Router:
                     merged_tags.append(tag)
             kwargs[metadata_variable_name]["tags"] = merged_tags
 
+        kwargs["model_info"] = model_info
+
         ## CREDENTIAL NAME AS TAG / CONNECTION-SPECIFIC TRANSPORT
         credential_name: Final = deployment.get("litellm_params", {}).get("litellm_credential_name")
         # This is an internal, deployment-derived value. A request body may not
@@ -3956,7 +3958,11 @@ class Router:
             from litellm.llms.custom_httpx.http_handler import CREDENTIAL_PROXY_TRUSTED
 
             if CredentialAccessor.find_credential(credential_name) is None:
-                raise ValueError(f"Credential '{credential_name}' was not found")
+                raise litellm.AuthenticationError(
+                    model=deployment_litellm_model_name,
+                    llm_provider="litellm",
+                    message=f"Credential '{credential_name}' was not found",
+                )
             credential_proxy_url: Final = get_credential_proxy_url(credential_name)
             if credential_proxy_url is not None:
                 kwargs["_credential_proxy_url"] = credential_proxy_url
@@ -3966,8 +3972,6 @@ class Router:
             if credential_tag not in existing_tags:
                 existing_tags.append(credential_tag)
             kwargs[metadata_variable_name]["tags"] = existing_tags
-
-        kwargs["model_info"] = model_info
 
         if function_name == "_ageneric_api_call_with_fallbacks":
             from litellm.passthrough.timeout_utils import (
