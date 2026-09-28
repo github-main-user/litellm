@@ -10601,6 +10601,15 @@ class ProxyStartupEvent:
             verbose_proxy_logger.debug("Key rotation disabled (set LITELLM_KEY_ROTATION_ENABLED=true to enable)")
 
         await cls._initialize_expired_ui_session_key_cleanup_background_job(scheduler=scheduler)
+        if os.getenv("LITELLM_PUBLIC_API_BRAND") and prisma_client is not None:
+            from litellm.proxy.db.public_inference_ids import PublicInferenceIdStore
+
+            scheduler.add_job(
+                PublicInferenceIdStore(prisma_client.db).cleanup_expired,
+                "interval",
+                hours=1,
+                id="public_inference_id_cleanup",
+            )
 
     @classmethod
     async def _initialize_expired_ui_session_key_cleanup_background_job(cls, scheduler: AsyncIOScheduler):
@@ -19330,9 +19339,12 @@ if _server_root_paths:
 
 if os.getenv("LITELLM_PUBLIC_API_BRAND"):
     from litellm.proxy.middleware.public_inference_boundary import PublicInferenceBoundary
+    from litellm.proxy.middleware.public_inference_ids import get_public_inference_id_store
 
     app.add_middleware(
-        PublicInferenceBoundary, brand=os.environ["LITELLM_PUBLIC_API_BRAND"]
+        PublicInferenceBoundary,
+        brand=os.environ["LITELLM_PUBLIC_API_BRAND"],
+        id_store_factory=get_public_inference_id_store,
     )
 
 

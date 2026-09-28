@@ -18,6 +18,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
+from litellm.proxy.middleware.public_inference_ids import current_public_ids
 from litellm.types.llms.openai import (
     BaseLiteLLMOpenAIResponseObject,
     ResponsesAPIResponse,
@@ -137,7 +138,12 @@ class ResponsesIDSecurity(CustomLogger):
         )
         if not isinstance(addressed_id, str) or not addressed_id:
             return data
-        authorized_id: Final = self._authorize_response_id(addressed_id, user_api_key_dict)
+        public_ids: Final = current_public_ids.get()
+        authorized_id: Final = (
+            public_ids.authorized_response_id(addressed_id)
+            if public_ids is not None
+            else self._authorize_response_id(addressed_id, user_api_key_dict)
+        )
         data[addressed_id_field] = authorized_id
         data[ADDRESSED_RESPONSE_ID_FIELD] = addressed_id
         return data
@@ -316,7 +322,7 @@ class ResponsesIDSecurity(CustomLogger):
         """
         general_settings: Final = self._general_settings_reader()
 
-        if general_settings.get("disable_responses_id_security", False):
+        if general_settings.get("disable_responses_id_security", False) or current_public_ids.get() is not None:
             return response
         if isinstance(response, ResponsesAPIResponse):
             response = cast(
@@ -338,6 +344,7 @@ class ResponsesIDSecurity(CustomLogger):
                 isinstance(chunk, BaseLiteLLMOpenAIResponseObject)
                 and _is_responses_api_create_route(user_api_key_dict.request_route)
                 and not general_settings.get("disable_responses_id_security", False)
+                and current_public_ids.get() is None
             ):
                 chunk = self._encrypt_response_id(chunk, user_api_key_dict, request_encryption_cache)
             yield chunk

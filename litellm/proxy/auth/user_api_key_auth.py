@@ -649,6 +649,7 @@ async def user_api_key_auth_websocket_for_model(websocket: WebSocket, model: str
         "type": "http",
         "headers": scope_headers,
         "path": ws_scope.get("path", ""),
+        "state": ws_scope.setdefault("state", {}),
     }
     for key in ("root_path", "app_root_path"):
         if key in ws_scope:
@@ -3159,6 +3160,11 @@ async def _authorize_authenticated_request(
     """
     ## ENSURE DISABLE ROUTE WORKS ACROSS ALL USER AUTH FLOWS ##
     RouteChecks.should_call_route(route=route, valid_token=user_api_key_auth_obj, request=request)
+    from litellm.proxy.middleware.public_inference_ids import STATE_KEY, PublicInferenceIds
+
+    public_ids: Final = request.scope.get("state", {}).get(STATE_KEY)
+    if isinstance(public_ids, PublicInferenceIds):
+        await public_ids.authorize_request(request, user_api_key_auth_obj, request_data)
     await _normalize_claude_model(request_data, user_api_key_auth_obj, request, route)
     await _resolve_router_settings_model_group_alias(request_data, user_api_key_auth_obj, request, route)
 

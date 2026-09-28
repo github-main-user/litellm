@@ -4,11 +4,20 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from tempfile import SpooledTemporaryFile
 from typing import BinaryIO
 from urllib.parse import urlsplit
 
+from starlette.datastructures import QueryParams
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from litellm.proxy.middleware.public_inference_ids import (
+    STATE_KEY,
+    InferenceIdStore,
+    PublicInferenceIds,
+    current_public_ids,
+)
 
 logger = logging.getLogger(__name__)
 _HEADERS = frozenset(
@@ -44,6 +53,23 @@ def _route(scope: Scope) -> str | None:
     for prefix in ("/v1/", "/openai/v1/"):
         if path == prefix[:-1] or path.startswith(prefix):
             return path[len(prefix) :]
+    bare = path.removeprefix("/openai").lstrip("/")
+    if bare.split("/", 1)[0] in (
+        "responses",
+        "containers",
+        "files",
+        "batches",
+        "videos",
+        "fine_tuning",
+        "models",
+        "chat",
+        "completions",
+        "messages",
+        "embeddings",
+        "images",
+        "audio",
+    ):
+        return bare
     return None
 
 
@@ -254,26 +280,76 @@ def _frame_end(buf: bytearray) -> int:
     return min((i + width for i, width in ends), default=0)
 
 
+async def _public_frame(frame: bytes, ids: PublicInferenceIds | None) -> bytes:
+    if ids is None:
+        return frame
+    lines = frame.splitlines()
+    raw = b"\n".join(line[5:].strip() for line in lines if line.startswith(b"data:"))
+    value = _parse(raw)
+    if not isinstance(value, dict):
+        return frame
+    payload = await ids.payload(value, incoming=False, resource=ids.resource)
+    events = [line for line in lines if line.startswith(b"event:")]
+    return b"\n".join([*events, b"data: " + _encoded(payload)]) + b"\n\n"
+
+
 class PublicInferenceBoundary:
-    def __init__(self, app: ASGIApp, brand: str = "VoidAPI") -> None:
+    def __init__(
+        self, app: ASGIApp, brand: str = "VoidAPI", id_store_factory: Callable[[], InferenceIdStore] | None = None
+    ) -> None:
         self.app = app
         self.brand = brand
+        self.id_store_factory = id_store_factory
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         route = _route(scope)
         if scope["type"] not in ("http", "websocket") or route is None:
             await self.app(scope, receive, send)
             return
+        ids = PublicInferenceIds(self.id_store_factory, self.brand) if self.id_store_factory is not None else None
+        if ids is not None:
+            scope.setdefault("state", {})[STATE_KEY] = ids
+        token = current_public_ids.set(ids)
         anthropic = route.split("/", 1)[0] == "messages"
-        if scope["type"] == "websocket":
-            await self._websocket(scope, receive, send, anthropic)
-        else:
-            await self._http(scope, receive, send, route, anthropic)
+        try:
+            if scope["type"] == "websocket":
+                await self._websocket(scope, receive, send, anthropic)
+            else:
+                await self._http(scope, receive, send, route, anthropic)
+        finally:
+            current_public_ids.reset(token)
 
     async def _websocket(self, scope: Scope, receive: Receive, send: Send, anthropic: bool) -> None:
         closed = False
         denial: Message | None = None
         denial_body = bytearray()
+        ids = scope.get("state", {}).get(STATE_KEY)
+        session_model = QueryParams(scope.get("query_string", b"")).get("model")
+
+        async def safe_receive() -> Message:
+            nonlocal session_model
+            message = await receive()
+            if not isinstance(ids, PublicInferenceIds) or message["type"] != "websocket.receive":
+                return message
+            raw = message.get("text") if message.get("text") is not None else message.get("bytes")
+            value = _parse(raw.encode() if isinstance(raw, str) else raw) if raw is not None else None
+            if not isinstance(value, dict):
+                return message
+            nested = value.get("response", value)
+            for frame in (value, nested):
+                if not isinstance(frame, dict) or not isinstance(frame.get("model"), str):
+                    continue
+                if session_model is not None and frame["model"] != session_model:
+                    raise ValueError("WebSocket model cannot change during a session")
+                session_model = frame["model"]
+            if session_model is not None:
+                ids.model = session_model
+            payload = _encoded(await ids.payload(value, incoming=True))
+            return (
+                {**message, "text": payload.decode(), "bytes": None}
+                if isinstance(raw, str)
+                else {**message, "bytes": payload, "text": None}
+            )
 
         async def safe_send(message: Message) -> None:
             nonlocal closed, denial
@@ -303,6 +379,14 @@ class PublicInferenceBoundary:
                 if raw is None:
                     return
                 value = _parse(raw.encode() if isinstance(raw, str) else raw)
+                if isinstance(value, dict) and isinstance(ids, PublicInferenceIds):
+                    value = await ids.payload(value, incoming=False, resource=ids.resource)
+                    encoded = _encoded(value)
+                    message = (
+                        {**message, "text": encoded.decode(), "bytes": None}
+                        if isinstance(raw, str)
+                        else {**message, "bytes": encoded, "text": None}
+                    )
                 failed = not isinstance(value, dict) or _failure(value)
                 if failed:
                     payload = _event(value, b"error", anthropic, self.brand).split(b"data: ", 1)[1].strip()
@@ -320,7 +404,7 @@ class PublicInferenceBoundary:
                 await send(message)
 
         try:
-            await self.app(scope, receive, safe_send)
+            await self.app(scope, safe_receive, safe_send)
             if denial is not None and not closed:
                 status, payload = _error(denial["status"], _parse(denial_body), anthropic, self.brand)
                 await send({**denial, "status": status, "headers": _replacement_headers(denial.get("headers", []))})
@@ -353,6 +437,8 @@ class PublicInferenceBoundary:
         stored: BinaryIO | None = None
         error_overflow = False
         sequence_number = -1
+        context = scope.get("state", {}).get(STATE_KEY)
+        ids = context if isinstance(context, PublicInferenceIds) else None
 
         async def send_start(new_status: int | None = None, replacement: bool = False) -> None:
             nonlocal started
@@ -360,8 +446,10 @@ class PublicInferenceBoundary:
                 return
             headers = pending.get("headers", [])
             sanitized = _replacement_headers(headers, sse=sse and replacement) if replacement else _headers(headers)
-            if sse:
-                sanitized = [(k, v) for k, v in sanitized if k.lower() not in (b"content-length", b"content-encoding")]
+            if sse or (inspect and ids is not None):
+                sanitized = [
+                    (k, v) for k, v in sanitized if k.lower() not in (b"content-length", b"content-encoding", b"etag")
+                ]
             started = True
             await send({**pending, "status": new_status if new_status is not None else status, "headers": sanitized})
 
@@ -409,6 +497,11 @@ class PublicInferenceBoundary:
                     and (
                         route.startswith("chat/completions")
                         or route.split("/", 1)[0] in ("responses", "completions", "messages")
+                        or (
+                            ids is not None
+                            and content_type.split(b";", 1)[0] == b"application/json"
+                            and not route.endswith("/content")
+                        )
                     )
                 )
                 if compressed and (status >= 400 or sse or inspect):
@@ -443,9 +536,14 @@ class PublicInferenceBoundary:
                     if not isinstance(value, dict) or _failure(value):
                         await finish_error(500, value)
                     else:
+                        body = (
+                            _encoded(await ids.payload(value, incoming=False, resource=ids.resource))
+                            if ids is not None
+                            else data
+                        )
                         await send_start()
                         closed = True
-                        await send({"type": "http.response.body", "body": data, "more_body": False})
+                        await send({"type": "http.response.body", "body": body, "more_body": False})
                 return
             if not sse:
                 await send_start()
@@ -460,7 +558,11 @@ class PublicInferenceBoundary:
                 frame = bytes(buf[:end])
                 del buf[:end]
                 checked, failed, sequence_number = _frame(
-                    frame, anthropic, self.brand, sequence_number, route.startswith("responses")
+                    await _public_frame(frame, ids),
+                    anthropic,
+                    self.brand,
+                    sequence_number,
+                    route.startswith("responses"),
                 )
                 await send_start()
                 closed = failed
@@ -472,7 +574,11 @@ class PublicInferenceBoundary:
             elif not more:
                 if buf:
                     checked, failed, sequence_number = _frame(
-                        bytes(buf) + b"\n\n", anthropic, self.brand, sequence_number, route.startswith("responses")
+                        await _public_frame(bytes(buf) + b"\n\n", ids),
+                        anthropic,
+                        self.brand,
+                        sequence_number,
+                        route.startswith("responses"),
                     )
                     await send_start()
                     closed = failed
