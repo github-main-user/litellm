@@ -116,6 +116,10 @@ Before implementing:
 - If a simpler approach exists, say so. Push back when warranted
 - If something is unclear, stop. Name what's confusing. Ask
 
+## Data Migration
+
+Prefer proper migrations or a verified one-time manual transfer over legacy compatibility bridges, startup import gates, or environment flags claiming data was transferred. Verify transferred data before dropping source tables, and make cross-database transfers safe to retry after partial completion
+
 ## Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative**
