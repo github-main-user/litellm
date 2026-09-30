@@ -17,6 +17,7 @@ import litellm
 from litellm.exceptions import AuthenticationError
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.llms.openai.common_utils import OpenAIError
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.main import responses_api_bridge_check
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
@@ -52,6 +53,42 @@ def test_responses_requires_explicit_credentials_when_file_auth_disabled(
     assert headers["Authorization"] == "Bearer managed-token"
     assert headers["ChatGPT-Account-Id"] == "managed-account"
     assert not token_dir.exists()
+
+
+@pytest.mark.parametrize("text", ["Hello", "", "Привет\n世界"])
+def test_chatgpt_wraps_string_input_without_changing_openai(text: str) -> None:
+    params: Final = {
+        "model": "gpt-6-luna",
+        "input": text,
+        "response_api_optional_request_params": {"instructions": "Keep it brief."},
+        "litellm_params": GenericLiteLLMParams(),
+        "headers": {},
+    }
+    chatgpt_request: Final = ChatGPTResponsesAPIConfig().transform_responses_api_request(**params)
+    openai_request: Final = OpenAIResponsesAPIConfig().transform_responses_api_request(**params)
+
+    assert chatgpt_request["input"] == [{"role": "user", "content": text}]
+    assert chatgpt_request["instructions"] == "Keep it brief."
+    assert openai_request["input"] == text
+
+
+def test_chatgpt_preserves_input_items() -> None:
+    items: Final = [
+        {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+        {"type": "function_call_output", "call_id": "call_test", "output": "Done"},
+    ]
+    request: Final = ChatGPTResponsesAPIConfig().transform_responses_api_request(
+        model="gpt-6-luna",
+        input=items,
+        response_api_optional_request_params={},
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert request["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+        {"type": "function_call_output", "call_id": "call_test", "output": "Done"},
+    ]
 
 
 class TestChatGPTResponsesAPITransformation:
