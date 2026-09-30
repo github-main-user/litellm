@@ -753,7 +753,7 @@ async def test_cache_cleanup_leaves_incoming_usage_and_native_anthropic_usage_un
 async def test_provider_extensions_remove_only_empty_and_duplicate_fields(transport: str, unique: bool) -> None:
     store = MemoryIds()
     thinking = [{"type": "thinking", "thinking": "Reasoning", "signature": "native-signature"}]
-    fields = {"citations": None, "thinking_blocks": thinking, "empty_results": []}
+    fields = {"citations": None, "thinking_blocks": thinking, "empty_results": [], "native_finish_reason": "end_turn"}
     extra = {
         "web_search_results": [{"url": "https://example.com", "title": "Source"}],
         "signature": "native-signature",
@@ -821,3 +821,23 @@ async def test_empty_provider_wrapper_is_removed_without_touching_tool_output(fi
     assert await context.payload(payload, incoming=False) == {"choices": [{"delta": {"content": "text"}}]}
     tool_result = {"messages": [{"role": "tool", "content": {"provider_specific_fields": fields}}]}
     assert await context.payload(tool_result, incoming=False) == tool_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_reason", ["end_turn", "tool_use", "max_tokens", "STOP"])
+async def test_native_finish_reason_is_removed_from_actual_choices_without_changing_normalized_reason(
+    native_reason: str,
+) -> None:
+    from litellm.types.utils import Choices
+
+    choice = Choices(finish_reason=native_reason, message={"role": "assistant", "content": "Answer"})
+    payload = {"choices": [choice.model_dump(exclude_none=True)]}
+    assert payload["choices"][0]["provider_specific_fields"]["native_finish_reason"] == native_reason
+    snapshot = json.dumps(payload)
+    context = PublicInferenceIds(lambda: MemoryIds(), "VoidAPI")
+    result = await context.payload(payload, incoming=False)
+    assert result["choices"][0]["finish_reason"] == choice.finish_reason
+    assert result["choices"][0]["message"] == payload["choices"][0]["message"]
+    assert "provider_specific_fields" not in result["choices"][0]
+    assert json.dumps(payload) == snapshot
+    assert await context.payload(payload, incoming=True) == payload

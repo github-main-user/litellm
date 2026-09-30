@@ -260,7 +260,9 @@ class PublicInferenceIds:
             {
                 key: item
                 for key, item in provider_fields.items()
-                if item not in (None, {}, []) and not (key in source and source[key] == item)
+                if key != "native_finish_reason"
+                and item not in (None, {}, [])
+                and not (key in source and source[key] == item)
             }
             if isinstance(provider_fields, dict)
             else provider_fields
