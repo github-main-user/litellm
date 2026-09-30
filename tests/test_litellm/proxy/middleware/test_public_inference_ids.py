@@ -30,7 +30,7 @@ class MemoryIds:
             raise RuntimeError("database unavailable")
         key = (owner, kind, identity or value)
         if key not in self.by_source:
-            public = f"{dict(response='resp_', reasoning='enc_', item='item_', container='cntr_').get(kind, kind + '_')}{secrets.token_hex(16)}"
+            public = f"{dict(response='resp_', reasoning='enc_', item='item_', tool='call_', container='cntr_').get(kind, kind + '_')}{secrets.token_hex(16)}"
             self.by_source[key] = public
             self.by_public[(owner, kind, public)] = value
         elif replace:
@@ -145,7 +145,7 @@ async def test_responses_roundtrip_keeps_internal_routing_and_leaves_client_data
                 "encrypted_content": public["output"][0]["encrypted_content"],
             },
             {"role": "user", "content": [{"type": "input_text", "text": client_text}]},
-            {"type": "function_call_output", "call_id": item_id, "output": client_text},
+            {"type": "function_call_output", "call_id": "call_native-example", "output": client_text},
         ],
         "instructions": client_text,
         "metadata": {"id": internal, "encrypted_content": encrypted},
@@ -934,7 +934,12 @@ async def test_vertex_metadata_is_removed_from_actual_response_without_altering_
         body = b"".join(value.get("body", b"") for value in sent)
         result = json.loads(body.removeprefix(b"data: ").strip())
     assert all(name not in result for name in metadata)
-    assert result["choices"] == payload["choices"]
+    public_tool = result["choices"][0]["message"]["tool_calls"][0]
+    original_tool = payload["choices"][0]["message"]["tool_calls"][0]
+    assert public_tool["id"] != original_tool["id"]
+    assert public_tool == {**original_tool, "id": public_tool["id"]}
+    assert result["choices"][0]["message"]["content"] == payload["choices"][0]["message"]["content"]
+    assert result["choices"][0]["message"]["annotations"] == payload["choices"][0]["message"]["annotations"]
     assert result["usage"] == payload["usage"]
     assert result["metadata"] == metadata
     assert json.dumps(payload) == snapshot
@@ -1046,7 +1051,7 @@ async def test_nested_code_interpreter_container_ids_are_opaque_and_owner_scoped
 @pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
 @pytest.mark.parametrize("node", ["message", "delta"])
 @pytest.mark.parametrize("signed", [False, True])
-async def test_tool_calls_filter_internal_metadata_without_changing_ids_arguments_or_signatures(
+async def test_tool_calls_filter_internal_metadata_and_roundtrip_ids_arguments_and_signatures(
     transport: str,
     node: str,
     signed: bool,
@@ -1124,11 +1129,109 @@ async def test_tool_calls_filter_internal_metadata_without_changing_ids_argument
         body = b"".join(value.get("body", b"") for value in sent)
         result = json.loads(body.removeprefix(b"data: ").strip())
     actual_call = result["choices"][0][node]["tool_calls"][0]
-    assert actual_call == expected_call
+    assert actual_call["id"].startswith("call_") and "__thought__" not in actual_call["id"]
+    assert actual_call == {**expected_call, "id": actual_call["id"]}
     assert _get_thought_signature_from_tool(actual_call) == _get_thought_signature_from_tool(call)
     assert result["metadata"] == internal
     assert json.dumps(payload) == snapshot
     context = PublicInferenceIds(lambda: store, "VoidAPI")
-    assert await context.payload(payload, incoming=True) == payload
+    context.bind(authenticated())
+    restored = await context.payload(result, incoming=True)
+    assert restored["choices"][0][node]["tool_calls"][0] == expected_call
     tool_output = {"messages": [{"role": "tool", "content": {"tool_calls": [call]}}]}
     assert await context.payload(tool_output, incoming=False) == tool_output
+
+
+@pytest.mark.asyncio
+async def test_streamed_tool_id_upgrade_preserves_signature_for_chat_and_responses_continuation() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        _encode_tool_call_id_with_signature,
+        _get_thought_signature_from_tool,
+    )
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    context.model = "public-model"
+    raw = "call_native-example"
+    signed = _encode_tool_call_id_with_signature(raw, "native-signature")
+    added = await context.payload({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": raw}]}}]}, incoming=False)
+    public = added["choices"][0]["delta"]["tool_calls"][0]["id"]
+    assert public.startswith("call_") and public != raw
+    assert await context.identifier("tool", public, incoming=True) == raw
+    done = await context.payload(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"id": signed, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                        ]
+                    }
+                }
+            ]
+        },
+        incoming=False,
+    )
+    assert done["choices"][0]["message"]["tool_calls"][0]["id"] == public
+    assert await context.identifier("tool", public, incoming=True) == signed
+    later = await context.payload({"call_id": raw}, incoming=False)
+    assert later["call_id"] == public
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    messages = {
+        "messages": [
+            {"role": "assistant", "tool_calls": done["choices"][0]["message"]["tool_calls"]},
+            {"role": "tool", "tool_call_id": public, "content": "Result"},
+        ]
+    }
+    restored = await continued.payload(messages, incoming=True)
+    assistant_call = restored["messages"][0]["tool_calls"][0]
+    assert assistant_call["id"] == signed
+    assert _get_thought_signature_from_tool(assistant_call) == "native-signature"
+    assert restored["messages"][1] == {"role": "tool", "tool_call_id": signed, "content": "Result"}
+    response_input = {
+        "input": [
+            {"type": "function_call", "call_id": public, "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": public, "output": {"call_id": "client-owned"}},
+        ]
+    }
+    response_restored = await continued.payload(response_input, incoming=True)
+    assert response_restored["input"][0]["call_id"] == signed
+    assert response_restored["input"][1] == {
+        "type": "function_call_output",
+        "call_id": signed,
+        "output": {"call_id": "client-owned"},
+    }
+    other = PublicInferenceIds(lambda: store, "VoidAPI")
+    other.bind(authenticated(user_id="bob"))
+    with pytest.raises(HTTPException) as denied:
+        await other.payload(messages, incoming=True)
+    assert denied.value.status_code == 404
+    with pytest.raises(HTTPException) as legacy:
+        await continued.identifier("tool", signed, incoming=True)
+    assert legacy.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_reused_native_tool_ids_in_different_responses_do_not_overwrite_signatures() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _encode_tool_call_id_with_signature
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    ids: list[str] = []
+    originals: list[str] = []
+    for response_id, signature in (("chatcmpl_one", "first-signature"), ("chatcmpl_two", "second-signature")):
+        original = _encode_tool_call_id_with_signature("call_reused", signature)
+        originals.append(original)
+        result = await context.payload(
+            {"id": response_id, "choices": [{"message": {"tool_calls": [{"id": original}]}}]}, incoming=False
+        )
+        ids.append(result["choices"][0]["message"]["tool_calls"][0]["id"])
+    assert ids[0] != ids[1]
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    for public, original in zip(ids, originals, strict=True):
+        assert await continued.identifier("tool", public, incoming=True) == original
+        assert await continued.identifier("tool", original, incoming=False) == public

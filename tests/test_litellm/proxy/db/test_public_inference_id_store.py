@@ -78,6 +78,7 @@ async def test_prefixes_and_owner_kind_value_isolation(
         ("response", "resp_"),
         ("reasoning", "enc_"),
         ("item", "item_"),
+        ("tool", "call_"),
         ("container", "cntr_"),
         ("file", "file_"),
         ("batch", "batch_"),
@@ -135,17 +136,19 @@ async def test_expiry_cleanup_and_republish(databases: tuple[PublicInferenceIdDb
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["item", "tool"])
 async def test_wrapped_payload_upgrades_without_downgrading(
     databases: tuple[PublicInferenceIdDb, PublicInferenceIdDb],
+    kind: str,
 ) -> None:
     first, second = (PublicInferenceIdStore(db) for db in databases)
     native = "provider-secret-item-id"
     wrapped = '{"id":"provider-secret-item-id","type":"function_call"}'
-    public_id = await first.publish("owner", "item", native)
-    assert await second.publish("owner", "item", wrapped, identity=native, replace=True) == public_id
-    assert await first.resolve("owner", "item", public_id) == wrapped
-    assert await first.publish("owner", "item", native) == public_id
-    assert await second.resolve("owner", "item", public_id) == wrapped
+    public_id = await first.publish("owner", kind, native)
+    assert await second.publish("owner", kind, wrapped, identity=native, replace=True) == public_id
+    assert await first.resolve("owner", kind, public_id) == wrapped
+    assert await first.publish("owner", kind, native) == public_id
+    assert await second.resolve("owner", kind, public_id) == wrapped
     assert native not in public_id
     with pytest.raises(KeyError) as error:
         await first.publish("owner", "unsupported-kind", native)

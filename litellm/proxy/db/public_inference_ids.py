@@ -14,6 +14,7 @@ PUBLIC_ID_PREFIXES: Final = {
     "response": "resp_",
     "reasoning": "enc_",
     "item": "item_",
+    "tool": "call_",
     "container": "cntr_",
     "file": "file_",
     "batch": "batch_",

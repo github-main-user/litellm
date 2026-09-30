@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import re
+import secrets
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Final, Protocol, cast
@@ -30,6 +31,8 @@ _FIELDS: Final = {
     "previous_response_id": "response",
     "encrypted_content": "reasoning",
     "item_id": "item",
+    "call_id": "tool",
+    "tool_call_id": "tool",
     "container_id": "container",
     "file_id": "file",
     "input_file_id": "file",
@@ -111,7 +114,7 @@ def _public_usage(value: dict[str, object]) -> dict[str, object]:
     }
 
 
-_PUBLIC_ID: Final = re.compile(r"(?:resp|enc|item|cntr|file|batch|video|obj)_[a-f0-9]{32}\Z")
+_PUBLIC_ID: Final = re.compile(r"(?:resp|enc|item|call|cntr|file|batch|video|obj)_[a-f0-9]{32}\Z")
 
 
 def get_public_inference_id_store() -> InferenceIdStore:
@@ -124,7 +127,7 @@ def get_public_inference_id_store() -> InferenceIdStore:
 
 
 def _managed(value: str) -> bool:
-    if value.startswith(("litellm", "encitem_")):
+    if value.startswith(("litellm", "encitem_")) or "__thought__" in value:
         return True
     stripped: Final = next(
         (
@@ -151,6 +154,8 @@ def _kind(field: str, value: str, resource: str | None) -> str | None:
     if field in ("id", "first_id", "last_id", "after", "before"):
         if resource == "model":
             return None
+        if resource == "tool":
+            return "tool"
         if value.startswith(("resp_", "litellm_poll_")):
             return "response"
         if value.startswith(("encitem_", "item_")):
@@ -171,6 +176,7 @@ class PublicInferenceIds:
         self.model: str | None = None
         self.resource: str | None = None
         self.deployment: str | None = None
+        self.tool_namespace: str = secrets.token_hex(16)
         self._published: Final[dict[tuple[str, str], str]] = {}
         self._resolved: Final[dict[tuple[str, str], str]] = {}
 
@@ -203,7 +209,13 @@ class PublicInferenceIds:
         if self.owner is None:
             raise HTTPException(status_code=401, detail="Authentication required")
         cache: Final = self._resolved if incoming else self._published
-        identity: Final = self._item_identity(value) if kind == "item" and not incoming else None
+        identity: Final = (
+            self._item_identity(value)
+            if kind == "item" and not incoming
+            else self._tool_identity(value)
+            if kind == "tool" and not incoming
+            else None
+        )
         key: Final = (kind, json.dumps([identity, value]) if identity is not None else value)
         if key in cache:
             return cache[key]
@@ -211,7 +223,12 @@ class PublicInferenceIds:
             await self.store().resolve(self.owner, kind, value)
             if incoming
             else await self.store().publish(
-                self.owner, kind, value, identity=identity, replace=kind == "item" and value.startswith("encitem_")
+                self.owner,
+                kind,
+                value,
+                identity=identity,
+                replace=(kind == "item" and value.startswith("encitem_"))
+                or (kind == "tool" and "__thought__" in value),
             )
         )
         if translated is None:
@@ -221,6 +238,8 @@ class PublicInferenceIds:
             self._resolved.pop((kind, translated), None)
         if incoming:
             self._published[(kind, translated)] = value
+            if kind == "tool":
+                self._published[(kind, json.dumps([self._tool_identity(translated), translated]))] = value
             if kind in ("response", "container"):
                 from litellm.responses.utils import ResponsesAPIRequestUtils
 
@@ -234,6 +253,9 @@ class PublicInferenceIds:
                 if original:
                     self._published[(kind, original)] = value
         return translated
+
+    def _tool_identity(self, value: str) -> str:
+        return json.dumps([self.tool_namespace, value.split("__thought__", 1)[0]])
 
     def _item_identity(self, value: str) -> str:
         from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -292,6 +314,8 @@ class PublicInferenceIds:
             else resource
         )
         response_id: Final = obj.get("id")
+        if not incoming and isinstance(response_id, str) and (node_resource == "response" or "choices" in obj):
+            self.tool_namespace = response_id
         if not incoming and node_resource == "response" and isinstance(response_id, str):
             from litellm.responses.utils import ResponsesAPIRequestUtils
 
@@ -347,6 +371,8 @@ class PublicInferenceIds:
         child_resource: Final = (
             "response"
             if key == "response"
+            else "tool"
+            if key == "tool_calls"
             else "item"
             if key in ("item", "input", "output") or (key == "data" and self.resource == "response")
             else self.resource
