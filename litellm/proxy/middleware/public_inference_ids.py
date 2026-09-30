@@ -78,6 +78,10 @@ _PRIVATE_FIELDS: Final = frozenset(
         "api_base",
         "api_key",
         "litellm_model_name",
+        "vertex_ai_grounding_metadata",
+        "vertex_ai_url_context_metadata",
+        "vertex_ai_safety_results",
+        "vertex_ai_citation_metadata",
     }
 )
 _CACHE_USAGE_EXTENSIONS: Final = frozenset(

@@ -841,3 +841,103 @@ async def test_native_finish_reason_is_removed_from_actual_choices_without_chang
     assert "provider_specific_fields" not in result["choices"][0]
     assert json.dumps(payload) == snapshot
     assert await context.payload(payload, incoming=True) == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+async def test_vertex_metadata_is_removed_from_actual_response_without_altering_client_content(transport: str) -> None:
+    from litellm import ModelResponse
+
+    metadata = {
+        "vertex_ai_grounding_metadata": {"groundingChunks": [{"web": {"uri": "https://example.com"}}]},
+        "vertex_ai_url_context_metadata": {"urlMetadata": [{"retrievedUrl": "https://example.com"}]},
+        "vertex_ai_safety_results": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "NEGLIGIBLE"}],
+        "vertex_ai_citation_metadata": {"citations": [{"uri": "https://example.com"}]},
+    }
+    response_model = ModelResponse(
+        usage={"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "vertex_ai_grounding_metadata is client text",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url_citation": {
+                                "url": "https://example.com",
+                                "title": "Source",
+                                "start_index": 0,
+                                "end_index": 6,
+                            },
+                        }
+                    ],
+                    "tool_calls": [
+                        {
+                            "id": "call_example",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": json.dumps(metadata),
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    for name, value in metadata.items():
+        setattr(response_model, name, value)
+    payload = response_model.model_dump(exclude_none=True)
+    payload["metadata"] = metadata
+    assert all(name in payload for name in metadata)
+    snapshot = json.dumps(payload)
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=MemoryIds)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    assert all(name not in result for name in metadata)
+    assert result["choices"] == payload["choices"]
+    assert result["usage"] == payload["usage"]
+    assert result["metadata"] == metadata
+    assert json.dumps(payload) == snapshot
+    context = PublicInferenceIds(MemoryIds, "VoidAPI")
+    assert await context.payload(payload, incoming=True) == payload
+    tool_result = {"messages": [{"role": "tool", "content": metadata}]}
+    assert await context.payload(tool_result, incoming=False) == tool_result
