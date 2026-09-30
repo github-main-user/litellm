@@ -162,17 +162,22 @@ class AnthropicOAuthClient:
         )
 
     async def exchange_code(self, code: str, state: str, code_verifier: str) -> AnthropicOAuthTokens:
-        return await self._request_tokens(
-            {
-                "grant_type": "authorization_code",
-                "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
-                "code": code,
-                "state": state,
-                "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
-                "code_verifier": code_verifier,
-            },
-            operation="token exchange",
-        )
+        body = {
+            "grant_type": "authorization_code",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "code": code,
+            "state": state,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }
+        for attempt in range(3):
+            try:
+                return await self._request_tokens(body, operation="token exchange")
+            except AnthropicOAuthError as error:
+                if error.status_code not in (502, 503, 504) or attempt == 2:
+                    raise
+                await asyncio.sleep(0.5 * (2**attempt))
+        raise RuntimeError("Unreachable Anthropic token exchange state")
 
     async def refresh(self, previous: AnthropicOAuthTokens) -> AnthropicOAuthTokens:
         return await self._request_tokens(
