@@ -1279,3 +1279,116 @@ async def test_only_signatures_recoverable_from_the_stored_id_are_removed(embedd
     restored_call = restored["messages"][0]["tool_calls"][0]
     assert restored_call["id"] == original_id
     assert _get_thought_signature_from_tool(restored_call) == _get_thought_signature_from_tool(call)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+@pytest.mark.parametrize("keep_results", [False, True])
+async def test_nonstandard_search_call_summary_is_removed_but_search_results_are_preserved(
+    transport: str, keep_results: bool
+) -> None:
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    search_results = [
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_example",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "url": "https://example.com",
+                    "title": "Source",
+                    "encrypted_content": "native-ciphertext",
+                }
+            ],
+        }
+    ]
+    calls = AnthropicConfig()._build_web_search_calls(
+        search_results,
+        {
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_example",
+                    "name": "web_search",
+                    "input": {"query": "example"},
+                }
+            ]
+        },
+    )
+    summaries = [call.model_dump(exclude_none=True) for call in calls]
+    assert summaries
+    fields = {"web_search_calls": summaries}
+    if keep_results:
+        fields.update(web_search_results=search_results, citations=[{"url": "https://example.com"}])
+    payload = {
+        "choices": [
+            {"message": {"content": "web_search_calls is user-visible text", "provider_specific_fields": fields}}
+        ],
+        "metadata": {"web_search_calls": summaries},
+    }
+    snapshot = json.dumps(payload)
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=MemoryIds)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    expected = {"content": "web_search_calls is user-visible text"}
+    if keep_results:
+        expected["provider_specific_fields"] = {"web_search_results": search_results, "citations": fields["citations"]}
+    assert result["choices"][0]["message"] == expected
+    assert result["metadata"] == payload["metadata"]
+    assert json.dumps(payload) == snapshot
+    context = PublicInferenceIds(MemoryIds, "VoidAPI")
+    assert await context.payload(payload, incoming=True) == payload
+    tool_output = {"messages": [{"role": "tool", "content": {"provider_specific_fields": fields}}]}
+    assert await context.payload(tool_output, incoming=False) == tool_output
+
+
+@pytest.mark.asyncio
+async def test_standard_responses_web_search_call_is_preserved() -> None:
+    from litellm.types.responses.main import build_web_search_call
+
+    call = build_web_search_call(
+        "example", {"query": "example"}, {"content": [{"type": "web_search_result", "url": "https://example.com"}]}
+    ).model_dump(exclude_none=True)
+    context = PublicInferenceIds(MemoryIds, "VoidAPI")
+    context.bind(authenticated())
+    payload = {"object": "response", "output": [call]}
+    result = await context.payload(payload, incoming=False)
+    translated = result["output"][0]
+    assert translated == {**call, "id": translated["id"]}
+    assert translated["id"].startswith("item_")

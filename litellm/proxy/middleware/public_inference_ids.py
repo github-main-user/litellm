@@ -307,7 +307,7 @@ class PublicInferenceIds:
             {
                 key: item
                 for key, item in provider_fields.items()
-                if key != "native_finish_reason"
+                if key not in ("native_finish_reason", "web_search_calls")
                 and item not in (None, {}, [])
                 and not (key in source and source[key] == item)
             }
