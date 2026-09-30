@@ -80,6 +80,30 @@ _PRIVATE_FIELDS: Final = frozenset(
         "litellm_model_name",
     }
 )
+_CACHE_USAGE_EXTENSIONS: Final = frozenset(
+    {
+        "cache_creation_token_details",
+        "cache_creation_tokens",
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    }
+)
+_USAGE_DETAILS: Final = frozenset(
+    {"prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details"}
+)
+
+
+def _public_usage(value: dict[str, object]) -> dict[str, object]:
+    return {
+        key: {name: item for name, item in detail.items() if name not in _CACHE_USAGE_EXTENSIONS}
+        if key in _USAGE_DETAILS and isinstance(detail, dict)
+        else detail
+        for key, detail in value.items()
+        if key not in _CACHE_USAGE_EXTENSIONS
+    }
+
+
 _PUBLIC_ID: Final = re.compile(r"(?:resp|enc|item|cntr|file|batch|video|obj)_[a-f0-9]{32}\Z")
 
 
@@ -253,6 +277,13 @@ class PublicInferenceIds:
     async def _field(
         self, key: str, value: object, obj: Mapping[str, object], *, incoming: bool, resource: str | None
     ) -> object:
+        if (
+            key == "usage"
+            and not incoming
+            and isinstance(value, dict)
+            and (resource == "response" or "prompt_tokens" in value)
+        ):
+            return _public_usage(value)
         if isinstance(value, str):
             if (key == "signature" and obj.get("type") in ("thinking", "signature_delta")) or (
                 key == "data" and obj.get("type") == "redacted_thinking"

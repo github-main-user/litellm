@@ -654,3 +654,94 @@ async def test_container_file_list_cursors_match_ids_and_restore_for_pagination(
     request = Request({**scope, "query_string": f"after={cursor}".encode()})
     await continued.authorize_request(request, authenticated(), {})
     assert request.query_params["after"] == "cfile-native"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+@pytest.mark.parametrize("api", ["chat", "responses"])
+async def test_public_usage_removes_cache_extensions_without_changing_standard_fields(transport: str, api: str) -> None:
+    store = MemoryIds()
+    details_key = "prompt_tokens_details" if api == "chat" else "input_tokens_details"
+    usage = {
+        ("prompt_tokens" if api == "chat" else "input_tokens"): 25,
+        ("completion_tokens" if api == "chat" else "output_tokens"): 10,
+        "total_tokens": 35,
+        details_key: {
+            "cached_tokens": 7,
+            "audio_tokens": 0,
+            "cache_write_tokens": 5,
+            "cache_creation_tokens": 5,
+            "cache_creation_token_details": {"ephemeral_5m_input_tokens": 5},
+        },
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 7,
+    }
+    client_metadata = {"cache_creation_input_tokens": "client-owned"}
+    payload = {"usage": usage, "metadata": client_metadata}
+    if api == "responses":
+        payload.update(object="response", id=wrapped_response(), output=[{"type": "message", "content": []}])
+    else:
+        payload.update(choices=[{"message": {"content": "cache_creation_token_details stays in text"}}])
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        context = scope["state"][STATE_KEY]
+        context.bind(authenticated())
+        context.resource = "response" if api == "responses" else None
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await PublicInferenceBoundary(app, id_store_factory=lambda: store)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/responses" if api == "responses" else "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(message["text"] for message in sent if message["type"] == "websocket.send"))
+    else:
+        body = b"".join(message.get("body", b"") for message in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    expected = {
+        key: value
+        for key, value in usage.items()
+        if key not in ("cache_creation_input_tokens", "cache_read_input_tokens")
+    }
+    expected[details_key] = {"cached_tokens": 7, "audio_tokens": 0}
+    assert result["usage"] == expected
+    assert result["metadata"] == client_metadata
+    if api == "chat":
+        assert result["choices"] == payload["choices"]
+    else:
+        assert result["output"] == payload["output"]
+        assert result["id"] != payload["id"]
+
+
+@pytest.mark.asyncio
+async def test_cache_cleanup_leaves_incoming_usage_and_native_anthropic_usage_unchanged() -> None:
+    context = PublicInferenceIds(lambda: MemoryIds(), "VoidAPI")
+    context.bind(authenticated())
+    native = {"type": "message", "usage": {"input_tokens": 5, "output_tokens": 2, "cache_creation_input_tokens": 3}}
+    assert await context.payload(native, incoming=False) == native
+    incoming = {"usage": {"prompt_tokens": 5, "cache_creation_input_tokens": 3}}
+    assert await context.payload(incoming, incoming=True) == incoming
