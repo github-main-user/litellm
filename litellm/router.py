@@ -33,7 +33,17 @@ from collections.abc import (
 )
 from functools import lru_cache, partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    Optional,
+    TypeAlias,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import anyio
 import httpx
@@ -113,7 +123,11 @@ from litellm.llms.base_llm.vector_store.transformation import (
     RouterVectorStoreEmbeddingExecutor,
     vector_store_request_metadata,
 )
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, get_async_httpx_client
+from litellm.llms.chatgpt.common_utils import chatgpt_quota_reset_seconds
+from litellm.llms.custom_httpx.http_handler import (
+    AsyncHTTPHandler,
+    get_async_httpx_client,
+)
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.llms.openai_like.model_info import (
     MODEL_INFO_DISCOVERY_PROVIDERS,
@@ -160,7 +174,10 @@ from litellm.router_utils.batch_utils import (
     replace_model_in_jsonl,
     should_replace_model_in_jsonl,
 )
-from litellm.router_utils.client_initalization_utils import InitalizeCachedClient, MaxParallelRequestsLimit
+from litellm.router_utils.client_initalization_utils import (
+    InitalizeCachedClient,
+    MaxParallelRequestsLimit,
+)
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
     is_clientside_credential,
@@ -234,7 +251,10 @@ from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
     increment_deployment_successes_for_current_minute,
 )
-from litellm.router_utils.routing_groups import parse_routing_groups, validate_routing_strategy
+from litellm.router_utils.routing_groups import (
+    parse_routing_groups,
+    validate_routing_strategy,
+)
 from litellm.scheduler import FlowItem, Scheduler
 from litellm.types.llms.openai import (
     AllMessageValues,
@@ -500,7 +520,9 @@ MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS: Final = 200
 def _anthropic_stream_should_drop_pre_content_ping(chunk: object, has_generated_content: bool) -> bool:
     """A `ping` keepalive seen before any real content is dropped outright - it recurs indefinitely on a
     slow-starting connection and carries nothing worth buffering toward a possible fallback."""
-    from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import is_anthropic_ping_chunk
+    from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import (
+        is_anthropic_ping_chunk,
+    )
 
     if has_generated_content:
         return False
@@ -511,7 +533,9 @@ def _anthropic_stream_forwards_ping_live(chunk: object, has_generated_content: b
     """A `ping` that no lifecycle frame precedes reaches the client live: a fallback's own message_start can still
     follow it without overlapping lifecycles, and AgenticAnthropicStreamingIterator's hold-back keepalive is exactly
     such a ping."""
-    from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import is_anthropic_ping_chunk
+    from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import (
+        is_anthropic_ping_chunk,
+    )
 
     if has_generated_content or buffered_chunk_count:
         return False
@@ -3794,6 +3818,20 @@ class Router:
         # cool down the deployment every other tenant sharing this config relies on.
         effective_model_info: Final = kwargs.get("model_info") or deployment.get("model_info") or MappingProxyType({})
         self._set_failed_deployment_id_on_exception(exception, MappingProxyType({"model_info": effective_model_info}))
+        quota_seconds: Final = chatgpt_quota_reset_seconds(exception)
+        deployment_id: Final = effective_model_info.get("id") if isinstance(effective_model_info, Mapping) else None
+        if (
+            quota_seconds is not None
+            and isinstance(deployment_id, str)
+            and self.get_model_group(id=deployment_id) is not None
+            and not self.disable_cooldowns
+        ):
+            self.cooldown_cache.add_deployment_to_cooldown(
+                model_id=deployment_id,
+                original_exception=exception,
+                exception_status=429,
+                cooldown_time=quota_seconds,
+            )
 
     @staticmethod
     def _stamp_retry_skip_deployment_id(exception: Exception, kwargs: Mapping[str, object]) -> None:
@@ -3954,7 +3992,9 @@ class Router:
         kwargs.pop("_credential_proxy_trusted", None)
         kwargs.pop("litellm_internal_proxy_url", None)
         if credential_name:
-            from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
+            from litellm.litellm_core_utils.credential_proxy import (
+                get_credential_proxy_url,
+            )
             from litellm.llms.custom_httpx.http_handler import CREDENTIAL_PROXY_TRUSTED
 
             if CredentialAccessor.find_credential(credential_name) is None:
@@ -7114,7 +7154,9 @@ class Router:
         if strategy != "simple-shuffle":
             return None
 
-        failed_id: Final[str | None] = getattr(exception, "failed_deployment_id", None)
+        failed_id: Final[str | None] = getattr(exception, "failed_deployment_id", None) or getattr(
+            exception, "retry_skip_deployment_id", None
+        )
         if not failed_id:
             return None
 
@@ -7553,7 +7595,8 @@ class Router:
         status_code: Final = getattr(exception, "status_code", None)
         if not failed_deployment_id or not isinstance(status_code, int):
             return ()
-        if litellm._should_retry(status_code):  # pyright: ignore[reportPrivateUsage]  # as in should_retry_this_error
+        retryable: Final = litellm._should_retry(status_code)  # pyright: ignore[reportPrivateUsage]  # as in should_retry_this_error
+        if retryable and chatgpt_quota_reset_seconds(exception) is None:
             return ()
         already_skipped_ids: Final = _as_retry_skipped_deployment_ids(already_skipped)
         skipped: Final = tuple(sorted(frozenset((*already_skipped_ids, failed_deployment_id))))
@@ -7664,6 +7707,10 @@ class Router:
                 )
                 if first_skipped_ids:
                     kwargs["_retry_skipped_deployment_ids"] = first_skipped_ids  # rebind-ok: the next attempt reads it
+                if chatgpt_quota_reset_seconds(original_exception) is not None and not self._has_retry_candidate(
+                    _healthy_deployments, first_skipped_ids
+                ):
+                    raise original_exception
             else:
                 raise
 
@@ -7740,6 +7787,10 @@ class Router:
                     )
                     if skipped_ids:
                         kwargs["_retry_skipped_deployment_ids"] = skipped_ids  # rebind-ok: the next attempt reads it
+                    if chatgpt_quota_reset_seconds(e) is not None and not self._has_retry_candidate(
+                        _healthy_deployments, skipped_ids
+                    ):
+                        raise e
                     _timeout = self._time_to_sleep_before_retry(
                         e=e,
                         remaining_retries=remaining_retries,
@@ -7940,6 +7991,15 @@ class Router:
                     return default_list[0]
         return None
 
+    @staticmethod
+    def _has_retry_candidate(
+        healthy_deployments: list[DeploymentTypedDict] | None, skipped_ids: tuple[str, ...]
+    ) -> bool:
+        return any(
+            (deployment.get("model_info") or {}).get("id") not in skipped_ids
+            for deployment in (healthy_deployments or [])
+        )
+
     def _time_to_sleep_before_retry(
         self,
         e: Exception,
@@ -7955,6 +8015,11 @@ class Router:
             1. there are healthy deployments in the same model group
             2. there are fallbacks for the completion call
         """
+
+        if chatgpt_quota_reset_seconds(e) is not None:
+            failed_id: Final = getattr(e, "retry_skip_deployment_id", None) or getattr(e, "failed_deployment_id", None)
+            if failed_id and self._has_retry_candidate(healthy_deployments, (failed_id,)):
+                return 0
 
         ## base case - single deployment
         if all_deployments is not None and len(all_deployments) == 1:
@@ -8236,7 +8301,7 @@ class Router:
                 )
                 return False
 
-            # Determine cooldown time with priority: deployment config > response header > router default
+            # Determine cooldown time with priority: quota reset > deployment config > response header > router default
             deployment_cooldown: Final = _first_present(
                 _model_info if isinstance(_model_info, dict) else None, litellm_params, key="cooldown_time"
             )
@@ -8248,11 +8313,13 @@ class Router:
                 )
             ##############################################
             # Logic to determine cooldown time
-            # 1. Check if a cooldown time is set in the deployment config
-            # 2. Check if a cooldown time is set in the response header
-            # 3. If no cooldown time is set, use the router default cooldown time
+            # 1. Use the ChatGPT quota reset when the account is exhausted
+            # 2. Otherwise use deployment config, response header, or router default
             ##############################################
-            if deployment_cooldown is not None and deployment_cooldown >= 0:
+            quota_cooldown: Final = chatgpt_quota_reset_seconds(exception)
+            if quota_cooldown is not None:
+                _time_to_cooldown = quota_cooldown
+            elif deployment_cooldown is not None and deployment_cooldown >= 0:
                 _time_to_cooldown = deployment_cooldown
             elif header_cooldown is not None and header_cooldown >= 0:
                 _time_to_cooldown = header_cooldown
@@ -12933,17 +13000,17 @@ class Router:
             excluded_deployment_ids=_excluded_deployment_ids,
         )
 
-        ## RETRY SKIP ## -> drop deployments that already refused this request with a
-        ## non-retryable status, unless that leaves nothing, so the caller still gets
-        ## the provider's own error instead of a no-deployments error.
+        ## RETRY SKIP ## -> never restore a refused deployment when filtering
+        ## leaves nothing; the retry loop raises the original quota error before
+        ## reaching selection in that case.
         _retry_skipped_deployment_ids: Final = _as_retry_skipped_deployment_ids(
             request_kwargs.pop("_retry_skipped_deployment_ids", None) if request_kwargs else None
         )
-        healthy_deployments = (
-            litellm.utils.get_excluded_filtered_deployments(
-                healthy_deployments, excluded_deployment_ids=_retry_skipped_deployment_ids
-            )
-            or healthy_deployments
+        filtered_deployments = litellm.utils.get_excluded_filtered_deployments(
+            healthy_deployments, excluded_deployment_ids=_retry_skipped_deployment_ids
+        )
+        healthy_deployments = filtered_deployments or (
+            [] if _retry_skipped_deployment_ids else healthy_deployments
         )
 
         if len(healthy_deployments) == 0:
@@ -13636,7 +13703,9 @@ class Router:
             )
             return None
 
-        from litellm.proxy.auth.auto_router_checks import authorize_member_auto_router_inference
+        from litellm.proxy.auth.auto_router_checks import (
+            authorize_member_auto_router_inference,
+        )
 
         await authorize_member_auto_router_inference(
             deployment=self._selected_strategy_marker_deployment(
@@ -14016,11 +14085,11 @@ class Router:
         _retry_skipped_deployment_ids: Final = _as_retry_skipped_deployment_ids(
             request_kwargs.pop("_retry_skipped_deployment_ids", None) if request_kwargs else None
         )
-        healthy_deployments = (
-            litellm.utils.get_excluded_filtered_deployments(
-                healthy_deployments, excluded_deployment_ids=_retry_skipped_deployment_ids
-            )
-            or healthy_deployments
+        filtered_deployments = litellm.utils.get_excluded_filtered_deployments(
+            healthy_deployments, excluded_deployment_ids=_retry_skipped_deployment_ids
+        )
+        healthy_deployments = filtered_deployments or (
+            [] if _retry_skipped_deployment_ids else healthy_deployments
         )
 
         if len(healthy_deployments) == 0:

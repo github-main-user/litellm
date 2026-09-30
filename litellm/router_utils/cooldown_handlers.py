@@ -23,6 +23,7 @@ from litellm.constants import (
     INTERNAL_CALL_ORIGIN_METADATA_KEY,
     SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD,
 )
+from litellm.llms.chatgpt.common_utils import chatgpt_quota_reset_seconds
 from litellm.router_utils.cooldown_callbacks import router_cooldown_event_callback
 from litellm.types.utils import BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN
 
@@ -359,6 +360,9 @@ def _should_cooldown_deployment(
             litellm_router_instance.routing_group_has_alternatives(requested_model_group)
             or litellm_router_instance.team_model_has_alternatives(deployment)
         )
+
+    if chatgpt_quota_reset_seconds(original_exception) is not None:
+        return True
 
     ## CHECK DEPLOYMENT-LEVEL POLICY FIRST (overrides router-level)
     dep_policy, dep_allowed_fails = _get_deployment_cooldown_policy(litellm_router_instance, deployment)

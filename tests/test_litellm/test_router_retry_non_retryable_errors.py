@@ -12,10 +12,12 @@ Regression tests for https://github.com/BerriAI/litellm/issues/21343
 
 import asyncio
 import datetime
+import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 import litellm
@@ -28,6 +30,70 @@ from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.litellm_core_utils.rules import Rules
 from litellm.utils import function_setup
+
+
+def test_chatgpt_transient_429_remains_retryable_but_exhausted_quota_is_skipped():
+    def rate_limit(payload):
+        return litellm.RateLimitError(
+            message="rate limited",
+            llm_provider="chatgpt",
+            model="chatgpt/gpt-5.4",
+            response=httpx.Response(
+                429,
+                json=payload,
+                request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+            ),
+        )
+
+    transient = rate_limit({"error": {"code": "rate_limit_exceeded", "resets_at": time.time() + 3600}})
+    transient.failed_deployment_id = "first"
+    exhausted = rate_limit({"error": {"code": "usage_limit_reached", "resets_at": time.time() + 3600}})
+    exhausted.failed_deployment_id = "first"
+
+    assert Router._deployment_ids_to_skip_on_retry(transient, ()) == ()
+    assert Router._deployment_ids_to_skip_on_retry(exhausted, ()) == ("first",)
+    assert Router._deployment_ids_to_skip_on_retry(transient, ("first",)) == ()
+    exhausted.failed_deployment_id = "second"
+    exhausted.retry_skip_deployment_id = "second"
+    assert Router._deployment_ids_to_skip_on_retry(exhausted, ("first",)) == ("first", "second")
+
+
+def test_chatgpt_quota_immediately_cools_single_deployment_despite_allowed_fails():
+    router = Router(model_list=[{
+        "model_name": "test-model",
+        "litellm_params": {"model": "chatgpt/gpt-5.4"},
+        "model_info": {"id": "only", "allowed_fails": 100, "cooldown_time": 1},
+    }])
+    error = litellm.RateLimitError(
+        message="exhausted", llm_provider="chatgpt", model="gpt-5.4",
+        response=httpx.Response(
+            429, json={"error": {"type": "usage_limit_reached", "resets_in_seconds": 3600}},
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        ),
+    )
+    router._stamp_failed_deployment_id_with_effective_model_info(
+        error, router.model_list[0], {"model_info": {"id": "only"}}
+    )
+    cooldowns = router.cooldown_cache.get_active_cooldowns(["only"], parent_otel_span=None)
+    assert len(cooldowns) == 1
+    assert cooldowns[0][1]["cooldown_time"] > 3000
+    assert router._has_retry_candidate(router.model_list, ("only",)) is False
+
+
+def test_chatgpt_quota_retry_after_does_not_delay_alternative():
+    router = Router(model_list=[], retry_after=1)
+    error = litellm.RateLimitError(
+        message="exhausted", llm_provider="chatgpt", model="gpt-5.4",
+        response=httpx.Response(
+            429,
+            headers={"retry-after": "3600"},
+            json={"error": {"type": "usage_limit_reached", "resets_in_seconds": 3600}},
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        ),
+    )
+    error.retry_skip_deployment_id = "first"
+    healthy = [{"model_info": {"id": "first"}}, {"model_info": {"id": "second"}}]
+    assert router._time_to_sleep_before_retry(error, 2, 3, healthy, healthy) == 0
 
 
 def _make_rate_limit_error(message="Rate limited"):

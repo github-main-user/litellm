@@ -8,8 +8,10 @@ cross-group fallback runs.
 """
 
 from collections import Counter
+from time import time
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 import litellm
@@ -793,6 +795,31 @@ async def test_user_config_two_region_failover():
 
 
 @pytest.mark.asyncio
+async def test_weighted_failover_uses_retry_skip_id_when_nested_call_does_not_stamp_failed_id():
+    router = Router(
+        model_list=[_make_dep("A"), _make_dep("B")],
+        routing_strategy="simple-shuffle",
+        enable_weighted_failover=True,
+    )
+    error = litellm.RateLimitError(message="exhausted", llm_provider="chatgpt", model="chatgpt/gpt-5.4")
+    error.retry_skip_deployment_id = "A"
+    with patch("litellm.router.run_async_fallback", new_callable=AsyncMock, return_value="recovered") as fallback:
+        result = await router._maybe_run_weighted_failover(
+            exception=error,
+            original_model_group="test-model",
+            all_deployments=[_make_dep("A"), _make_dep("B")],
+            args=(),
+            kwargs={"metadata": {}},
+            input_kwargs={},
+        )
+
+    assert result == "recovered"
+    assert fallback.call_args.kwargs["fallback_model_group"] == [
+        {"model": "test-model", "_excluded_deployment_ids": ["A"]}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_weighted_failover_skips_when_remaining_all_in_cooldown(
     monkeypatch,
 ):
@@ -973,6 +1000,99 @@ async def test_failover_falls_through_to_external_fallback_when_remaining_in_coo
         )
 
     assert response._hidden_params["model_id"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_exhausted_quota_cools_down_and_tries_other_deployment():
+    reset_at = time() + 3600
+    error = litellm.RateLimitError(
+        message="quota exhausted",
+        llm_provider="chatgpt",
+        model="chatgpt/gpt-5.4",
+        response=httpx.Response(
+            429,
+            json={"error": {"code": "usage_limit_reached", "resets_at": reset_at}},
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        ),
+    )
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "chatgpt/gpt-5.4", "weight": 1},
+                "model_info": {"id": "exhausted", "allowed_fails": 100, "cooldown_time": 1},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "good", "mock_response": "ok", "weight": 1},
+                "model_info": {"id": "available"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        enable_weighted_failover=True,
+    )
+
+    with (
+        patch("litellm.router.simple_shuffle", side_effect=lambda **kw: kw["healthy_deployments"][0]),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[error, litellm.ModelResponse()]) as provider,
+    ):
+        response = await router.acompletion(model="test-model", messages=[{"role": "user", "content": "hi"}])
+
+    assert provider.await_count == 2
+    assert [call.kwargs["model_info"]["id"] for call in provider.await_args_list] == ["exhausted", "available"]
+    assert isinstance(response, litellm.ModelResponse)
+    cooldown = router.cooldown_cache.get_active_cooldowns(["exhausted"], parent_otel_span=None)
+    assert len(cooldown) == 1
+    assert cooldown[0][1]["cooldown_time"] > 3000
+
+
+@pytest.mark.asyncio
+async def test_multiple_chatgpt_quotas_skip_to_healthy_with_retries():
+    def exhausted():
+        return litellm.RateLimitError(
+            message="quota exhausted", llm_provider="chatgpt", model="gpt-5.4",
+            response=httpx.Response(
+                429, headers={"retry-after": "3600"},
+                json={"error": {"type": "usage_limit_reached", "resets_in_seconds": 3600}},
+                request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+            ),
+        )
+
+    router = Router(
+        model_list=[
+            {"model_name": "test-model", "litellm_params": {"model": "chatgpt/gpt-5.4"},
+             "model_info": {"id": "exhausted-a", "allowed_fails": 100}},
+            {"model_name": "test-model", "litellm_params": {"model": "chatgpt/gpt-5.4"},
+             "model_info": {"id": "exhausted-b", "allowed_fails": 100}},
+            {"model_name": "test-model", "litellm_params": {"model": "openai/gpt-4o", "api_key": "dummy", "mock_response": "ok"},
+             "model_info": {"id": "healthy"}},
+        ],
+        routing_strategy="simple-shuffle", num_retries=2,
+    )
+    selected = []
+
+    def first_eligible(**kwargs):
+        dep = kwargs["healthy_deployments"][0]
+        selected.append(dep["model_info"]["id"])
+        return dep
+
+    with (
+        patch("litellm.router.simple_shuffle", side_effect=first_eligible),
+        patch("litellm.router.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch("litellm.acompletion", new_callable=AsyncMock,
+              side_effect=[exhausted(), exhausted(), litellm.ModelResponse()]) as provider,
+    ):
+        response = await router.acompletion(model="test-model", messages=[{"role": "user", "content": "hi"}])
+
+    assert provider.await_count == 3
+    assert selected == ["exhausted-a", "exhausted-b", "healthy"]
+    assert [call.kwargs["model_info"]["id"] for call in provider.await_args_list] == selected
+    assert isinstance(response, litellm.ModelResponse)
+    assert all(call.args[0] == 0 for call in sleep.call_args_list)
+    assert len(router.cooldown_cache.get_active_cooldowns(
+        ["exhausted-a", "exhausted-b"], parent_otel_span=None
+    )) == 2
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,12 @@
 Constants and helpers for ChatGPT subscription OAuth.
 """
 
+import math
 import os
 import platform
+import time
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Final
 from uuid import uuid4
 
@@ -24,6 +28,50 @@ DEFAULT_ORIGINATOR: Final = "codex_cli_rs"
 CODEX_CLI_VERSION: Final = "0.155.1"
 DEFAULT_USER_AGENT: Final = f"{DEFAULT_ORIGINATOR}/{CODEX_CLI_VERSION} (Unknown 0; unknown) unknown"
 CHATGPT_DEFAULT_INSTRUCTIONS: Final = "You are a helpful assistant."
+
+
+def chatgpt_quota_reset_seconds(exception: Exception) -> float | None:
+    if getattr(exception, "status_code", None) != 429 or getattr(exception, "llm_provider", None) != "chatgpt":
+        return None
+    response: Final = getattr(exception, "response", None)
+    if response is None:
+        return None
+    try:
+        payload: Final = response.json()
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    error: Final = payload.get("error")
+    if not isinstance(error, Mapping) or "usage_limit_reached" not in (error.get("code"), error.get("type")):
+        return None
+    reset: Final = error.get("resets_at", error.get("reset_at"))
+    seconds: Final = error.get("resets_in_seconds")
+    if reset is None and isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+        try:
+            remaining_seconds: Final = float(seconds)
+        except OverflowError:
+            return None
+        return remaining_seconds if math.isfinite(remaining_seconds) and remaining_seconds > 0 else None
+    if isinstance(reset, bool):
+        return None
+    if isinstance(reset, (int, float)):
+        try:
+            timestamp: Final = float(reset)
+        except OverflowError:
+            return None
+    elif isinstance(reset, str):
+        try:
+            parsed: Final = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        timestamp = parsed.timestamp()
+    else:
+        return None
+    remaining: Final = timestamp - time.time()
+    return remaining if math.isfinite(remaining) and remaining > 0 else None
 
 
 class ChatGPTAuthError(BaseLLMException):
