@@ -4320,3 +4320,86 @@ def test_map_optional_params_verbosity_merges_into_text():
         verbosity_only_request,
     )
     assert verbosity_only_request["text"] == {"verbosity": "low"}
+
+
+@pytest.mark.parametrize("terminal", [None, "response.failed", "response.incomplete", "response.completed"])
+def test_raw_sse_delta_recovery_requires_completed(terminal):
+    import json
+
+    events = [
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text}
+        for text in ("Hel", "lo")
+    ]
+    if terminal:
+        events.append({"type": terminal, "response": {"output": []}})
+    raw_sse = "\n".join(f"data: {json.dumps(event)}" for event in events)
+    recovered = LiteLLMResponsesTransformationHandler._recover_output_items_from_raw_sse(raw_sse)
+    assert recovered == (
+        [
+            {
+                "type": "message",
+                "id": "msg_0",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Hello", "annotations": []}],
+            }
+        ]
+        if terminal == "response.completed"
+        else []
+    )
+
+
+def test_transform_response_recovers_completed_delta_only_sse():
+    handler = LiteLLMResponsesTransformationHandler()
+    logging_obj = Mock()
+    logging_obj.model_call_details = {
+        "original_response": "\n".join(
+            [
+                'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hel"}',
+                'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}',
+                'data: {"type":"response.completed","response":{"output":[]}}',
+            ]
+        )
+    }
+    result = handler.transform_response(
+        model="gpt-5.4",
+        raw_response=_make_empty_responses_api_response(),
+        model_response=_make_empty_model_response(),
+        logging_obj=logging_obj,
+        request_data={"model": "gpt-5.4"},
+        messages=[{"role": "user", "content": "Hello"}],
+        optional_params={},
+        litellm_params={},
+        encoding=Mock(),
+    )
+    assert len(result.choices) == 1
+    assert result.choices[0].message.content == "Hello"
+
+
+@pytest.mark.parametrize("source", ["terminal", "item_done", "text_done"])
+def test_raw_sse_recovery_prefers_full_text_over_deltas(source):
+    item = {
+        "type": "message",
+        "id": "msg_full",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Full text", "annotations": []}],
+    }
+    events = [{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "Partial"}]
+    if source == "item_done":
+        events.append({"type": "response.output_item.done", "output_index": 0, "item": item})
+    if source == "text_done":
+        events.append(
+            {
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": "msg_full",
+                "text": "Full text",
+            }
+        )
+    events.append({"type": "response.completed", "response": {"output": [item] if source == "terminal" else []}})
+    recovered = LiteLLMResponsesTransformationHandler._recover_output_items_from_raw_sse(
+        "\n".join(f"data: {json.dumps(event)}" for event in events)
+    )
+    assert recovered == [item]

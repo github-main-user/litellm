@@ -123,3 +123,46 @@ def record_output_text_chunk(
         content_item["annotations"] = parsed_chunk["annotations"]
     else:
         content_item.setdefault("annotations", [])
+
+
+def record_recovery_text_chunk(
+    parsed_chunk: Mapping[str, object],
+    text_chunks: dict[tuple[int, int], dict[str, object]],
+) -> None:
+    is_delta: Final = parsed_chunk.get("type") == "response.output_text.delta"
+    text: Final = parsed_chunk.get("delta" if is_delta else "text")
+    if not isinstance(text, str):
+        return
+    output_index: Final = _chunk_index(
+        parsed_chunk, "output_index", 0 if is_delta else len({key[0] for key in text_chunks})
+    )
+    content_index: Final = _chunk_index(
+        parsed_chunk,
+        "content_index",
+        0 if is_delta else max((key[1] + 1 for key in text_chunks if key[0] == output_index), default=0),
+    )
+    if content_index < 0 or content_index > _MAX_CONTENT_INDEX:
+        return
+    key: Final = (output_index, content_index)
+    previous: Final = text_chunks.get(key, {})
+    if is_delta and previous.get("type") == "response.output_text.done":
+        return
+    previous_text: Final = previous.get("text", "")
+    text_chunks[key] = {
+        **parsed_chunk,
+        "output_index": output_index,
+        "content_index": content_index,
+        "text": previous_text + text if is_delta and isinstance(previous_text, str) else text,
+    }
+
+
+def merge_recovered_output_items(
+    output_items: Mapping[int, dict[str, object]],
+    text_chunks: Mapping[tuple[int, int], dict[str, object]],
+    completed: bool,
+) -> dict[int, dict[str, object]]:
+    text_items: Final[dict[int, dict[str, object]]] = {}
+    for chunk in text_chunks.values():
+        if completed or chunk.get("type") == "response.output_text.done":
+            record_output_text_chunk(chunk, output_items, text_items)
+    return {**text_items, **output_items}

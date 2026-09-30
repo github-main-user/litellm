@@ -32,9 +32,10 @@ from litellm.llms.base_llm.bridges.completion_transformation import (
     CompletionTransformationBridge,
 )
 from litellm.responses.sse_output_recovery import (
+    merge_recovered_output_items,
     parse_sse_json_chunk,
     record_output_item_chunk,
-    record_output_text_chunk,
+    record_recovery_text_chunk,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils, normalize_responses_api_stream_options
 from litellm.types.llms.openai import (
@@ -836,7 +837,8 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             return []
 
         recovered_output_items: Final[dict[int, dict[str, object]]] = {}
-        recovered_text_only_items: Final[dict[int, dict[str, object]]] = {}
+        text_chunks: Final[dict[tuple[int, int], dict[str, object]]] = {}
+        completed = False
 
         for chunk in raw_sse.splitlines():
             parsed_chunk = parse_sse_json_chunk(chunk)
@@ -849,6 +851,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                 recovered_output = cls._extract_output_from_completed_event(parsed_chunk)
                 if recovered_output is not None:
                     return recovered_output
+                completed = True
                 continue
 
             if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
@@ -858,12 +861,8 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                 )
                 continue
 
-            if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE:
-                record_output_text_chunk(
-                    parsed_chunk=parsed_chunk,
-                    output_items=recovered_output_items,
-                    text_only_items=recovered_text_only_items,
-                )
+            if event_type in (ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE, ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA):
+                record_recovery_text_chunk(parsed_chunk, text_chunks)
                 continue
 
         # Merge text-only items into the recovered output items. Real
@@ -871,8 +870,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         # but text-only items at indices without a matching OUTPUT_ITEM_DONE
         # must still be preserved (e.g. multi-output responses where some
         # indices only emitted OUTPUT_TEXT_DONE).
-        merged_items: Final[dict[int, dict[str, object]]] = {**recovered_text_only_items}
-        merged_items.update(recovered_output_items)
+        merged_items: Final = merge_recovered_output_items(recovered_output_items, text_chunks, completed)
 
         if merged_items:
             return [item for _, item in sorted(merged_items.items())]

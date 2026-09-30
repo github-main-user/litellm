@@ -8,9 +8,10 @@ from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response impo
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.responses.sse_output_recovery import (
+    merge_recovered_output_items,
     parse_sse_json_chunk,
     record_output_item_chunk,
-    record_output_text_chunk,
+    record_recovery_text_chunk,
 )
 from litellm.types.llms.openai import (
     ResponsesAPIResponse,
@@ -157,7 +158,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         completed_response = None
         error_message = None
         streamed_output_items: Final[dict[int, dict]] = {}
-        text_only_output_items: Final[dict[int, dict]] = {}
+        text_chunks: Final[dict[tuple[int, int], dict[str, object]]] = {}
         for chunk in body_text.splitlines():
             parsed_chunk = parse_sse_json_chunk(chunk)
             if parsed_chunk is None:
@@ -171,12 +172,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 )
                 continue
 
-            if event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE:
-                record_output_text_chunk(
-                    parsed_chunk=parsed_chunk,
-                    output_items=streamed_output_items,
-                    text_only_items=text_only_output_items,
-                )
+            if event_type in (ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE, ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA):
+                record_recovery_text_chunk(parsed_chunk, text_chunks)
                 continue
 
             if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
@@ -184,8 +181,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 # output_index, but text-only items at indices without a
                 # matching OUTPUT_ITEM_DONE must still be preserved (e.g.
                 # providers that emit only OUTPUT_TEXT_DONE for some indices).
-                merged_items: dict[int, dict] = {**text_only_output_items}
-                merged_items.update(streamed_output_items)
+                merged_items: Final = merge_recovered_output_items(streamed_output_items, text_chunks, completed=True)
                 completed_response = self._build_completed_response_from_chunk(
                     parsed_chunk=parsed_chunk,
                     streamed_output_items=merged_items,

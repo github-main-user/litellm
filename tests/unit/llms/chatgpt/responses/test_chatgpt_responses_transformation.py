@@ -493,3 +493,70 @@ class TestChatGPTResponsesAPITransformation:
 
         assert "ChatGPT upstream failed" in str(exc_info.value)
         assert exc_info.value.status_code == 502
+
+
+@pytest.mark.parametrize("terminal", [None, "response.failed", "response.incomplete", "response.completed"])
+def test_chatgpt_delta_only_recovery_requires_completed(terminal):
+    events = [
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text}
+        for text in ("Hel", "lo")
+    ]
+    if terminal:
+        events.append(
+            {
+                "type": terminal,
+                "response": {
+                    "id": "resp_delta",
+                    "object": "response",
+                    "created_at": 1,
+                    "model": "gpt-5.4",
+                    "status": terminal.split(".")[1],
+                    "output": [],
+                },
+            }
+        )
+    body = "\n".join(f"data: {json.dumps(event)}" for event in events)
+    response, error = ChatGPTResponsesAPIConfig()._extract_completed_response_from_sse(body)
+    if terminal == "response.completed":
+        assert response is not None
+        assert response.output_text == "Hello"
+        assert len(response.output) == 1
+    else:
+        assert response is None
+    assert error is None
+
+
+@pytest.mark.parametrize("source", ["terminal", "item_done", "text_done"])
+def test_chatgpt_completed_recovery_prefers_full_text_over_deltas(source):
+    item = {
+        "type": "message",
+        "id": "msg_full",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Full text", "annotations": []}],
+    }
+    events = [{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "Partial"}]
+    if source == "item_done":
+        events.append({"type": "response.output_item.done", "output_index": 0, "item": item})
+    if source == "text_done":
+        events.append({"type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": "Full text"})
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_full",
+                "object": "response",
+                "created_at": 1,
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [item] if source == "terminal" else [],
+            },
+        }
+    )
+    response, error = ChatGPTResponsesAPIConfig()._extract_completed_response_from_sse(
+        "\n".join(f"data: {json.dumps(event)}" for event in events)
+    )
+    assert response is not None
+    assert response.output_text == "Full text"
+    assert len(response.output) == 1
+    assert error is None
