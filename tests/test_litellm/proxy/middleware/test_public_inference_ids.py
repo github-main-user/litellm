@@ -745,3 +745,79 @@ async def test_cache_cleanup_leaves_incoming_usage_and_native_anthropic_usage_un
     assert await context.payload(native, incoming=False) == native
     incoming = {"usage": {"prompt_tokens": 5, "cache_creation_input_tokens": 3}}
     assert await context.payload(incoming, incoming=True) == incoming
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+@pytest.mark.parametrize("unique", [False, True])
+async def test_provider_extensions_remove_only_empty_and_duplicate_fields(transport: str, unique: bool) -> None:
+    store = MemoryIds()
+    thinking = [{"type": "thinking", "thinking": "Reasoning", "signature": "native-signature"}]
+    fields = {"citations": None, "thinking_blocks": thinking, "empty_results": []}
+    extra = {
+        "web_search_results": [{"url": "https://example.com", "title": "Source"}],
+        "signature": "native-signature",
+        "enabled": False,
+        "count": 0,
+    }
+    if unique:
+        fields.update(extra)
+    message = {"content": "Answer", "thinking_blocks": thinking, "provider_specific_fields": fields}
+    payload = {"choices": [{"message": message}], "metadata": {"provider_specific_fields": fields}}
+    before = json.dumps(payload)
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=lambda: store)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    expected = {"content": "Answer", "thinking_blocks": thinking}
+    if unique:
+        expected["provider_specific_fields"] = extra
+    assert result["choices"][0]["message"] == expected
+    assert result["metadata"] == payload["metadata"]
+    assert json.dumps(payload) == before
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    assert await context.payload(payload, incoming=True) == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", [None, {}, {"citations": None, "thinking_blocks": []}])
+async def test_empty_provider_wrapper_is_removed_without_touching_tool_output(fields: object) -> None:
+    context = PublicInferenceIds(lambda: MemoryIds(), "VoidAPI")
+    payload = {"choices": [{"delta": {"content": "text", "provider_specific_fields": fields}}]}
+    assert await context.payload(payload, incoming=False) == {"choices": [{"delta": {"content": "text"}}]}
+    tool_result = {"messages": [{"role": "tool", "content": {"provider_specific_fields": fields}}]}
+    assert await context.payload(tool_result, incoming=False) == tool_result

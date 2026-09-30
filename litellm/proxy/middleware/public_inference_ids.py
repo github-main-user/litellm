@@ -254,7 +254,26 @@ class PublicInferenceIds:
             return [await self.payload(item, incoming=incoming, resource=resource) for item in value]
         if not isinstance(value, dict):
             return value
-        obj: Final = cast(dict[str, object], value)
+        source: Final = cast(dict[str, object], value)
+        provider_fields: Final = source.get("provider_specific_fields")
+        unique_fields: Final = (
+            {
+                key: item
+                for key, item in provider_fields.items()
+                if item not in (None, {}, []) and not (key in source and source[key] == item)
+            }
+            if isinstance(provider_fields, dict)
+            else provider_fields
+        )
+        obj: Final = (
+            {
+                key: unique_fields if key == "provider_specific_fields" else item
+                for key, item in source.items()
+                if key != "provider_specific_fields" or unique_fields not in (None, {})
+            }
+            if not incoming
+            else source
+        )
         object_type: Final = obj.get("object")
         node_resource: Final = (
             "file"
