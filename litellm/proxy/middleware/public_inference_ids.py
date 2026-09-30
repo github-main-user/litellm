@@ -114,6 +114,17 @@ def _public_usage(value: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _without_redundant_tool_signature(source: dict[str, object], signature: str) -> dict[str, object]:
+    return {
+        key: {name: item for name, item in value.items() if name != "thought_signature" or item != signature}
+        if key == "provider_specific_fields" and isinstance(value, dict)
+        else _without_redundant_tool_signature(value, signature)
+        if key == "function" and isinstance(value, dict)
+        else value
+        for key, value in source.items()
+    }
+
+
 _PUBLIC_ID: Final = re.compile(r"(?:resp|enc|item|call|cntr|file|batch|video|obj)_[a-f0-9]{32}\Z")
 
 
@@ -283,7 +294,14 @@ class PublicInferenceIds:
             return [await self.payload(item, incoming=incoming, resource=resource) for item in value]
         if not isinstance(value, dict):
             return value
-        source: Final = cast(dict[str, object], value)
+        original_source: Final = cast(dict[str, object], value)
+        tool_id: Final = original_source.get("id")
+        signature: Final = tool_id.partition("__thought__")[2] if isinstance(tool_id, str) else ""
+        source: Final = (
+            _without_redundant_tool_signature(original_source, signature)
+            if not incoming and resource == "tool" and signature
+            else original_source
+        )
         provider_fields: Final = source.get("provider_specific_fields")
         unique_fields: Final = (
             {

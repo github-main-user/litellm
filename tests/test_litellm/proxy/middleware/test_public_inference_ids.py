@@ -1076,7 +1076,7 @@ async def test_tool_calls_filter_internal_metadata_and_roundtrip_ids_arguments_a
         "id": call_id,
         "type": "function",
         "index": 0,
-        "provider_specific_fields": internal,
+        "provider_specific_fields": {**internal, **signature_fields},
         "function": {
             "name": "lookup",
             "arguments": arguments,
@@ -1086,8 +1086,6 @@ async def test_tool_calls_filter_internal_metadata_and_roundtrip_ids_arguments_a
     payload = {"choices": [{node: {"role": "assistant", "tool_calls": [call]}}], "metadata": internal}
     expected_call = {key: value for key, value in call.items() if key != "provider_specific_fields"}
     expected_call["function"] = {"name": "lookup", "arguments": arguments}
-    if signed:
-        expected_call["function"]["provider_specific_fields"] = signature_fields
     snapshot = json.dumps(payload)
     store = MemoryIds()
     sent: list[Message] = []
@@ -1131,13 +1129,15 @@ async def test_tool_calls_filter_internal_metadata_and_roundtrip_ids_arguments_a
     actual_call = result["choices"][0][node]["tool_calls"][0]
     assert actual_call["id"].startswith("call_") and "__thought__" not in actual_call["id"]
     assert actual_call == {**expected_call, "id": actual_call["id"]}
-    assert _get_thought_signature_from_tool(actual_call) == _get_thought_signature_from_tool(call)
+    assert _get_thought_signature_from_tool(actual_call) is None
     assert result["metadata"] == internal
     assert json.dumps(payload) == snapshot
     context = PublicInferenceIds(lambda: store, "VoidAPI")
     context.bind(authenticated())
     restored = await context.payload(result, incoming=True)
-    assert restored["choices"][0][node]["tool_calls"][0] == expected_call
+    restored_call = restored["choices"][0][node]["tool_calls"][0]
+    assert restored_call == expected_call
+    assert _get_thought_signature_from_tool(restored_call) == _get_thought_signature_from_tool(call)
     tool_output = {"messages": [{"role": "tool", "content": {"tool_calls": [call]}}]}
     assert await context.payload(tool_output, incoming=False) == tool_output
 
@@ -1235,3 +1235,47 @@ async def test_reused_native_tool_ids_in_different_responses_do_not_overwrite_si
     for public, original in zip(ids, originals, strict=True):
         assert await continued.identifier("tool", public, incoming=True) == original
         assert await continued.identifier("tool", original, incoming=False) == public
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("embedded", [None, "same-signature", "different-signature"])
+@pytest.mark.parametrize("location", ["tool", "function"])
+async def test_only_signatures_recoverable_from_the_stored_id_are_removed(embedded: str | None, location: str) -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        _encode_tool_call_id_with_signature,
+        _get_thought_signature_from_tool,
+    )
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    original_id = _encode_tool_call_id_with_signature("call_example", embedded)
+    signature_fields = {"thought_signature": "same-signature", "enabled": False}
+    call = {"id": original_id, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+    if location == "tool":
+        call["provider_specific_fields"] = signature_fields
+    else:
+        call["function"]["provider_specific_fields"] = signature_fields
+    payload = {
+        "choices": [{"message": {"tool_calls": [call]}}],
+        "metadata": {"provider_specific_fields": signature_fields},
+    }
+    snapshot = json.dumps(payload)
+    public = await context.payload(payload, incoming=False)
+    public_call = public["choices"][0]["message"]["tool_calls"][0]
+    fields = (
+        public_call["provider_specific_fields"]
+        if location == "tool"
+        else public_call["function"]["provider_specific_fields"]
+    )
+    assert fields == ({"enabled": False} if embedded == "same-signature" else signature_fields)
+    assert public["metadata"] == payload["metadata"]
+    assert json.dumps(payload) == snapshot
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    restored = await continued.payload(
+        {"messages": [{"role": "assistant", "tool_calls": [public_call]}]}, incoming=True
+    )
+    restored_call = restored["messages"][0]["tool_calls"][0]
+    assert restored_call["id"] == original_id
+    assert _get_thought_signature_from_tool(restored_call) == _get_thought_signature_from_tool(call)
