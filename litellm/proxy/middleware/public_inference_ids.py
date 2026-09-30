@@ -57,6 +57,7 @@ _CHILDREN: Final = frozenset(
         "tools",
         "container",
         "code_interpreter_call",
+        "code_interpreter_results",
         "messages",
         "message",
         "choices",

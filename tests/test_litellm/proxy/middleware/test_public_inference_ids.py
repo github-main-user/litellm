@@ -941,3 +941,101 @@ async def test_vertex_metadata_is_removed_from_actual_response_without_altering_
     assert await context.payload(payload, incoming=True) == payload
     tool_result = {"messages": [{"role": "tool", "content": metadata}]}
     assert await context.payload(tool_result, incoming=False) == tool_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_nested_code_interpreter_container_ids_are_opaque_and_owner_scoped(transport: str, wrapped: bool) -> None:
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.responses.utils import ResponsesAPIRequestUtils
+
+    native_container = "cntr_native-example"
+    container = (
+        ResponsesAPIRequestUtils._build_container_id("anthropic", "private-deployment", native_container)
+        if wrapped
+        else native_container
+    )
+    results = AnthropicConfig()._build_code_interpreter_results(
+        tool_results=[
+            {
+                "type": "bash_code_execution_tool_result",
+                "tool_use_id": "toolu_example",
+                "content": {"stdout": "container_id is user-visible output", "stderr": ""},
+            }
+        ],
+        code_by_id={"toolu_example": "print('container_id is user-visible output')"},
+        container_id=container,
+    )
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Done",
+                    "provider_specific_fields": {
+                        "code_interpreter_results": [item.model_dump(exclude_none=True) for item in results],
+                        "container": {"id": container},
+                    },
+                }
+            }
+        ]
+    }
+    snapshot = json.dumps(payload)
+    store = MemoryIds()
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=lambda: store)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    fields = result["choices"][0]["message"]["provider_specific_fields"]
+    public = fields["code_interpreter_results"][0]["container_id"]
+    assert public.startswith("cntr_") and public != container
+    assert fields["container"]["id"] == public
+    original_result = payload["choices"][0]["message"]["provider_specific_fields"]["code_interpreter_results"][0]
+    assert fields["code_interpreter_results"][0] == {**original_result, "container_id": public}
+    assert container not in json.dumps(result)
+    assert json.dumps(payload) == snapshot
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    assert await continued.payload({"tools": [{"type": "code_interpreter", "container": public}]}, incoming=True) == {
+        "tools": [{"type": "code_interpreter", "container": container}]
+    }
+    other = PublicInferenceIds(lambda: store, "VoidAPI")
+    other.bind(authenticated(user_id="bob"))
+    with pytest.raises(HTTPException) as denied:
+        await other.identifier("container", public, incoming=True)
+    assert denied.value.status_code == 404
