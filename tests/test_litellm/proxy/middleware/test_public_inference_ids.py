@@ -669,6 +669,7 @@ async def test_public_usage_removes_cache_extensions_without_changing_standard_f
         details_key: {
             "cached_tokens": 7,
             "audio_tokens": 0,
+            "text_tokens": 20,
             "cache_write_tokens": 5,
             "cache_creation_tokens": 5,
             "cache_creation_token_details": {"ephemeral_5m_input_tokens": 5},
@@ -727,7 +728,7 @@ async def test_public_usage_removes_cache_extensions_without_changing_standard_f
         for key, value in usage.items()
         if key not in ("cache_creation_input_tokens", "cache_read_input_tokens")
     }
-    expected[details_key] = {"cached_tokens": 7, "audio_tokens": 0}
+    expected[details_key] = {"cached_tokens": 7, "audio_tokens": 0, "text_tokens": 20}
     assert result["usage"] == expected
     assert result["metadata"] == client_metadata
     if api == "chat":
@@ -1039,3 +1040,95 @@ async def test_nested_code_interpreter_container_ids_are_opaque_and_owner_scoped
     with pytest.raises(HTTPException) as denied:
         await other.identifier("container", public, incoming=True)
     assert denied.value.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+@pytest.mark.parametrize("node", ["message", "delta"])
+@pytest.mark.parametrize("signed", [False, True])
+async def test_tool_calls_filter_internal_metadata_without_changing_ids_arguments_or_signatures(
+    transport: str,
+    node: str,
+    signed: bool,
+) -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        _encode_tool_call_id_with_signature,
+        _get_thought_signature_from_tool,
+    )
+
+    internal = {
+        "api_base": "https://private.example",
+        "api_key": "internal-placeholder",
+        "model_id": "private-account",
+        "litellm_trace_id": "private-trace",
+    }
+    signature_fields = {"thought_signature": "native-signature"} if signed else {}
+    call_id = _encode_tool_call_id_with_signature("call_example", "native-signature" if signed else None)
+    arguments = json.dumps(
+        {"api_key": "client-input", "model_id": "client-input", "provider_specific_fields": internal}
+    )
+    call = {
+        "id": call_id,
+        "type": "function",
+        "index": 0,
+        "provider_specific_fields": internal,
+        "function": {
+            "name": "lookup",
+            "arguments": arguments,
+            "provider_specific_fields": {**internal, **signature_fields},
+        },
+    }
+    payload = {"choices": [{node: {"role": "assistant", "tool_calls": [call]}}], "metadata": internal}
+    expected_call = {key: value for key, value in call.items() if key != "provider_specific_fields"}
+    expected_call["function"] = {"name": "lookup", "arguments": arguments}
+    if signed:
+        expected_call["function"]["provider_specific_fields"] = signature_fields
+    snapshot = json.dumps(payload)
+    store = MemoryIds()
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=lambda: store)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    actual_call = result["choices"][0][node]["tool_calls"][0]
+    assert actual_call == expected_call
+    assert _get_thought_signature_from_tool(actual_call) == _get_thought_signature_from_tool(call)
+    assert result["metadata"] == internal
+    assert json.dumps(payload) == snapshot
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    assert await context.payload(payload, incoming=True) == payload
+    tool_output = {"messages": [{"role": "tool", "content": {"tool_calls": [call]}}]}
+    assert await context.payload(tool_output, incoming=False) == tool_output

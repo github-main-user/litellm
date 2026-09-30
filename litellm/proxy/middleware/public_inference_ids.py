@@ -55,6 +55,8 @@ _CHILDREN: Final = frozenset(
         "part",
         "data",
         "tools",
+        "tool_calls",
+        "function",
         "container",
         "code_interpreter_call",
         "code_interpreter_results",
@@ -294,10 +296,15 @@ class PublicInferenceIds:
             from litellm.responses.utils import ResponsesAPIRequestUtils
 
             self.deployment = ResponsesAPIRequestUtils.get_model_id_from_response_id(response_id)
-        return {
+        translated: Final = {
             key: await self._field(key, item, obj, incoming=incoming, resource=node_resource)
             for key, item in obj.items()
             if incoming or (key not in _PRIVATE_FIELDS and not key.startswith("litellm_"))
+        }
+        return {
+            key: item
+            for key, item in translated.items()
+            if incoming or key != "provider_specific_fields" or item not in (None, {})
         }
 
     async def _field(
