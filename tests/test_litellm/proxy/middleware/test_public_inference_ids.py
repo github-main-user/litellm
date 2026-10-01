@@ -1635,3 +1635,91 @@ async def test_reused_tool_ids_at_different_indices_keep_separate_streamed_signa
         assert restored["messages"][index + 1]["tool_call_id"] == call["id"]
         assert restored["messages"][index + 1]["content"] == f"result-{index}"
     assert context.tool_index == 0 and continued.tool_index == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_json", [False, True])
+async def test_id_restoration_synchronizes_all_body_readers_without_adding_auth_fields(cached_json: bool) -> None:
+    from litellm.proxy.common_utils.http_parsing_utils import (
+        _read_request_body,
+        _safe_get_request_parsed_body,
+        read_raw_json_body,
+    )
+
+    store = MemoryIds()
+    issuer = PublicInferenceIds(lambda: store, "VoidAPI")
+    issuer.bind(authenticated())
+    internal = wrapped_response()
+    public = await issuer.identifier("response", internal, incoming=False)
+    body = {"previous_response_id": public, "input": "Continue 🐈", "metadata": {"previous_response_id": public}}
+    raw = json.dumps(body).encode()
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": raw, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"",
+            "state": {},
+        },
+        receive,
+    )
+    await _read_request_body(request)
+    original_json = await request.json() if cached_json else None
+    data = await _read_request_body(request)
+    data["litellm_metadata"] = {"auth_only": True}
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    await context.authorize_request(request, authenticated(), data)
+    expected = {**body, "previous_response_id": internal}
+    assert data == {**expected, "litellm_metadata": {"auth_only": True}}
+    assert _safe_get_request_parsed_body(request) == expected
+    assert await _read_request_body(request) == expected
+    assert await request.json() == expected
+    assert json.loads(await request.body()) == expected
+    assert json.loads(await read_raw_json_body(request)) == expected
+    if original_json is not None:
+        assert original_json == expected
+
+
+@pytest.mark.asyncio
+async def test_id_restoration_preserves_multipart_upload_body_and_file_objects() -> None:
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    from litellm.proxy.common_utils.http_parsing_utils import (
+        _safe_get_request_parsed_body,
+        _safe_set_request_parsed_body,
+    )
+
+    store = MemoryIds()
+    issuer = PublicInferenceIds(lambda: store, "VoidAPI")
+    issuer.bind(authenticated())
+    public = await issuer.identifier("file", "file-native", incoming=False)
+    upload = UploadFile(BytesIO(b"file content"), filename="example.txt")
+    raw = b"--boundary\r\nOpaque multipart bytes\r\n--boundary--\r\n"
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/files",
+            "headers": [(b"content-type", b"multipart/form-data; boundary=boundary")],
+            "query_string": b"",
+            "state": {},
+        }
+    )
+    request._body = raw
+    _safe_set_request_parsed_body(request, {"file_id": public, "file": upload})
+    data = _safe_get_request_parsed_body(request)
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    await context.authorize_request(request, authenticated(), data)
+    assert data["file_id"] == "file-native"
+    assert _safe_get_request_parsed_body(request)["file_id"] == "file-native"
+    assert _safe_get_request_parsed_body(request)["file"] is upload
+    assert await request.body() == raw
+    assert not hasattr(request, "_json")
+    await upload.close()

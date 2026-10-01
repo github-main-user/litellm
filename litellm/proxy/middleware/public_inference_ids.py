@@ -521,11 +521,26 @@ class PublicInferenceIds:
             "fine_tuning": "object",
         }
         self.resource = next((resources[part] for part in reversed(route.split("/")) if part in resources), None)
-        restored: Final = cast(dict[str, object], await self.payload(data, incoming=True))
-        data.update(restored)
+        from litellm.proxy.common_utils.http_parsing_utils import (
+            _is_form_content_type,
+            _safe_get_request_parsed_body,
+            _safe_set_request_parsed_body,
+        )
+
+        cached_body: Final = _safe_get_request_parsed_body(request)
         cached_json: Final = getattr(request, "_json", None)
-        if isinstance(cached_json, dict):
-            cached_json.update(restored)
+        client_body: Final = dict(
+            cached_body if cached_body is not None else cached_json if isinstance(cached_json, dict) else data
+        )
+        restored: Final = cast(dict[str, object], await self.payload(data, incoming=True))
+        restored_body: Final = cast(dict[str, object], await self.payload(client_body, incoming=True))
+        data.update(restored)
+        _safe_set_request_parsed_body(request, restored_body)
+        if not _is_form_content_type(request.headers.get("content-type", "")):
+            if isinstance(cached_json, dict):
+                cached_json.update(restored_body)
+            request._json = restored_body
+            request._body = json.dumps(restored_body, ensure_ascii=False).encode("utf-8")
         request.scope["path_params"] = {
             key: await self.identifier(_FIELDS[key], value, incoming=True)
             if key in _FIELDS and isinstance(value, str)
