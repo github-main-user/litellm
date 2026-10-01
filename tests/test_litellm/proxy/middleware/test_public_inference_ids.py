@@ -61,6 +61,7 @@ async def http_exchange(
     path: str = "/v1/responses",
     query: str = "",
     path_params: dict[str, str] | None = None,
+    method: str = "POST",
 ) -> tuple[list[Message], dict[str, object]]:
     sent: list[Message] = []
     observed: dict[str, object] = {}
@@ -98,7 +99,7 @@ async def http_exchange(
 
     scope: Scope = {
         "type": "http",
-        "method": "POST",
+        "method": method,
         "path": path,
         "query_string": query.encode(),
         "path_params": path_params or {},
@@ -111,6 +112,84 @@ async def http_exchange(
 
 def response(messages: list[Message]) -> dict[str, object]:
     return json.loads(b"".join(item.get("body", b"") for item in messages[1:]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_id", [False, True])
+async def test_response_retrieval_recovers_public_model_without_request_model(native_id: bool) -> None:
+    store = MemoryIds()
+    created, _ = await http_exchange(lambda: store, authenticated(), {"model": "public-alias"})
+    public = response(created)["id"]
+    upstream = {
+        "object": "response",
+        "id": "resp_provider-123" if native_id else wrapped_response(),
+        "model": "private-deployment-name",
+        "metadata": {"model": "user-value"},
+    }
+    sent, seen = await http_exchange(
+        lambda: store,
+        authenticated(),
+        {},
+        upstream,
+        path=f"/v1/responses/{public}",
+        path_params={"response_id": public},
+        method="GET",
+    )
+    assert sent[0]["status"] == 200
+    assert response(sent) == {**upstream, "id": public, "model": "public-alias"}
+    assert seen["path"]["response_id"] == wrapped_response()
+    assert seen["body"] == {}
+    denied, _ = await http_exchange(
+        lambda: store,
+        authenticated(user_id="bob"),
+        {},
+        upstream,
+        path=f"/v1/responses/{public}",
+        path_params={"response_id": public},
+        method="GET",
+    )
+    assert denied[0]["status"] == 404
+    assert "private-deployment-name" not in json.dumps(response(sent))
+
+
+@pytest.mark.asyncio
+async def test_previous_response_alias_does_not_override_requested_model() -> None:
+    store = MemoryIds()
+    created, _ = await http_exchange(lambda: store, authenticated(), {"model": "old-alias"})
+    public = response(created)["id"]
+    sent, seen = await http_exchange(
+        lambda: store, authenticated(), {"model": "new-alias", "previous_response_id": public}
+    )
+    assert sent[0]["status"] == 200
+    assert response(sent)["model"] == "new-alias"
+    assert seen["body"] == {"model": "new-alias", "previous_response_id": wrapped_response()}
+    fetched, _ = await http_exchange(
+        lambda: store,
+        authenticated(),
+        {},
+        path=f"/v1/responses/{public}",
+        path_params={"response_id": public},
+        method="GET",
+    )
+    assert response(fetched)["model"] == "old-alias"
+
+
+@pytest.mark.asyncio
+async def test_response_without_saved_alias_fails_closed_instead_of_exposing_upstream_model() -> None:
+    store = MemoryIds()
+    issuer = PublicInferenceIds(lambda: store, "VoidAPI")
+    issuer.bind(authenticated())
+    public = await issuer.identifier("response", wrapped_response(), incoming=False)
+    sent, _ = await http_exchange(
+        lambda: store,
+        authenticated(),
+        {},
+        path=f"/v1/responses/{public}",
+        path_params={"response_id": public},
+        method="GET",
+    )
+    assert sent[0]["status"] >= 400
+    assert b"private-model" not in b"".join(item.get("body", b"") for item in sent)
 
 
 @pytest.mark.asyncio
@@ -210,7 +289,7 @@ async def test_path_and_query_use_restored_ids_without_touching_unrelated_query(
             await http_exchange(
                 lambda: store,
                 authenticated(),
-                {},
+                {"model": "public-model"},
                 {
                     "object": "response",
                     "id": internal,
@@ -435,7 +514,11 @@ async def test_same_user_new_key_allowed_but_other_team_denied() -> None:
     store = MemoryIds()
     internal = wrapped_response()
     public = response(
-        (await http_exchange(lambda: store, authenticated(), {}, {"object": "response", "id": internal}))[0]
+        (
+            await http_exchange(
+                lambda: store, authenticated(), {"model": "public-model"}, {"object": "response", "id": internal}
+            )
+        )[0]
     )["id"]
     allowed, observed = await http_exchange(
         lambda: store, authenticated(api_key="sk-other"), {"previous_response_id": public}
@@ -1791,3 +1874,85 @@ async def test_anthropic_source_restoration_does_not_rewrite_user_data() -> None
         "metadata": file_source,
     }
     assert await context.payload(payload, incoming=True) == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["json", "sse", "websocket"])
+async def test_gemini_server_tool_history_is_not_exposed_by_public_boundary(transport: str) -> None:
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
+
+    parts = [
+        {
+            "toolCall": {"toolType": "GOOGLE_SEARCH", "id": "search-1", "args": {"query": "example"}},
+            "thoughtSignature": "call-signature",
+        },
+        {
+            "toolResponse": {
+                "toolType": "GOOGLE_SEARCH",
+                "id": "search-1",
+                "response": {"result": "Found example", "model_id": "user-owned-result"},
+            },
+            "thoughtSignature": "result-signature",
+        },
+    ]
+    invocations = VertexGeminiConfig._extract_server_side_tool_invocations(parts)
+    fields = {"server_side_tool_invocations": invocations}
+    message = {
+        "role": "assistant",
+        "content": "Answer",
+        "provider_specific_fields": {**fields, "model_id": "private-route", "unneeded_diagnostic": "discard"},
+    }
+    payload = {"choices": [{("delta" if transport == "sse" else "message"): message}]}
+    snapshot = json.dumps(payload)
+    store = MemoryIds()
+    sent: list[Message] = []
+
+    async def app(scope: Scope, receive, send) -> None:
+        scope["state"][STATE_KEY].bind(authenticated())
+        if transport == "websocket":
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream" if transport == "sse" else b"application/json")],
+            }
+        )
+        body = json.dumps(payload).encode()
+        await send({"type": "http.response.body", "body": b"data: " + body + b"\n\n" if transport == "sse" else body})
+
+    async def send(value: Message) -> None:
+        sent.append(value)
+
+    await PublicInferenceBoundary(app, id_store_factory=lambda: store)(
+        {
+            "type": "websocket" if transport == "websocket" else "http",
+            "path": "/v1/chat/completions",
+            "method": "POST",
+            "headers": [],
+            "query_string": b"",
+            "state": {},
+        },
+        lambda: None,
+        send,
+    )
+    if transport == "websocket":
+        result = json.loads(next(value["text"] for value in sent if value["type"] == "websocket.send"))
+    else:
+        body = b"".join(value.get("body", b"") for value in sent)
+        result = json.loads(body.removeprefix(b"data: ").strip())
+    public_message = result["choices"][0]["delta" if transport == "sse" else "message"]
+    assert public_message == {"role": "assistant", "content": "Answer"}
+    assert json.dumps(payload) == snapshot
+    for private_value in (
+        "server_side_tool_invocations",
+        "GOOGLE_SEARCH",
+        "search-1",
+        "call-signature",
+        "result-signature",
+        "private-route",
+        "unneeded_diagnostic",
+    ):
+        assert private_value not in json.dumps(result)

@@ -236,15 +236,18 @@ class PublicInferenceIds:
         if key in cache:
             return cache[key]
         translated: Final = (
-            await self.store().resolve(self.owner, kind, value)
+            await self._resolve_identifier(kind, value)
             if incoming
             else await self.store().publish(
                 self.owner,
                 kind,
-                value,
-                identity=identity,
+                json.dumps({"response_id": value, "public_model": self.model})
+                if kind == "response" and self.model
+                else value,
+                identity=value if kind == "response" and self.model else identity,
                 replace=(kind == "item" and value.startswith("encitem_"))
-                or (kind == "tool" and "__thought__" in value),
+                or (kind == "tool" and "__thought__" in value)
+                or (kind == "response" and bool(self.model)),
             )
         )
         if translated is None:
@@ -269,6 +272,23 @@ class PublicInferenceIds:
                 if original:
                     self._published[(kind, original)] = value
         return translated
+
+    async def _resolve_identifier(self, kind: str, value: str) -> str | None:
+        stored: Final = await self.store().resolve(cast(str, self.owner), kind, value)
+        if kind != "response" or stored is None or not stored.startswith("{"):
+            return stored
+        record: Final = json.loads(stored)
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("response_id"), str)
+            or not isinstance(record.get("public_model"), str)
+            or not record["response_id"]
+            or not record["public_model"]
+        ):
+            raise HTTPException(status_code=502, detail="Invalid stored response")
+        if self.model is None:
+            self.model = record["public_model"]
+        return record["response_id"]
 
     def _tool_identity(self, value: str) -> str:
         return json.dumps([self.tool_namespace, self.choice_index, self.tool_index, value.split("__thought__", 1)[0]])
@@ -475,8 +495,11 @@ class PublicInferenceIds:
                 return await self.identifier(kind, value, incoming=incoming)
             if not incoming and key == "owned_by" and value.lower() == "litellm":
                 return self.brand
-            if not incoming and key == "model" and self.model and resource != "model":
-                return self.model
+            if not incoming and key == "model" and resource != "model":
+                if self.model:
+                    return self.model
+                if resource == "response":
+                    raise HTTPException(status_code=502, detail="Response model unavailable")
             return value
         if key in ("file_ids", "result_files", "vector_store_ids") and isinstance(value, list):
             list_kind: Final = "object" if key == "vector_store_ids" else "file"

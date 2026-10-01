@@ -56,6 +56,26 @@ async def databases() -> AsyncIterator[tuple[PublicInferenceIdDb, PublicInferenc
 
 
 @pytest.mark.asyncio
+async def test_response_alias_persists_across_database_clients(
+    databases: tuple[PublicInferenceIdDb, PublicInferenceIdDb],
+) -> None:
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.middleware.public_inference_ids import PublicInferenceIds
+
+    issuer = PublicInferenceIds(lambda: PublicInferenceIdStore(databases[0]), "VoidAPI")
+    issuer.bind(UserAPIKeyAuth(user_id="alias-owner", api_key="sk-test"))
+    issuer.model = "public-alias"
+    public = await issuer.identifier("response", "resp_native", incoming=False)
+    reader = PublicInferenceIds(lambda: PublicInferenceIdStore(databases[1]), "VoidAPI")
+    reader.bind(UserAPIKeyAuth(user_id="alias-owner", api_key="sk-new-key"))
+    assert await reader.identifier("response", public, incoming=True) == "resp_native"
+    assert reader.model == "public-alias"
+    result = await reader.payload({"object": "response", "id": "resp_native", "model": "private-model"}, incoming=False)
+    assert result == {"object": "response", "id": public, "model": "public-alias"}
+    assert len(await databases[0].query_raw('SELECT public_id FROM "LiteLLM_PublicInferenceId"')) == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_publish_is_atomic_and_prefixed(
     databases: tuple[PublicInferenceIdDb, PublicInferenceIdDb],
 ) -> None:
