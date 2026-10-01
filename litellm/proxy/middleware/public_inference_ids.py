@@ -190,6 +190,7 @@ class PublicInferenceIds:
         self.tool_namespace: str = secrets.token_hex(16)
         self.native_messages: bool = False
         self.choice_index: int = 0
+        self.tool_index: int = 0
         self._tool_ids: Final[dict[tuple[str, int, int], str]] = {}
         self._tool_signatures: Final[dict[tuple[str, int, int], str]] = {}
         self._published: Final[dict[tuple[str, str], str]] = {}
@@ -270,7 +271,7 @@ class PublicInferenceIds:
         return translated
 
     def _tool_identity(self, value: str) -> str:
-        return json.dumps([self.tool_namespace, self.choice_index, value.split("__thought__", 1)[0]])
+        return json.dumps([self.tool_namespace, self.choice_index, self.tool_index, value.split("__thought__", 1)[0]])
 
     def _item_identity(self, value: str) -> str:
         from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -441,11 +442,22 @@ class PublicInferenceIds:
         finally:
             self.choice_index = previous
 
+    async def _tool(self, value: object, index: int, *, incoming: bool) -> object:
+        previous: Final = self.tool_index
+        declared_index: Final = value.get("index") if isinstance(value, dict) else None
+        self.tool_index = declared_index if isinstance(declared_index, int) else index
+        try:
+            return await self.payload(value, incoming=incoming, resource="tool")
+        finally:
+            self.tool_index = previous
+
     async def _field(
         self, key: str, value: object, obj: Mapping[str, object], *, incoming: bool, resource: str | None
     ) -> object:
         if key == "choices" and isinstance(value, list):
             return [await self._choice(item, index, incoming=incoming) for index, item in enumerate(value)]
+        if key == "tool_calls" and isinstance(value, list):
+            return [await self._tool(item, index, incoming=incoming) for index, item in enumerate(value)]
         if (
             key == "usage"
             and not incoming
@@ -483,8 +495,6 @@ class PublicInferenceIds:
         child_resource: Final = (
             "response"
             if key == "response"
-            else "tool"
-            if key == "tool_calls"
             else "tool_function"
             if key == "function" and resource == "tool"
             else "item"

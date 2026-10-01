@@ -1549,3 +1549,89 @@ async def test_unmigrated_message_and_legacy_function_signatures_are_not_lost() 
     message = result["choices"][0]["message"]
     assert message["provider_specific_fields"] == {"thought_signatures": ["native-signature"]}
     assert message["function_call"] == payload["choices"][0]["message"]["function_call"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signature_first", [False, True])
+async def test_reused_tool_ids_at_different_indices_keep_separate_streamed_signatures(signature_first: bool) -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _get_thought_signature_from_tool
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+
+    async def chunk(calls):
+        return await context.payload(
+            {"id": "chatcmpl_same", "choices": [{"index": 0, "delta": {"tool_calls": calls}}]}, incoming=False
+        )
+
+    async def signatures():
+        for index in (1, 0):
+            await chunk(
+                [
+                    {
+                        "index": index,
+                        "function": {"provider_specific_fields": {"thought_signature": f"signature-{index}"}},
+                    }
+                ]
+            )
+
+    if signature_first:
+        await signatures()
+    initial = await chunk(
+        [
+            {"index": index, "id": "call_reused", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+            for index in (0, 1)
+        ]
+    )
+    calls = initial["choices"][0]["delta"]["tool_calls"]
+    ids = [call["id"] for call in calls]
+    assert ids[0] != ids[1]
+    if not signature_first:
+        await signatures()
+    for index in (1, 0):
+        repeated = await chunk([{"index": index, "id": "call_reused"}])
+        assert repeated["choices"][0]["delta"]["tool_calls"][0]["id"] == ids[index]
+    final = await context.payload(
+        {
+            "id": "chatcmpl_same",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call_reused",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                                "provider_specific_fields": {"thought_signature": f"signature-{index}"},
+                            }
+                            for index in (0, 1)
+                        ]
+                    },
+                }
+            ],
+        },
+        incoming=False,
+    )
+    final_calls = final["choices"][0]["message"]["tool_calls"]
+    assert [call["id"] for call in final_calls] == ids
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    restored = await continued.payload(
+        {
+            "messages": [
+                {"role": "assistant", "tool_calls": final_calls},
+                *(
+                    {"role": "tool", "tool_call_id": public, "content": f"result-{index}"}
+                    for index, public in enumerate(ids)
+                ),
+            ]
+        },
+        incoming=True,
+    )
+    for index, call in enumerate(restored["messages"][0]["tool_calls"]):
+        assert _get_thought_signature_from_tool(call) == f"signature-{index}"
+        assert restored["messages"][index + 1]["tool_call_id"] == call["id"]
+        assert restored["messages"][index + 1]["content"] == f"result-{index}"
+    assert context.tool_index == 0 and continued.tool_index == 0
