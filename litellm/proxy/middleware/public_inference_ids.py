@@ -188,6 +188,10 @@ class PublicInferenceIds:
         self.resource: str | None = None
         self.deployment: str | None = None
         self.tool_namespace: str = secrets.token_hex(16)
+        self.native_messages: bool = False
+        self.choice_index: int = 0
+        self._tool_ids: Final[dict[tuple[str, int, int], str]] = {}
+        self._tool_signatures: Final[dict[tuple[str, int, int], str]] = {}
         self._published: Final[dict[tuple[str, str], str]] = {}
         self._resolved: Final[dict[tuple[str, str], str]] = {}
 
@@ -266,7 +270,7 @@ class PublicInferenceIds:
         return translated
 
     def _tool_identity(self, value: str) -> str:
-        return json.dumps([self.tool_namespace, value.split("__thought__", 1)[0]])
+        return json.dumps([self.tool_namespace, self.choice_index, value.split("__thought__", 1)[0]])
 
     def _item_identity(self, value: str) -> str:
         from litellm.responses.utils import ResponsesAPIRequestUtils
@@ -289,12 +293,61 @@ class PublicInferenceIds:
             raise HTTPException(status_code=403, detail="Resource access denied")
         return resolved
 
+    async def _prepare_tool(self, source: dict[str, object]) -> dict[str, object]:
+        from litellm.litellm_core_utils.prompt_templates.factory import (
+            _encode_tool_call_id_with_signature,
+            _get_thought_signature_from_tool,
+        )
+
+        index: Final = source.get("index")
+        slot: Final = (self.tool_namespace, self.choice_index, index) if isinstance(index, int) else None
+        supplied_id: Final = source.get("id")
+        original_id: Final = supplied_id if isinstance(supplied_id, str) else self._tool_ids.get(slot) if slot else None
+        supplied_signature: Final = _get_thought_signature_from_tool(source)
+        signature: Final = (
+            supplied_signature
+            if isinstance(supplied_signature, str) and supplied_signature
+            else self._tool_signatures.get(slot)
+            if slot
+            else None
+        )
+        if slot and signature:
+            self._tool_signatures[slot] = signature
+        if original_id is None:
+            if signature and slot is None:
+                raise HTTPException(status_code=502, detail="Invalid upstream tool call")
+            return source
+        encoded_id: Final = (
+            _encode_tool_call_id_with_signature(original_id.split("__thought__", 1)[0], signature)
+            if signature
+            else original_id
+        )
+        if slot:
+            self._tool_ids[slot] = encoded_id
+        if supplied_id is None:
+            if signature:
+                await self.identifier("tool", encoded_id, incoming=False)
+            return source
+        return {**source, "id": encoded_id}
+
     async def payload(self, value: object, *, incoming: bool, resource: str | None = None) -> object:
         if isinstance(value, list):
             return [await self.payload(item, incoming=incoming, resource=resource) for item in value]
         if not isinstance(value, dict):
             return value
-        original_source: Final = cast(dict[str, object], value)
+        raw_source: Final = cast(dict[str, object], value)
+        prepared_response_tool: Final = (
+            await self._prepare_tool({**raw_source, "id": raw_source.get("call_id")})
+            if not incoming and not self.native_messages and raw_source.get("type") == "function_call"
+            else None
+        )
+        original_source: Final = (
+            {**raw_source, "call_id": prepared_response_tool["id"]}
+            if prepared_response_tool is not None and isinstance(prepared_response_tool.get("id"), str)
+            else await self._prepare_tool(raw_source)
+            if not incoming and not self.native_messages and resource == "tool"
+            else raw_source
+        )
         tool_id: Final = original_source.get("id")
         signature: Final = tool_id.partition("__thought__")[2] if isinstance(tool_id, str) else ""
         source: Final = (
@@ -303,6 +356,17 @@ class PublicInferenceIds:
             else original_source
         )
         provider_fields: Final = source.get("provider_specific_fields")
+        continuation_fields: Final = (
+            {
+                key: item
+                for key, item in provider_fields.items()
+                if key in ("thought_signatures", "thought_signature", "signature")
+            }
+            if isinstance(provider_fields, dict)
+            and resource not in ("tool", "tool_function")
+            and source.get("type") != "function_call"
+            else {}
+        )
         unique_fields: Final = (
             {
                 key: item
@@ -314,9 +378,23 @@ class PublicInferenceIds:
             if isinstance(provider_fields, dict)
             else provider_fields
         )
+        promoted: Final = (
+            {
+                key: provider_fields[key]
+                for key in ("thinking_blocks", "reasoning_items")
+                if isinstance(provider_fields, dict)
+                and key in provider_fields
+                and provider_fields[key] not in (None, {}, [])
+                and key not in source
+            }
+            if not incoming and not self.native_messages
+            else {}
+        )
         obj: Final = (
             {
-                key: unique_fields if key == "provider_specific_fields" else item
+                key: (unique_fields if self.native_messages else continuation_fields)
+                if key == "provider_specific_fields"
+                else item
                 for key, item in source.items()
                 if key != "provider_specific_fields" or unique_fields not in (None, {})
             }
@@ -340,8 +418,13 @@ class PublicInferenceIds:
             self.deployment = ResponsesAPIRequestUtils.get_model_id_from_response_id(response_id)
         translated: Final = {
             key: await self._field(key, item, obj, incoming=incoming, resource=node_resource)
-            for key, item in obj.items()
-            if incoming or (key not in _PRIVATE_FIELDS and not key.startswith("litellm_"))
+            for key, item in {**obj, **promoted}.items()
+            if incoming
+            or (
+                key not in _PRIVATE_FIELDS
+                and not key.startswith("litellm_")
+                and (key != "provider_specific_fields" or self.native_messages or bool(continuation_fields))
+            )
         }
         return {
             key: item
@@ -349,9 +432,20 @@ class PublicInferenceIds:
             if incoming or key != "provider_specific_fields" or item not in (None, {})
         }
 
+    async def _choice(self, value: object, index: int, *, incoming: bool) -> object:
+        previous: Final = self.choice_index
+        declared_index: Final = value.get("index") if isinstance(value, dict) else None
+        self.choice_index = declared_index if isinstance(declared_index, int) else index
+        try:
+            return await self.payload(value, incoming=incoming)
+        finally:
+            self.choice_index = previous
+
     async def _field(
         self, key: str, value: object, obj: Mapping[str, object], *, incoming: bool, resource: str | None
     ) -> object:
+        if key == "choices" and isinstance(value, list):
+            return [await self._choice(item, index, incoming=incoming) for index, item in enumerate(value)]
         if (
             key == "usage"
             and not incoming
@@ -391,6 +485,8 @@ class PublicInferenceIds:
             if key == "response"
             else "tool"
             if key == "tool_calls"
+            else "tool_function"
+            if key == "function" and resource == "tool"
             else "item"
             if key in ("item", "input", "output") or (key == "data" and self.resource == "response")
             else self.resource

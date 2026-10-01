@@ -806,7 +806,7 @@ async def test_provider_extensions_remove_only_empty_and_duplicate_fields(transp
         result = json.loads(body.removeprefix(b"data: ").strip())
     expected = {"content": "Answer", "thinking_blocks": thinking}
     if unique:
-        expected["provider_specific_fields"] = extra
+        expected["provider_specific_fields"] = {"signature": "native-signature"}
     assert result["choices"][0]["message"] == expected
     assert result["metadata"] == payload["metadata"]
     assert json.dumps(payload) == before
@@ -974,18 +974,9 @@ async def test_nested_code_interpreter_container_ids_are_opaque_and_owner_scoped
         container_id=container,
     )
     payload = {
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "Done",
-                    "provider_specific_fields": {
-                        "code_interpreter_results": [item.model_dump(exclude_none=True) for item in results],
-                        "container": {"id": container},
-                    },
-                }
-            }
-        ]
+        "object": "response",
+        "output": [item.model_dump(exclude_none=True) for item in results],
+        "container": {"id": container},
     }
     snapshot = json.dumps(payload)
     store = MemoryIds()
@@ -1027,12 +1018,11 @@ async def test_nested_code_interpreter_container_ids_are_opaque_and_owner_scoped
     else:
         body = b"".join(value.get("body", b"") for value in sent)
         result = json.loads(body.removeprefix(b"data: ").strip())
-    fields = result["choices"][0]["message"]["provider_specific_fields"]
-    public = fields["code_interpreter_results"][0]["container_id"]
+    public = result["output"][0]["container_id"]
     assert public.startswith("cntr_") and public != container
-    assert fields["container"]["id"] == public
-    original_result = payload["choices"][0]["message"]["provider_specific_fields"]["code_interpreter_results"][0]
-    assert fields["code_interpreter_results"][0] == {**original_result, "container_id": public}
+    assert result["container"]["id"] == public
+    original_result = payload["output"][0]
+    assert result["output"][0] == {**original_result, "id": result["output"][0]["id"], "container_id": public}
     assert container not in json.dumps(result)
     assert json.dumps(payload) == snapshot
     continued = PublicInferenceIds(lambda: store, "VoidAPI")
@@ -1263,12 +1253,8 @@ async def test_only_signatures_recoverable_from_the_stored_id_are_removed(embedd
     snapshot = json.dumps(payload)
     public = await context.payload(payload, incoming=False)
     public_call = public["choices"][0]["message"]["tool_calls"][0]
-    fields = (
-        public_call["provider_specific_fields"]
-        if location == "tool"
-        else public_call["function"]["provider_specific_fields"]
-    )
-    assert fields == ({"enabled": False} if embedded == "same-signature" else signature_fields)
+    assert "provider_specific_fields" not in public_call
+    assert "provider_specific_fields" not in public_call["function"]
     assert public["metadata"] == payload["metadata"]
     assert json.dumps(payload) == snapshot
     continued = PublicInferenceIds(lambda: store, "VoidAPI")
@@ -1277,7 +1263,7 @@ async def test_only_signatures_recoverable_from_the_stored_id_are_removed(embedd
         {"messages": [{"role": "assistant", "tool_calls": [public_call]}]}, incoming=True
     )
     restored_call = restored["messages"][0]["tool_calls"][0]
-    assert restored_call["id"] == original_id
+    assert restored_call["id"] == _encode_tool_call_id_with_signature("call_example", "same-signature")
     assert _get_thought_signature_from_tool(restored_call) == _get_thought_signature_from_tool(call)
 
 
@@ -1367,8 +1353,6 @@ async def test_nonstandard_search_call_summary_is_removed_but_search_results_are
         body = b"".join(value.get("body", b"") for value in sent)
         result = json.loads(body.removeprefix(b"data: ").strip())
     expected = {"content": "web_search_calls is user-visible text"}
-    if keep_results:
-        expected["provider_specific_fields"] = {"web_search_results": search_results, "citations": fields["citations"]}
     assert result["choices"][0]["message"] == expected
     assert result["metadata"] == payload["metadata"]
     assert json.dumps(payload) == snapshot
@@ -1392,3 +1376,176 @@ async def test_standard_responses_web_search_call_is_preserved() -> None:
     translated = result["output"][0]
     assert translated == {**call, "id": translated["id"]}
     assert translated["id"].startswith("item_")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signature_first", [False, True])
+async def test_streamed_signature_only_delta_is_saved_without_emitting_provider_fields(signature_first: bool) -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _get_thought_signature_from_tool
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    id_delta = {"index": 0, "id": "call_example", "type": "function", "function": {"name": "lookup", "arguments": ""}}
+    signature_delta = {"index": 0, "function": {"provider_specific_fields": {"thought_signature": "native-signature"}}}
+    results = [
+        await context.payload({"choices": [{"delta": {"tool_calls": [delta]}}]}, incoming=False)
+        for delta in ([signature_delta, id_delta] if signature_first else [id_delta, signature_delta])
+    ]
+    assert all("provider_specific_fields" not in json.dumps(result) for result in results)
+    public_call = results[1 if signature_first else 0]["choices"][0]["delta"]["tool_calls"][0]
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    restored = await continued.payload(
+        {"messages": [{"role": "assistant", "tool_calls": [public_call]}]}, incoming=True
+    )
+    call = restored["messages"][0]["tool_calls"][0]
+    assert _get_thought_signature_from_tool(call) == "native-signature"
+    assert call["id"].split("__thought__", 1)[0] == "call_example"
+    content = {"role": "tool", "tool_call_id": public_call["id"], "content": "Result"}
+    reply = await continued.payload({"messages": [content]}, incoming=True)
+    assert reply["messages"][0]["tool_call_id"] == call["id"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_in_provider_fields_is_promoted_before_wrapper_removal() -> None:
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    thinking = [{"type": "thinking", "thinking": "Reasoning", "signature": "native-signature"}]
+    payload = {
+        "choices": [{"message": {"content": "Answer", "provider_specific_fields": {"thinking_blocks": thinking}}}]
+    }
+    result = await context.payload(payload, incoming=False)
+    assert result == {"choices": [{"message": {"content": "Answer", "thinking_blocks": thinking}}]}
+    existing = {
+        "choices": [
+            {"message": {"thinking_blocks": thinking, "provider_specific_fields": {"thinking_blocks": ["duplicate"]}}}
+        ]
+    }
+    assert (await context.payload(existing, incoming=False))["choices"][0]["message"]["thinking_blocks"] == thinking
+
+
+@pytest.mark.asyncio
+async def test_native_messages_keep_signature_extension_needed_by_the_adapter() -> None:
+    store = MemoryIds()
+    payload = {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_example",
+                "name": "lookup",
+                "input": {},
+                "provider_specific_fields": {"signature": "native-signature"},
+            }
+        ],
+    }
+    messages, _ = await http_exchange(lambda: store, authenticated(), {}, payload, path="/v1/messages")
+    assert response(messages) == payload
+
+
+@pytest.mark.asyncio
+async def test_response_function_call_signature_is_stored_using_call_id_not_output_item_id() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _get_thought_signature_from_tool
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    payload = {
+        "object": "response",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_item",
+                "call_id": "call_native",
+                "name": "lookup",
+                "arguments": "{}",
+                "provider_specific_fields": {"thought_signature": "native-signature"},
+            }
+        ],
+    }
+    result = await context.payload(payload, incoming=False)
+    item = result["output"][0]
+    assert "provider_specific_fields" not in item
+    assert item["id"].startswith("item_") and item["call_id"].startswith("call_")
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    restored = await continued.payload({"input": [item]}, incoming=True)
+    call = restored["input"][0]
+    assert call["id"] == "fc_item"
+    assert _get_thought_signature_from_tool({"id": call["call_id"]}) == "native-signature"
+    assert call["name"] == "lookup" and call["arguments"] == "{}"
+
+
+@pytest.mark.asyncio
+async def test_interleaved_choice_tool_signatures_do_not_overwrite_each_other() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _get_thought_signature_from_tool
+
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    first = await context.payload(
+        {
+            "id": "chatcmpl_example",
+            "choices": [
+                {"index": index, "delta": {"tool_calls": [{"index": 0, "id": "call_reused"}]}} for index in (0, 1)
+            ],
+        },
+        incoming=False,
+    )
+    ids = [choice["delta"]["tool_calls"][0]["id"] for choice in first["choices"]]
+    assert ids[0] != ids[1]
+    for index in (1, 0):
+        frame = await context.payload(
+            {
+                "id": "chatcmpl_example",
+                "choices": [
+                    {
+                        "index": index,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "provider_specific_fields": {"thought_signature": f"signature-{index}"}
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+            incoming=False,
+        )
+        assert "provider_specific_fields" not in json.dumps(frame)
+    continued = PublicInferenceIds(lambda: store, "VoidAPI")
+    continued.bind(authenticated())
+    for index, public in enumerate(ids):
+        internal = await continued.identifier("tool", public, incoming=True)
+        assert _get_thought_signature_from_tool({"id": internal}) == f"signature-{index}"
+
+
+@pytest.mark.asyncio
+async def test_unmigrated_message_and_legacy_function_signatures_are_not_lost() -> None:
+    context = PublicInferenceIds(MemoryIds, "VoidAPI")
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "Answer",
+                    "provider_specific_fields": {"thought_signatures": ["native-signature"], "unused": "drop"},
+                    "function_call": {
+                        "name": "lookup",
+                        "arguments": "{}",
+                        "provider_specific_fields": {"thought_signature": "legacy-signature"},
+                    },
+                }
+            }
+        ]
+    }
+    result = await context.payload(payload, incoming=False)
+    message = result["choices"][0]["message"]
+    assert message["provider_specific_fields"] == {"thought_signatures": ["native-signature"]}
+    assert message["function_call"] == payload["choices"][0]["message"]["function_call"]

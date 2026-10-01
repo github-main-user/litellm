@@ -308,6 +308,7 @@ class PublicInferenceBoundary:
             return
         ids = PublicInferenceIds(self.id_store_factory, self.brand) if self.id_store_factory is not None else None
         if ids is not None:
+            ids.native_messages = route.split("/", 1)[0] == "messages"
             scope.setdefault("state", {})[STATE_KEY] = ids
         token = current_public_ids.set(ids)
         anthropic = route.split("/", 1)[0] == "messages"
