@@ -1723,3 +1723,71 @@ async def test_id_restoration_preserves_multipart_upload_body_and_file_objects()
     assert await request.body() == raw
     assert not hasattr(request, "_json")
     await upload.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_type", ["image", "document"])
+@pytest.mark.parametrize("placement", ["message", "tool_result", "document_content"])
+async def test_anthropic_file_sources_restore_with_owner_checks(block_type: str, placement: str) -> None:
+    store = MemoryIds()
+    issuer = PublicInferenceIds(lambda: store, "VoidAPI")
+    issuer.bind(authenticated())
+    native = "file-native-example"
+    public = await issuer.identifier("file", native, incoming=False)
+    block = {"type": block_type, "source": {"type": "file", "file_id": public}}
+    expected_block = {"type": block_type, "source": {"type": "file", "file_id": native}}
+
+    def placed(item):
+        if placement == "tool_result":
+            return {"type": "tool_result", "tool_use_id": "tool_native", "content": [item]}
+        if placement == "document_content":
+            return {"type": "document", "source": {"type": "content", "content": [item]}}
+        return item
+
+    body = {"messages": [{"role": "user", "content": [placed(block)]}], "metadata": {"source": block["source"]}}
+    sent, seen = await http_exchange(
+        lambda: store, authenticated(), body, {"type": "message", "content": []}, path="/v1/messages"
+    )
+    assert sent[0]["status"] == 200
+    expected = {"messages": [{"role": "user", "content": [placed(expected_block)]}], "metadata": body["metadata"]}
+    assert seen["body"] == expected
+    assert seen["cached"] == expected
+    denied, _ = await http_exchange(lambda: store, authenticated(user_id="bob"), body, path="/v1/messages")
+    assert denied[0]["status"] == 404
+    unknown = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": block_type, "source": {"type": "file", "file_id": "file_" + "f" * 32}}],
+            }
+        ]
+    }
+    missing, _ = await http_exchange(lambda: store, authenticated(), unknown, path="/v1/messages")
+    assert missing[0]["status"] == 404
+
+
+@pytest.mark.asyncio
+async def test_anthropic_source_restoration_does_not_rewrite_user_data() -> None:
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    public = await context.identifier("file", "file-native", incoming=False)
+    file_source = {"type": "image", "source": {"type": "file", "file_id": public}}
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": f"https://example.com/{public}"}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": public}},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": public}},
+                    {"type": "text", "text": json.dumps(file_source)},
+                    {"type": "tool_result", "tool_use_id": "tool_native", "content": json.dumps(file_source)},
+                    {"type": "tool_result", "tool_use_id": "tool_native", "content": {"data": file_source}},
+                    {"type": "tool_use", "id": "tool_native", "name": "lookup", "input": file_source},
+                ],
+            }
+        ],
+        "metadata": file_source,
+    }
+    assert await context.payload(payload, incoming=True) == payload

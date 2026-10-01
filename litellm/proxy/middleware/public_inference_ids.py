@@ -484,6 +484,20 @@ class PublicInferenceIds:
                 await self.identifier(list_kind, item, incoming=incoming) if isinstance(item, str) else item
                 for item in value
             ]
+        if (
+            key == "source"
+            and obj.get("type") in ("image", "document")
+            and isinstance(value, dict)
+            and value.get("type") in ("file", "content")
+        ):
+            return await self.payload(value, incoming=incoming)
+        if key == "content" and obj.get("type") == "tool_result" and isinstance(value, list):
+            return [
+                await self.payload(item, incoming=incoming)
+                if isinstance(item, dict) and item.get("type") in ("image", "document")
+                else item
+                for item in value
+            ]
         if key not in _CHILDREN:
             return value
         if key == "input" and not isinstance(value, list):
