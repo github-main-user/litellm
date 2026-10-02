@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.management_endpoints.canonical_model_endpoints import (
     CanonicalWrite,
     _deployment_params,
@@ -13,6 +14,8 @@ from litellm.proxy.management_endpoints.canonical_model_endpoints import (
     _model_info,
     _parse_body,
     _read,
+    create_canonical_model,
+    update_canonical_model,
 )
 
 
@@ -20,6 +23,7 @@ def _payload() -> dict[str, object]:
     return {
         "name": "public-model",
         "group": "group-one",
+        "base_model": "lab/original",
         "input_price_per_million_tokens": 2.0,
         "output_price_per_million_tokens": 3.0,
         "cache_read_price_per_million_tokens": 0.5,
@@ -87,8 +91,8 @@ def test_canonical_supports_zero_bindings() -> None:
     assert CanonicalWrite.model_validate({**payload, "connections": []}).connections == []
 
 
-@pytest.mark.parametrize("base_model", [None, "lab/model-v1.2", "Lab_1/model_name"])
-def test_canonical_base_model_is_written_and_returned(base_model: str | None) -> None:
+@pytest.mark.parametrize("base_model", ["lab/model-v1.2", "Lab_1/model_name"])
+def test_canonical_base_model_is_written_and_returned(base_model: str) -> None:
     body: Final = _parse_body({**_payload(), "base_model": base_model, "connections": []})
     fields: Final = _fields(body, "admin")
     row: Final = SimpleNamespace(**fields, id="canonical-1", connections=[])
@@ -97,26 +101,13 @@ def test_canonical_base_model_is_written_and_returned(base_model: str | None) ->
     assert _read(row).model_dump(mode="json")["base_model"] == base_model
 
 
-def test_canonical_base_model_defaults_to_null_on_create() -> None:
-    body: Final = _parse_body({**_payload(), "connections": []})
-    row: Final = SimpleNamespace(base_model=None, **_fields(body, "admin"), id="canonical-1", connections=[])
-
-    assert body.base_model is None
-    assert _read(row).base_model is None
-
-
-@pytest.mark.parametrize(
-    ("changes", "expected"),
-    [({}, "lab/original"), ({"base_model": None}, None), ({"base_model": "lab/replacement"}, "lab/replacement")],
-)
-def test_canonical_base_model_update_preserves_replaces_or_clears(
-    changes: dict[str, str | None], expected: str | None
-) -> None:
-    body: Final = _parse_body({**_payload(), **changes, "connections": []})
-    updated: Final = {"base_model": "lab/original", **_fields(body, "admin")}
-    row: Final = SimpleNamespace(**updated, id="canonical-1", connections=[])
-
-    assert _read(row).base_model == expected
+@pytest.mark.parametrize("extra", [{}, {"base_model": None}])
+def test_canonical_base_model_is_required(extra: dict[str, object]) -> None:
+    payload: Final = {key: value for key, value in _payload().items() if key != "base_model"}
+    with pytest.raises(HTTPException) as exc:
+        _parse_body({**payload, **extra})
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "invalid_request"
 
 
 @pytest.mark.parametrize(
@@ -149,3 +140,17 @@ def test_canonical_base_model_does_not_change_inference_metadata() -> None:
 
     assert _deployment_params(tagged, tagged.connections[0]) == _deployment_params(original, original.connections[0])
     assert _model_info(tagged, "deployment-1", "chat") == _model_info(original, "deployment-1", "chat")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+@pytest.mark.parametrize("extra", [{}, {"base_model": None}, {"base_model": ""}])
+async def test_canonical_create_and_put_require_base_model(method: str, extra: dict[str, object]) -> None:
+    payload: Final = {key: value for key, value in _payload().items() if key != "base_model"}
+    with pytest.raises(HTTPException) as exc:
+        if method == "POST":
+            await create_canonical_model(user=UserAPIKeyAuth(user_id="admin"), raw={**payload, **extra})
+        else:
+            await update_canonical_model("canonical-1", user=UserAPIKeyAuth(user_id="admin"), raw={**payload, **extra})
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "invalid_request"

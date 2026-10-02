@@ -19,7 +19,7 @@ class CatalogConnection(BaseModel):
 class CatalogRecord(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     name: str
-    base_model: str | None
+    base_model: str
     created_at: datetime
     input_price_per_million_tokens: Decimal
     output_price_per_million_tokens: Decimal
@@ -41,7 +41,7 @@ class CatalogEntry(BaseModel):
     object: Literal["model"] = "model"
     created: int
     owned_by: str
-    base_model: str | None
+    base_model: str
     pricing: CatalogPricing
 
 

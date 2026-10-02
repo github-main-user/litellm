@@ -56,7 +56,7 @@ model LiteLLM_CanonicalModel {
   id String @id @default(uuid())
   name String @unique
   group String?
-  base_model String?
+  base_model String
   input_price_per_million_tokens Decimal @client.Decimal(24, 12)
   output_price_per_million_tokens Decimal @client.Decimal(24, 12)
   cache_read_price_per_million_tokens Decimal @client.Decimal(24, 12)

@@ -5,6 +5,7 @@ from typing import Final
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import litellm
 from litellm.proxy import proxy_server as ps
@@ -183,11 +184,6 @@ def test_anonymous_without_canonical_database_never_lists_config_models(catalog_
     assert response.json() == {"object": "list", "data": []}
 
 
-def test_catalog_base_model_can_be_null() -> None:
-    record = _record("public").model_copy(update={"base_model": None})
-    assert catalog_entries((record,), "catalog-brand", None, ())[0].model_dump() == _expected(record)
-
-
 @pytest.mark.asyncio
 async def test_authenticated_anthropic_clients_keep_legacy_model_view(catalog_proxy) -> None:
     from starlette.requests import Request
@@ -228,3 +224,8 @@ def test_untrusted_oauth_identity_headers_are_not_treated_as_anonymous(catalog_p
     )
     response = TestClient(ps.app).get("/v1/models", headers={"x-catalog-user": "forged-user"})
     assert response.status_code in (401, 403), response.text
+
+
+def test_catalog_record_rejects_null_base_model() -> None:
+    with pytest.raises(ValidationError):
+        CatalogRecord.model_validate({**_record("public").model_dump(), "base_model": None})

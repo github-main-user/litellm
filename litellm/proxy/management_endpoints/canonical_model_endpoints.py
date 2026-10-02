@@ -28,8 +28,8 @@ class CanonicalWrite(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     name: str = Field(min_length=1, max_length=255, pattern=r"^[^*]+$")
     group: str | None = Field(default=None, min_length=1, max_length=100)
-    base_model: str | None = Field(
-        default=None, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+    base_model: str = Field(
+        min_length=3, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
     )
     input_price_per_million_tokens: Decimal = Field(gt=0, max_digits=24, decimal_places=12)
     output_price_per_million_tokens: Decimal = Field(gt=0, max_digits=24, decimal_places=12)
@@ -59,7 +59,7 @@ class CanonicalRead(BaseModel):
     id: str
     name: str
     group: str | None
-    base_model: str | None
+    base_model: str
     input_price_per_million_tokens: Decimal
     output_price_per_million_tokens: Decimal
     cache_read_price_per_million_tokens: Decimal
@@ -131,7 +131,7 @@ def _fields(body: CanonicalWrite, actor: str) -> dict[str, object]:
     return {
         "name": body.name,
         "group": body.group,
-        **({"base_model": body.base_model} if "base_model" in body.model_fields_set else {}),
+        "base_model": body.base_model,
         "input_price_per_million_tokens": body.input_price_per_million_tokens,
         "output_price_per_million_tokens": body.output_price_per_million_tokens,
         "cache_read_price_per_million_tokens": body.cache_read_price_per_million_tokens
