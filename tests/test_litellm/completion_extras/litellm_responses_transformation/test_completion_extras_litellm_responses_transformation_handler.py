@@ -1,8 +1,11 @@
+import json
+from collections.abc import AsyncIterator, Iterator
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-
 
 import litellm
 from litellm.completion_extras.litellm_responses_transformation.handler import (
@@ -10,17 +13,195 @@ from litellm.completion_extras.litellm_responses_transformation.handler import (
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import ModelResponse
+
+
+class CollectedResponseStream:
+    def __init__(self, events: list[object], response: ResponsesAPIResponse | None) -> None:
+        self.events = events
+        self.response = response
+        self.completed_response = None
+        self._hidden_params = {"custom_llm_provider": "chatgpt", "model_id": "deployment"}
+
+    def __iter__(self) -> Iterator[object]:
+        yield from self.events
+        if self.response is not None:
+            self.completed_response = SimpleNamespace(response=self.response)
+
+    async def __aiter__(self) -> AsyncIterator[object]:
+        for event in self:
+            yield event
+
+
+def collected_response(output: list[dict[str, object]]) -> ResponsesAPIResponse:
+    return ResponsesAPIResponse(
+        id="resp_test",
+        created_at=1,
+        model="test-model",
+        object="response",
+        status="completed",
+        output=output,
+        usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("event_kind", ["delta", "text_done", "item_done", "typed_item_done"])
+async def test_non_streaming_bridge_recovers_text_from_empty_completed_response(asynchronous: bool, event_kind: str):
+    from openai.types.responses import ResponseOutputItemDoneEvent
+
+    item = {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK", "annotations": []}],
+    }
+    event = {"type": "response.output_item.done", "sequence_number": 1, "output_index": 0, "item": item}
+    events = (
+        [
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            }
+            for text in ("O", "K")
+        ]
+        if event_kind == "delta"
+        else [
+            {
+                "type": "response.output_text.done",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "OK",
+            }
+        ]
+        if event_kind == "text_done"
+        else [ResponseOutputItemDoneEvent.model_validate(event)]
+        if event_kind == "typed_item_done"
+        else [event]
+    )
+    stream = CollectedResponseStream(events, collected_response([]))
+    bridge = ResponsesToCompletionBridgeHandler()
+    if asynchronous:
+        with patch("litellm.aresponses", new=AsyncMock(return_value=stream)):
+            result = await bridge.acompletion(**_bridge_kwargs(stream=False))
+    else:
+        with patch("litellm.responses", return_value=stream):
+            result = bridge.completion(**_bridge_kwargs(stream=False))
+    assert result.choices[0].message.content == "OK"
+    assert result.usage.prompt_tokens == 10
+    assert result.usage.completion_tokens == 2
+    assert result.usage.total_tokens == 12
+    assert stream.response.output == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("terminal_output", [False, True])
+async def test_collector_preserves_items_order_signatures_and_authoritative_final_output(
+    asynchronous: bool, terminal_output: bool
+):
+    items = [
+        {"type": "reasoning", "id": "rs_test", "summary": [], "encrypted_content": "reasoning-signature"},
+        {
+            "type": "function_call",
+            "id": "fc_test",
+            "call_id": "call_test",
+            "name": "lookup",
+            "arguments": '{"query":"example"}',
+            "status": "completed",
+        },
+    ]
+    authoritative = [
+        {
+            "type": "message",
+            "id": "msg_final",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Final", "annotations": []}],
+        }
+    ]
+    expected = collected_response(authoritative if terminal_output else items)
+    stream = CollectedResponseStream(
+        [{"type": "response.output_item.done", "output_index": index, "item": items[index]} for index in (1, 0)],
+        collected_response(authoritative if terminal_output else []),
+    )
+    bridge = ResponsesToCompletionBridgeHandler()
+    result = (
+        await bridge._collect_response_from_stream_async(stream)
+        if asynchronous
+        else bridge._collect_response_from_stream(stream)
+    )
+    assert result.model_dump() == expected.model_dump()
+    assert result._hidden_params == stream._hidden_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_collector_does_not_invent_success_when_stream_never_completes(asynchronous: bool):
+    stream = CollectedResponseStream([{"type": "response.output_text.delta", "delta": "partial"}], None)
+    bridge = ResponsesToCompletionBridgeHandler()
+    with pytest.raises(ValueError, match="without a completed response"):
+        if asynchronous:
+            await bridge._collect_response_from_stream_async(stream)
+        else:
+            bridge._collect_response_from_stream(stream)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_non_streaming_collection_with_real_responses_iterators(asynchronous: bool):
+    from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+    from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator, SyncResponsesAPIStreamingIterator
+
+    events = [
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "msg_test",
+            "delta": "OK",
+            "logprobs": [],
+        },
+        {"type": "response.completed", "sequence_number": 2, "response": collected_response([]).model_dump()},
+    ]
+    response = httpx.Response(
+        200,
+        content="".join("data: " + json.dumps(event) + "\n\n" for event in events),
+        headers={"content-type": "text/event-stream"},
+    )
+    kwargs = _bridge_kwargs(stream=False)
+    iterator = (ResponsesAPIStreamingIterator if asynchronous else SyncResponsesAPIStreamingIterator)(
+        response=response,
+        model=kwargs["model"],
+        responses_api_provider_config=ChatGPTResponsesAPIConfig(),
+        logging_obj=kwargs["logging_obj"],
+        custom_llm_provider="chatgpt",
+    )
+    bridge = ResponsesToCompletionBridgeHandler()
+    if asynchronous:
+        with patch("litellm.aresponses", new=AsyncMock(return_value=iterator)):
+            result = await bridge.acompletion(**kwargs)
+    else:
+        with patch("litellm.responses", return_value=iterator):
+            result = bridge.completion(**kwargs)
+    assert result.choices[0].message.content == "OK"
+    assert result.usage.total_tokens == 12
+    assert iterator.completed_response.response.output == []
 
 
 def test_is_preformatted_cached_chat_stream_true():
     stream = MagicMock(spec=CustomStreamWrapper)
     stream.custom_llm_provider = "cached_response"
-    assert (
-        ResponsesToCompletionBridgeHandler._is_preformatted_cached_chat_stream(stream)
-        is True
-    )
+    assert ResponsesToCompletionBridgeHandler._is_preformatted_cached_chat_stream(stream) is True
 
 
 def test_is_preformatted_cached_chat_stream_false_wrong_provider():

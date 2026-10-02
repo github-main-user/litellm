@@ -2,9 +2,10 @@
 Handler for transforming /chat/completions api requests to litellm.responses requests
 """
 
-from collections.abc import Coroutine
+from collections.abc import AsyncIterable, Coroutine, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Final, Union
 
+from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 from litellm.types.llms.openai import ResponsesAPIResponse
@@ -74,9 +75,29 @@ class ResponsesToCompletionBridgeHandler:
                     existing.setdefault(key, value)
         return response
 
-    def _collect_response_from_stream(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        for _ in stream_iter:
-            pass
+    @staticmethod
+    def _record_stream_output(
+        event: object,
+        items: dict[int, dict[str, object]],
+        text: dict[tuple[int, int], dict[str, object]],
+    ) -> None:
+        from litellm.responses.sse_output_recovery import record_output_item_chunk, record_recovery_text_chunk
+
+        payload: Final = event.model_dump() if isinstance(event, BaseModel) else event
+        if not isinstance(payload, Mapping):
+            return
+        if payload.get("type") == "response.output_item.done":
+            record_output_item_chunk(payload, items)
+        elif payload.get("type") in ("response.output_text.delta", "response.output_text.done"):
+            record_recovery_text_chunk(payload, text)
+
+    def _collected_response(
+        self,
+        stream_iter: object,
+        items: Mapping[int, dict[str, object]],
+        text: Mapping[tuple[int, int], dict[str, object]],
+    ) -> "ResponsesAPIResponse":
+        from litellm.responses.sse_output_recovery import merge_recovered_output_items
 
         completed: Final[object] = getattr(stream_iter, "completed_response", None)
         response_obj: Final[object] = getattr(completed, "response", None) if completed else None
@@ -85,24 +106,29 @@ class ResponsesToCompletionBridgeHandler:
 
         hidden_params: Final = getattr(stream_iter, "_hidden_params", None)
         response: Final = self._coerce_response_object(response_obj, hidden_params)
-        if not isinstance(response, ResponsesAPIResponse):
-            raise ValueError("Stream completed response is invalid")
-        return response
+        if response.output:
+            return response
+        recovered: Final = merge_recovered_output_items(items, text, completed=response.status == "completed")
+        if not recovered:
+            return response
+        return self._coerce_response_object(
+            {**response.model_dump(), "output": [item for _, item in sorted(recovered.items())]},
+            response._hidden_params,
+        )
 
-    async def _collect_response_from_stream_async(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        async for _ in stream_iter:
-            pass
+    def _collect_response_from_stream(self, stream_iter: Iterable[object]) -> "ResponsesAPIResponse":
+        items: Final[dict[int, dict[str, object]]] = {}
+        text: Final[dict[tuple[int, int], dict[str, object]]] = {}
+        for event in stream_iter:
+            self._record_stream_output(event, items, text)
+        return self._collected_response(stream_iter, items, text)
 
-        completed: Final[object] = getattr(stream_iter, "completed_response", None)
-        response_obj: Final[object] = getattr(completed, "response", None) if completed else None
-        if response_obj is None:
-            raise ValueError("Stream ended without a completed response")
-
-        hidden_params: Final = getattr(stream_iter, "_hidden_params", None)
-        response: Final = self._coerce_response_object(response_obj, hidden_params)
-        if not isinstance(response, ResponsesAPIResponse):
-            raise ValueError("Stream completed response is invalid")
-        return response
+    async def _collect_response_from_stream_async(self, stream_iter: AsyncIterable[object]) -> "ResponsesAPIResponse":
+        items: Final[dict[int, dict[str, object]]] = {}
+        text: Final[dict[tuple[int, int], dict[str, object]]] = {}
+        async for event in stream_iter:
+            self._record_stream_output(event, items, text)
+        return self._collected_response(stream_iter, items, text)
 
     def validate_input_kwargs(self, kwargs: dict) -> ResponsesToCompletionBridgeHandlerInputKwargs:
         from litellm import LiteLLMLoggingObj
