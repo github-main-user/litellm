@@ -875,6 +875,56 @@ async def test_user_api_key_auth_websocket():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query_scope, expected",
+    [
+        ({}, []),
+        ({"query_string": b""}, []),
+        (
+            {"query_string": b"model=public-model&label=first&label=second%20value"},
+            [("model", "public-model"), ("label", "first"), ("label", "second value")],
+        ),
+    ],
+)
+async def test_websocket_auth_restores_public_ids_without_losing_query_scope(query_scope, expected):
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket_for_model
+    from litellm.proxy.middleware.public_inference_ids import STATE_KEY, PublicInferenceIds
+
+    factory = MagicMock(side_effect=AssertionError("Unexpected ID lookup"))
+    context = PublicInferenceIds(factory, "VoidAPI")
+    user = UserAPIKeyAuth(user_id="websocket-test", api_key="sk-test")
+    scope = {
+        "type": "websocket",
+        "scheme": "ws",
+        "path": "/v1/responses",
+        "root_path": "",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "state": {STATE_KEY: context},
+        **query_scope,
+    }
+    send = AsyncMock()
+    websocket = WebSocket(scope, receive=AsyncMock(), send=send)
+
+    async def authorize(request, api_key):
+        assert api_key == "Bearer sk-test"
+        assert list(request.query_params.multi_items()) == expected
+        assert request.scope["state"][STATE_KEY] is context
+        data = await request.json()
+        await context.authorize_request(request, user, data)
+        assert list(request.query_params.multi_items()) == expected
+        assert data == {"model": "public-model"}
+        return user
+
+    with patch("litellm.proxy.auth.user_api_key_auth.user_api_key_auth", side_effect=authorize):
+        result = await user_api_key_auth_websocket_for_model(websocket, model="public-model")
+    assert result is user
+    assert context.owner is not None
+    assert context.model == "public-model"
+    factory.assert_not_called()
+    send.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_user_api_key_auth_websocket_carries_asgi_path():
     """
     The synthetic Request must carry the ASGI scope's ``path`` so

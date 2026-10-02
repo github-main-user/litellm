@@ -650,6 +650,7 @@ async def user_api_key_auth_websocket_for_model(websocket: WebSocket, model: str
         "type": "http",
         "headers": scope_headers,
         "path": ws_scope.get("path", ""),
+        "query_string": ws_scope.get("query_string") or b"",
         "state": ws_scope.setdefault("state", {}),
     }
     for key in ("root_path", "app_root_path"):
