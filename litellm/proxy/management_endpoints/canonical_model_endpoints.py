@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Annotated, Final, Literal
@@ -13,6 +14,9 @@ from litellm.proxy.common_utils.config_sync_pubsub import publish_config_change_
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
 from litellm.repositories.base_repository import is_unique_violation
 from litellm.repositories.model_repository import ModelRepository
+
+from litellm.repositories.credentials_repository import CredentialsRepository
+from litellm.proxy.management_endpoints.model_resolution import ModelResolution, ResolutionRequest, resolve_identity
 
 router: Final = APIRouter(tags=["canonical models"])
 
@@ -454,3 +458,14 @@ def _write_error(exc: Exception) -> None:
     if getattr(exc, "code", None) == "P2003":
         raise _error(400, "invalid_credential", "Provider connection does not exist") from exc
     raise _error(500, "internal_error", "Canonical model write failed") from exc
+
+
+@router.post("/canonical/resolve", response_model=list[ModelResolution])
+async def resolve_models(body: ResolutionRequest, user: Annotated[UserAPIKeyAuth, Depends(_admin)]) -> list[ModelResolution]:
+    client: Final = _client()
+    rows: Final = await WriterPinnedClient(client.db).db.litellm_canonicalmodel.find_many(where={"base_model": body.base_model}, include={"connections": True})
+    names: Final = tuple(dict.fromkeys(name for name in (*body.provider_connections, *(connection.provider_connection for row in rows for connection in row.connections)) if name is not None))
+    credentials: Final = await asyncio.gather(*(CredentialsRepository(client).find_by_name(name) for name in names))
+    providers: Final = {name: credential.credential_info.get("provider") if credential is not None else None for name, credential in zip(names, credentials)}
+    known: Final = tuple(connection.provider_model for row in rows for connection in row.connections if providers.get(connection.provider_connection) == connection.provider_model.partition("/")[0])
+    return [resolve_identity(body.base_model, name, providers.get(name), known) for name in body.provider_connections]
