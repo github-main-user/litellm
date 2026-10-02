@@ -19,6 +19,7 @@ import fastapi
 import orjson
 from fastapi import HTTPException, Request, WebSocket, status
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import TypeAdapter
 from starlette.exceptions import WebSocketException
 
 import litellm
@@ -3780,3 +3781,45 @@ async def _run_post_custom_auth_checks(
             valid_token.project_alias = _project_obj.project_alias
 
     return valid_token
+
+
+async def model_catalog_auth(
+    request: Request,
+    api_key: str = fastapi.Security(api_key_header),
+    azure_api_key_header: str = fastapi.Security(azure_api_key_header),
+    anthropic_api_key_header: str | None = fastapi.Security(anthropic_api_key_header),
+    google_ai_studio_api_key_header: str | None = fastapi.Security(google_ai_studio_api_key_header),
+    azure_apim_header: str | None = fastapi.Security(azure_apim_header),
+    custom_litellm_key_header: str | None = fastapi.Security(custom_litellm_key_header),
+) -> UserAPIKeyAuth | None:
+    from litellm.proxy.proxy_server import general_settings
+
+    custom_header: Final = TypeAdapter(str | None).validate_python(general_settings.get("litellm_key_header_name"))
+    oauth2_headers: Final = TypeAdapter(dict[str, str] | None).validate_python(
+        general_settings.get("oauth2_config_mappings")
+    ) or {}
+    credential_headers: Final = (
+        SpecialHeaders.openai_authorization.value,
+        SpecialHeaders.azure_authorization.value,
+        SpecialHeaders.anthropic_authorization.value,
+        SpecialHeaders.google_ai_studio_authorization.value,
+        SpecialHeaders.azure_apim_authorization.value,
+        SpecialHeaders.custom_litellm_api_key.value,
+        *oauth2_headers.values(),
+    )
+    if (
+        request.method == "GET"
+        and request.url.path == "/v1/models"
+        and not any(name in request.headers for name in credential_headers)
+        and not (isinstance(custom_header, str) and custom_header in request.headers)
+    ):
+        return None
+    return await user_api_key_auth(
+        request=request,
+        api_key=api_key,
+        azure_api_key_header=azure_api_key_header,
+        anthropic_api_key_header=anthropic_api_key_header,
+        google_ai_studio_api_key_header=google_ai_studio_api_key_header,
+        azure_apim_header=azure_apim_header,
+        custom_litellm_key_header=custom_litellm_key_header,
+    )

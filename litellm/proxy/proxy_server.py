@@ -362,6 +362,7 @@ from litellm.proxy.auth.model_checks import (
 from litellm.proxy.auth.password_policy import validate_password_policy
 from litellm.proxy.auth.user_api_key_auth import (
     _fetch_global_spend_with_event_coordination,
+    model_catalog_auth,
     user_api_key_auth,
     user_api_key_auth_websocket,
 )
@@ -550,6 +551,7 @@ from litellm.proxy.management_endpoints.cache_settings_endpoints import (
 from litellm.proxy.management_endpoints.callback_management_endpoints import (
     router as callback_management_endpoints_router,
 )
+from litellm.proxy.management_endpoints.canonical_model_endpoints import router as canonical_model_router
 from litellm.proxy.management_endpoints.common_utils import (
     _user_has_admin_privileges,
     _user_has_admin_view,
@@ -591,7 +593,6 @@ from litellm.proxy.management_endpoints.management_v1 import (
     router as management_v1_router,
 )
 from litellm.proxy.management_endpoints.management_v1.common import MANAGEMENT_V1_PREFIX
-from litellm.proxy.management_endpoints.canonical_model_endpoints import router as canonical_model_router
 from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
     router as model_access_group_management_router,
 )
@@ -10985,13 +10986,11 @@ class ProxyStartupEvent:
 
 
 #### API ENDPOINTS ####
-@router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
-@router.get(
-    "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
-)  # if project requires model list
+@router.get("/v1/models", tags=["model management"])
+@router.get("/models", tags=["model management"])  # if project requires model list
 async def model_list(
     request: Request = None,  # pyright: ignore[reportArgumentType]  # FastAPI always injects the Request; the None default only serves direct in-process callers
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    user_api_key_dict: UserAPIKeyAuth | None = Depends(model_catalog_auth),
     return_wildcard_routes: bool | None = False,
     team_id: str | None = None,
     include_model_access_groups: bool | None = False,
@@ -11048,6 +11047,59 @@ async def model_list(
         http_request is not None and http_request.headers.get("anthropic-version") is not None
     )
     client_headers: Final[Mapping[str, str]] = http_request.headers if http_request is not None else _EMPTY_HEADERS
+    if (
+        http_request is not None
+        and http_request.url.path == "/v1/models"
+        and (user_api_key_dict is None or not wants_anthropic_format)
+    ):
+        from litellm.proxy.common_utils.canonical_model_catalog import CatalogRecord, catalog_entries
+
+        canonical_rows: Final = TypeAdapter(tuple[CatalogRecord, ...]).validate_python(
+            await prisma_client.db.litellm_canonicalmodel.find_many(
+                include={"connections": {"include": {"deployment": True}}}, order={"name": "asc"}
+            )
+            if prisma_client is not None
+            else ()
+        )
+        if user_api_key_dict is None or (canonical_rows and not wants_anthropic_format):
+            catalog_available: Final = (
+                await get_available_models_for_user(
+                    user_api_key_dict=user_api_key_dict,
+                    llm_router=llm_router,
+                    general_settings=general_settings,
+                    user_model=user_model,
+                    prisma_client=prisma_client,
+                    proxy_logging_obj=proxy_logging_obj,
+                    team_id=team_id,
+                    user_api_key_cache=user_api_key_cache,
+                )
+                if user_api_key_dict is not None
+                else None
+            )
+            catalog_hidden: Final = (
+                (llm_router.get_fully_blocked_model_names() if llm_router is not None else set())
+                | await get_hidden_unhealthy_model_names(
+                    healthy_only=healthy_only, general_settings=settings, llm_router=llm_router
+                )
+            )
+            catalog_data: Final = catalog_entries(
+                canonical_rows,
+                os.getenv("LITELLM_PUBLIC_API_BRAND") or "litellm",
+                catalog_available,
+                catalog_hidden,
+            )
+            if wants_anthropic_format:
+                return create_anthropic_model_list_response(
+                    tuple(
+                        ModelInfoResponse(id=entry.id, object=entry.object, created=entry.created, owned_by=entry.owned_by)
+                        for entry in catalog_data
+                    )
+                )
+            return {"data": [entry.model_dump() for entry in catalog_data], "object": "list"}
+
+    if user_api_key_dict is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     view_router_settings: Final = (
         await proxy_config.get_hierarchical_router_settings(user_api_key_dict, prisma_client, proxy_logging_obj)
         if wants_anthropic_format and is_claude_code_client(client_headers)
