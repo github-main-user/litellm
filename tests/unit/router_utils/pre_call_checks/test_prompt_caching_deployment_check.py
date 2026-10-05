@@ -398,6 +398,36 @@ async def test_cache_reuses_stable_boundaries_but_prefers_the_longest_prefix(asy
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("async_cache", [False, True])
+async def test_message_boundary_outweighs_an_earlier_block_boundary(async_cache):
+    cache: Final = PromptCachingCache(cache=DualCache())
+    block: Final = {"type": "text", "text": "Shared instructions", "cache_control": {"type": "ephemeral"}}
+    shorter: Final = cast(list[AllMessageValues], [{"role": "system", "content": [block]}])
+    longer: Final = cast(
+        list[AllMessageValues],
+        [
+            {
+                "role": "system",
+                "content": [block, {"type": "text", "text": "More instructions"}],
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+    )
+    original: Final = copy.deepcopy(longer)
+    if async_cache:
+        await cache.async_add_model_id("long", longer, None)
+        await cache.async_add_model_id("short", shorter, None)
+        assert await cache.async_get_model_id(longer, None) == {"model_id": "long"}
+        assert await cache.async_get_model_id(shorter, None) == {"model_id": "short"}
+    else:
+        cache.add_model_id("long", longer, None)
+        cache.add_model_id("short", shorter, None)
+        assert cache.get_model_id(longer, None) == {"model_id": "long"}
+        assert cache.get_model_id(shorter, None) == {"model_id": "short"}
+    assert longer == original
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("subscription", [False, True])
 @pytest.mark.parametrize(

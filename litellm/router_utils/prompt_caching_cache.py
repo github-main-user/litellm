@@ -156,6 +156,13 @@ class PromptCachingCache:
             if not cacheable_messages:
                 return None
 
+        return PromptCachingCache._hash_prefix(cacheable_messages, tools)
+
+    @staticmethod
+    def _hash_prefix(
+        cacheable_messages: list[AllMessageValues] | None,
+        tools: list[ChatCompletionToolParam] | None,
+    ) -> str:
         # Use serialize_object for consistent and stable serialization
         data_to_hash: Final = {}
         if cacheable_messages is not None:
@@ -179,33 +186,28 @@ class PromptCachingCache:
     @staticmethod
     def _cacheable_prefixes(messages: list[AllMessageValues]) -> Iterator[list[AllMessageValues]]:
         for message_index, message in enumerate(messages):
+            content: Final = message.get("content")
+            if isinstance(content, list):
+                for block_index, block in enumerate(content):
+                    block_control: Final = block.get("cache_control") if isinstance(block, dict) else None
+                    if isinstance(block_control, dict) and block_control.get("type") == "ephemeral":
+                        yield [
+                            *messages[:message_index],
+                            cast(AllMessageValues, {**message, "content": content[: block_index + 1]}),
+                        ]
             control: Final = message.get("cache_control")
             if isinstance(control, dict) and control.get("type") == "ephemeral":
                 yield messages[: message_index + 1]
-            content: Final = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block_index, block in enumerate(content):
-                block_control: Final = block.get("cache_control") if isinstance(block, dict) else None
-                if isinstance(block_control, dict) and block_control.get("type") == "ephemeral":
-                    yield [
-                        *messages[:message_index],
-                        cast(AllMessageValues, {**message, "content": content[: block_index + 1]}),
-                    ]
 
     @staticmethod
     def _cache_keys(
         messages: list[AllMessageValues] | None,
         tools: list[ChatCompletionToolParam] | None,
     ) -> tuple[str, ...]:
+        if messages is None and tools is None:
+            return ()
         prefixes: Final = PromptCachingCache._cacheable_prefixes(messages) if messages is not None else (None,)
-        return tuple(
-            dict.fromkeys(
-                key
-                for prefix in prefixes
-                if (key := PromptCachingCache.get_prompt_caching_cache_key(prefix, tools)) is not None
-            )
-        )
+        return tuple(dict.fromkeys(PromptCachingCache._hash_prefix(prefix, tools) for prefix in prefixes))
 
     def add_model_id(
         self,
