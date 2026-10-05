@@ -4,6 +4,7 @@ Check if prompt caching is valid for a given deployment
 Route to previously cached model id, if valid
 """
 
+from collections.abc import Mapping
 from typing import Final, cast
 
 from litellm import verbose_logger
@@ -47,6 +48,31 @@ def _get_min_token_count_for_deployments(healthy_deployments: list[dict]) -> int
     )
 
 
+def _responses_prompt_caching_messages(
+    request_kwargs: Mapping[str, object] | None,
+) -> list[AllMessageValues] | None:
+    if request_kwargs is None or request_kwargs.get("previous_response_id"):
+        return None
+    response_input: Final = request_kwargs.get("input")
+    if not isinstance(response_input, (str, list)):
+        return None
+
+    from openai.types.responses.response_create_params import ResponseInputParam
+
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    return cast(
+        list[AllMessageValues],
+        LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+            input=cast(str | ResponseInputParam, response_input),
+            responses_api_request=dict(request_kwargs),
+            replay_reasoning=True,
+        ),
+    )
+
+
 class PromptCachingDeploymentCheck(CustomLogger):
     def __init__(self, cache: DualCache):
         self.cache = cache
@@ -62,8 +88,9 @@ class PromptCachingDeploymentCheck(CustomLogger):
         if request_kwargs is not None and request_kwargs.get("_target_order") is not None:
             return healthy_deployments
 
-        if messages is not None and await offload_token_count(is_prompt_caching_valid_prompt)(
-            messages=messages,
+        cache_messages: Final = messages if messages is not None else _responses_prompt_caching_messages(request_kwargs)
+        if cache_messages is not None and await offload_token_count(is_prompt_caching_valid_prompt)(
+            messages=cache_messages,
             model=model,
             min_token_count=_get_min_token_count_for_deployments(healthy_deployments),
         ):
@@ -75,7 +102,7 @@ class PromptCachingDeploymentCheck(CustomLogger):
             ## `litellm.acompletion`, after a deployment has been picked, so the affinity key has to
             ## be derived from the messages as they will be sent, not as they arrive here.
             affinity_messages: Final = AnthropicCacheControlHook.messages_with_default_injections(
-                messages=cast(list[AllMessageValues], messages),
+                messages=cache_messages,
                 models=(
                     deployment["litellm_params"]["model"]
                     for deployment in healthy_deployments
@@ -118,9 +145,11 @@ class PromptCachingDeploymentCheck(CustomLogger):
             call_type != CallTypes.completion.value
             and call_type != CallTypes.acompletion.value
             and call_type != CallTypes.anthropic_messages.value
+            and call_type != CallTypes.responses.value
+            and call_type != CallTypes.aresponses.value
         ):  # only use prompt caching for completion calls
             verbose_logger.debug(
-                "litellm.router_utils.pre_call_checks.prompt_caching_deployment_check: skipping adding model id to prompt caching cache, CALL TYPE IS NOT COMPLETION or ANTHROPIC MESSAGE"
+                "Skipping prompt cache affinity for unsupported call type: %s", call_type
             )
             return
 

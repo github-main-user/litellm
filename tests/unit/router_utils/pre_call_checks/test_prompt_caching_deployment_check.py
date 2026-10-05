@@ -1,6 +1,7 @@
 import asyncio
 import copy
-from typing import cast
+import json
+from typing import Final, cast
 
 import pytest
 
@@ -314,6 +315,111 @@ async def test_repeated_auto_cached_prefix_pins_to_one_deployment(monkeypatch, l
     ]
 
     assert subsequent == [served_by] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("structured_input", [False, True])
+@pytest.mark.parametrize("previous_response_id", [None, "resp_previous"])
+async def test_responses_auto_cached_prefix_reuses_completion_affinity(
+    monkeypatch, structured_input, previous_response_id
+):
+    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
+    deployments: Final = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
+    cache: Final = DualCache()
+    messages: Final = cast(
+        list[AllMessageValues],
+        [
+            {"role": "system", "content": "word " * 3000},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}] if structured_input else "hello"},
+        ],
+    )
+    request: Final = {
+        "instructions": "word " * 3000,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+        if structured_input
+        else "hello",
+        "previous_response_id": previous_response_id,
+    }
+    original: Final = copy.deepcopy(request)
+    await PromptCachingCache(cache=cache).async_add_model_id(
+        model_id="dep-2", messages=_affinity_messages(messages), tools=None
+    )
+    check: Final = PromptCachingDeploymentCheck(cache=cache)
+    filtered: Final = await check.async_filter_deployments(
+        model=MODEL_GROUP_ALIAS,
+        healthy_deployments=deployments,
+        messages=None,
+        request_kwargs=request,
+    )
+    assert filtered == (deployments if previous_response_id else [deployments[1]])
+    assert request == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_router_responses_reuses_the_deployment_that_cached_the_prompt(monkeypatch, respx_mock, stream):
+    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    deployments: Final = [
+        {
+            "model_name": MODEL_GROUP_ALIAS,
+            "litellm_params": {
+                "model": AUTO_CACHING_MODEL,
+                "api_key": "sk-fake",
+                "api_base": f"https://{model_id}.example.test",
+            },
+            "model_info": {"id": model_id},
+        }
+        for model_id in ("dep-1", "dep-2")
+    ]
+    router: Final = litellm.Router(model_list=deployments, optional_pre_call_checks=["prompt_caching"])
+    reply: Final = {
+        "id": "msg_cache_test",
+        "type": "message",
+        "role": "assistant",
+        "model": AUTO_CACHING_MODEL.removeprefix("anthropic/"),
+        "content": [{"type": "text", "text": "OK"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 4, "output_tokens": 1, "cache_creation_input_tokens": 3000},
+    }
+    events: Final = (
+        {"type": "message_start", "message": {**reply, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "OK"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    )
+    response_body: Final = (
+        {
+            "content": "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
+            "headers": {"content-type": "text/event-stream"},
+        }
+        if stream
+        else {"json": reply}
+    )
+    for deployment in deployments:
+        respx_mock.post(f"{deployment['litellm_params']['api_base']}/v1/messages").respond(200, **response_body)
+    request: Final = {"model": MODEL_GROUP_ALIAS, "instructions": "word " * 3000, "input": "hello", "stream": stream}
+    first_response: Final = await router.aresponses(**request)
+    if stream:
+        async for _ in first_response:
+            pass
+    first_host: Final = respx_mock.calls[-1].request.url.host
+    affinity_key: Final = PromptCachingCache.get_prompt_caching_cache_key(
+        _affinity_messages(_auto_caching_messages()), None
+    )
+    assert await _eventually(lambda: router.cache.get_cache(key=affinity_key)) is not None
+    for _ in range(3):
+        response: Final = await router.aresponses(**request)
+        if stream:
+            async for _ in response:
+                pass
+        assert respx_mock.calls[-1].request.url.host == first_host
 
 
 @pytest.mark.asyncio
