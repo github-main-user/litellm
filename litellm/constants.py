@@ -1848,7 +1848,6 @@ LITELLM_SETTINGS_SAFE_DB_OVERRIDES: Final = [
     # must be listed here so a DB write from one worker overrides the live litellm attribute on
     # the others when config reloads; otherwise peer workers stay on their startup value.
     # test_general_settings_ui_fields_are_db_overridable enforces that pairing.
-    "enable_anthropic_prompt_caching",
     "anthropic_prompt_caching_ttl",
     "openai_system_messages_first",
     "max_ui_session_budget",

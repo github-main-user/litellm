@@ -261,7 +261,6 @@ async def test_affinity_key_matches_the_messages_auto_caching_actually_sends(mon
     every request. Routing must derive the same key the success event writes from the messages the
     request was actually sent with, otherwise auto-injected caching gets no affinity at all.
     """
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     capture = _SentMessagesCapture()
     monkeypatch.setattr(litellm, "callbacks", [capture])
     messages = _auto_caching_messages()
@@ -288,7 +287,6 @@ async def test_repeated_auto_cached_prefix_pins_to_one_deployment(monkeypatch, l
     across a multi-deployment group once one deployment has cached the prefix. Bedrock and Anthropic
     caches are per account and region, so every bounce paid the cache write premium and never read.
     """
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     router = litellm.Router(
         model_list=[
             {
@@ -324,7 +322,6 @@ async def test_repeated_auto_cached_prefix_pins_to_one_deployment(monkeypatch, l
 async def test_responses_auto_cached_prefix_reuses_completion_affinity(
     monkeypatch, structured_input, previous_response_id
 ):
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     deployments: Final = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
     cache: Final = DualCache()
     messages: Final = cast(
@@ -436,7 +433,6 @@ async def test_message_boundary_outweighs_an_earlier_block_boundary(async_cache)
 async def test_router_reuses_the_deployment_that_cached_the_prompt(
     monkeypatch, respx_mock, stream, subscription, api, explicit_system
 ):
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     monkeypatch.setattr(litellm, "callbacks", [])
     monkeypatch.setattr(litellm, "success_callback", [])
@@ -551,7 +547,6 @@ async def test_per_request_enable_prompt_caching_reaches_the_affinity_key(monkey
     off, so routing has to read it too. Ignore it and the key comes off unmarked messages, which is
     never what the request goes on to send, and the pin is lost for every per-key enablement.
     """
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", False)
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
@@ -575,7 +570,6 @@ async def test_per_request_enable_prompt_caching_reaches_the_affinity_key(monkey
 
 @pytest.mark.asyncio
 async def test_claude_code_one_shot_subagent_does_not_reuse_an_auto_injected_affinity_key(monkeypatch):
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
@@ -610,7 +604,6 @@ async def test_claude_code_one_shot_subagent_does_not_reuse_an_auto_injected_aff
 
 @pytest.mark.asyncio
 async def test_root_cache_control_does_not_reuse_an_auto_injected_affinity_key(monkeypatch):
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
@@ -642,7 +635,6 @@ async def test_tool_marked_cache_control_keeps_routing_off_another_requests_pref
     keys off the injected prefix, pinning the request to whichever deployment cached a different,
     tool-less request whose prefix it can never actually reuse.
     """
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
@@ -680,7 +672,6 @@ def test_client_supplied_cache_control_keeps_its_own_prefix_boundary(monkeypatch
     keep keying off the client's boundary. Injecting on top would push the boundary to the trailing
     turn and break affinity for prompts that already worked.
     """
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     messages = cast(
         list[AllMessageValues],
         [

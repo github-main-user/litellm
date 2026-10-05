@@ -11519,9 +11519,9 @@ async def test_update_config_field_throttle_persists_to_litellm_settings(monkeyp
 
 
 def test_get_config_list_includes_anthropic_prompt_caching_fields(monkeypatch):
-    """The auto prompt caching flag and its ttl are litellm_settings globals surfaced on the
-    General Settings table, so an admin can turn caching on without hand-writing config. The
-    ttl is a Select and must ship its allowed values, or the table renders no editor for it."""
+    """The prompt caching ttl is a litellm_settings global surfaced on the General Settings
+    table, so an admin can set its lifetime without hand-writing config. The ttl is a Select
+    and must ship its allowed values, or the table renders no editor for it."""
     import types
     from unittest.mock import AsyncMock, MagicMock
 
@@ -11536,7 +11536,6 @@ def test_get_config_list_includes_anthropic_prompt_caching_fields(monkeypatch):
     mock_config_table.find_first = AsyncMock(return_value=None)
     mock_prisma.db = types.SimpleNamespace(litellm_config=mock_config_table)
     monkeypatch.setattr(ps, "prisma_client", mock_prisma)
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     monkeypatch.setattr(litellm, "anthropic_prompt_caching_ttl", "1h")
     monkeypatch.setattr(litellm, "openai_system_messages_first", False)
     app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
@@ -11548,8 +11547,7 @@ def test_get_config_list_includes_anthropic_prompt_caching_fields(monkeypatch):
         assert resp.status_code == 200, resp.text
         fields = {item["field_name"]: item for item in resp.json()}
 
-        assert fields["enable_anthropic_prompt_caching"]["field_type"] == "Boolean"
-        assert fields["enable_anthropic_prompt_caching"]["field_value"] is True
+        assert "enable_anthropic_prompt_caching" not in fields
 
         assert fields["anthropic_prompt_caching_ttl"]["field_type"] == "Select"
         assert fields["anthropic_prompt_caching_ttl"]["field_value"] == "1h"
@@ -11557,7 +11555,6 @@ def test_get_config_list_includes_anthropic_prompt_caching_fields(monkeypatch):
 
         # Both caching fields carry their sub-tab so the Admin UI can render them on a
         # dedicated Prompt Caching tab, while ungrouped fields stay on General.
-        assert fields["enable_anthropic_prompt_caching"]["field_tab"] == "prompt_caching"
         assert fields["anthropic_prompt_caching_ttl"]["field_tab"] == "prompt_caching"
         assert fields["budget_exceeded_throttle_percentage"]["field_tab"] is None
 
@@ -11566,6 +11563,28 @@ def test_get_config_list_includes_anthropic_prompt_caching_fields(monkeypatch):
         assert fields["openai_system_messages_first"]["field_tab"] == "prompt_caching"
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_update_config_field_rejects_removed_prompt_caching_flag(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from fastapi import HTTPException
+
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy._types import ConfigFieldUpdate, LitellmUserRoles, UserAPIKeyAuth
+
+    monkeypatch.setattr(ps, "prisma_client", MagicMock())
+    admin = UserAPIKeyAuth(api_key="k", user_id="a", user_role=LitellmUserRoles.PROXY_ADMIN)
+    with pytest.raises(HTTPException) as exc:
+        await ps.update_config_general_settings(
+            data=ConfigFieldUpdate(
+                field_name="enable_anthropic_prompt_caching", field_value=False, config_type="general_settings"
+            ),
+            user_api_key_dict=admin,
+        )
+    assert exc.value.status_code == 400
+    assert exc.value.detail == {"error": "Invalid field=enable_anthropic_prompt_caching passed in."}
 
 
 def test_general_settings_ui_fields_are_db_overridable():
@@ -11734,7 +11753,7 @@ def test_general_settings_ui_defaults_unchanged_for_existing_fields():
         is None
     )
     assert (
-        _general_settings_ui_litellm_default(_GENERAL_SETTINGS_UI_LITELLM_FIELDS["enable_anthropic_prompt_caching"])
+        _general_settings_ui_litellm_default(_GENERAL_SETTINGS_UI_LITELLM_FIELDS["openai_system_messages_first"])
         is False
     )
     assert (
@@ -11746,7 +11765,6 @@ def test_general_settings_ui_defaults_unchanged_for_existing_fields():
 @pytest.mark.parametrize(
     "field_name, db_value",
     [
-        ("enable_anthropic_prompt_caching", True),
         ("anthropic_prompt_caching_ttl", "1h"),
         ("openai_system_messages_first", True),
     ],
@@ -11767,7 +11785,7 @@ def test_prompt_caching_settings_propagate_on_config_reload(monkeypatch, field_n
     assert getattr(litellm, field_name) == db_value
 
 
-def test_get_config_list_marks_untouched_prompt_caching_flag_as_not_set(monkeypatch):
+def test_get_config_list_marks_untouched_system_first_flag_as_not_set(monkeypatch):
     """The flag defaults to False rather than None, so a plain 'is not None' check would
     report the default as 'In Config' and imply an admin had set it."""
     import types
@@ -11784,7 +11802,7 @@ def test_get_config_list_marks_untouched_prompt_caching_flag_as_not_set(monkeypa
     mock_config_table.find_first = AsyncMock(return_value=None)
     mock_prisma.db = types.SimpleNamespace(litellm_config=mock_config_table)
     monkeypatch.setattr(ps, "prisma_client", mock_prisma)
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", False)
+    monkeypatch.setattr(litellm, "openai_system_messages_first", False)
     app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
         user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
     )
@@ -11792,7 +11810,7 @@ def test_get_config_list_marks_untouched_prompt_caching_flag_as_not_set(monkeypa
         client = TestClient(app)
         resp = client.get("/config/list", params={"config_type": "general_settings"})
         fields = {item["field_name"]: item for item in resp.json()}
-        assert fields["enable_anthropic_prompt_caching"]["stored_in_db"] is None
+        assert fields["openai_system_messages_first"]["stored_in_db"] is None
     finally:
         app.dependency_overrides.clear()
 
@@ -11800,8 +11818,6 @@ def test_get_config_list_marks_untouched_prompt_caching_flag_as_not_set(monkeypa
 @pytest.mark.parametrize(
     "field_name, field_value",
     [
-        ("enable_anthropic_prompt_caching", True),
-        ("enable_anthropic_prompt_caching", False),
         ("anthropic_prompt_caching_ttl", "5m"),
         ("anthropic_prompt_caching_ttl", "1h"),
         ("openai_system_messages_first", True),
@@ -11849,8 +11865,6 @@ async def test_update_config_field_prompt_caching_persists_to_litellm_settings(m
 @pytest.mark.parametrize(
     "field_name, bad_value",
     [
-        ("enable_anthropic_prompt_caching", "yes"),
-        ("enable_anthropic_prompt_caching", 1),
         ("anthropic_prompt_caching_ttl", "10m"),
         ("anthropic_prompt_caching_ttl", "1H"),
         ("anthropic_prompt_caching_ttl", 3600),
@@ -11893,7 +11907,6 @@ async def test_update_config_field_prompt_caching_rejects_invalid(monkeypatch, f
 @pytest.mark.parametrize(
     "field_name, expected_default",
     [
-        ("enable_anthropic_prompt_caching", False),
         ("anthropic_prompt_caching_ttl", None),
         ("openai_system_messages_first", False),
         ("budget_exceeded_throttle_percentage", None),
@@ -12294,9 +12307,9 @@ async def test_ui_litellm_field_write_refuses_a_key_the_config_file_declares(mon
     from litellm.proxy.proxy_server import ProxyConfig, update_config_general_settings
 
     pc = ProxyConfig()
-    pc._load_yaml_settings_stores({"litellm_settings": {"enable_anthropic_prompt_caching": True}})
+    pc._load_yaml_settings_stores({"litellm_settings": {"openai_system_messages_first": True}})
+    monkeypatch.setattr(litellm, "openai_system_messages_first", True)
     monkeypatch.setattr(proxy_server_module, "proxy_config", pc)
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
 
     fake = _fake_prisma_with_config({})
     monkeypatch.setattr(proxy_server_module, "prisma_client", fake)
@@ -12305,14 +12318,14 @@ async def test_ui_litellm_field_write_refuses_a_key_the_config_file_declares(mon
     with pytest.raises(HTTPException) as excinfo:
         await update_config_general_settings(
             data=ConfigFieldUpdate(
-                field_name="enable_anthropic_prompt_caching", field_value=False, config_type="general_settings"
+                field_name="openai_system_messages_first", field_value=False, config_type="general_settings"
             ),
             user_api_key_dict=admin,
         )
 
     assert excinfo.value.status_code == 400
-    assert excinfo.value.detail["keys"] == ["enable_anthropic_prompt_caching"]
-    assert litellm.enable_anthropic_prompt_caching is True
+    assert excinfo.value.detail["keys"] == ["openai_system_messages_first"]
+    assert litellm.openai_system_messages_first is True
     fake.db.litellm_config.upsert.assert_not_awaited()
 
 
@@ -12322,19 +12335,19 @@ async def test_ui_litellm_field_reset_refuses_a_key_the_config_file_declares(mon
     from litellm.proxy.proxy_server import ProxyConfig, _reset_general_settings_ui_litellm_field
 
     pc = ProxyConfig()
-    pc._load_yaml_settings_stores({"litellm_settings": {"enable_anthropic_prompt_caching": True}})
+    pc._load_yaml_settings_stores({"litellm_settings": {"openai_system_messages_first": True}})
+    monkeypatch.setattr(litellm, "openai_system_messages_first", True)
     monkeypatch.setattr(proxy_server_module, "proxy_config", pc)
-    monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
 
     fake = _fake_prisma_with_config({})
     monkeypatch.setattr(proxy_server_module, "prisma_client", fake)
 
     admin = UserAPIKeyAuth(api_key="hashed-admin", user_id="admin-1", user_role=LitellmUserRoles.PROXY_ADMIN)
     with pytest.raises(HTTPException) as excinfo:
-        await _reset_general_settings_ui_litellm_field("enable_anthropic_prompt_caching", admin)
+        await _reset_general_settings_ui_litellm_field("openai_system_messages_first", admin)
 
     assert excinfo.value.status_code == 400
-    assert litellm.enable_anthropic_prompt_caching is True
+    assert litellm.openai_system_messages_first is True
 
 
 @pytest.mark.asyncio

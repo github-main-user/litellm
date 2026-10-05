@@ -570,10 +570,8 @@ async def test_anthropic_cache_control_hook_out_of_bounds(bad_index, monkeypatch
             request_body = json.loads(mock_post.call_args.kwargs["data"])
 
             # Assert that NO cache control was applied to any message
-            for msg in request_body["messages"]:
-                content = msg.get("content", [])
-                if isinstance(content, list):
-                    assert not any("cachePoint" in item for item in content if isinstance(item, dict))
+            assert messages == [{"role": "user", "content": "Message 1"}, {"role": "user", "content": "Message 2"}]
+            assert any("cachePoint" in item for item in request_body["messages"][-1]["content"])
 
 
 @pytest.mark.asyncio
@@ -707,6 +705,7 @@ async def test_anthropic_cache_control_hook_no_op(monkeypatch: pytest.MonkeyPatc
                 model="bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
                 messages=messages,
                 # No cache_control_injection_points parameter
+                cache_control={"type": "ephemeral"},
                 client=client,
             )
 
@@ -1551,8 +1550,8 @@ class TestApplyToAnthropicMessagesRequest:
         assert total_blocks <= 4
 
 
-class TestEnableAnthropicPromptCaching:
-    """Auto-injected default breakpoints via litellm.enable_anthropic_prompt_caching."""
+class TestAutomaticAnthropicPromptCaching:
+    """Auto-injected default breakpoints for supported Claude models."""
 
     MESSAGES: List[AllMessageValues] = [
         {"role": "system", "content": "a long system prompt"},
@@ -1570,28 +1569,28 @@ class TestEnableAnthropicPromptCaching:
             tools=tools,
         )
 
-    def test_disabled_by_default(self):
-        assert litellm.enable_anthropic_prompt_caching is False
-        assert self._points() == []
+    def test_enabled_by_default(self):
+        assert [point["index"] for point in self._points()] == [None, -1]
 
     def test_injects_system_and_trailing_turn(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert self._points() == [
             {"location": "message", "role": "system", "index": None, "control": {"type": "ephemeral"}},
             {"location": "message", "role": None, "index": -1, "control": {"type": "ephemeral"}},
         ]
 
     def test_bedrock_claude_is_injected(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         points = self._points(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0", provider="bedrock")
         assert [p["index"] for p in points] == [None, -1]
 
     @pytest.mark.parametrize("model, provider", [("gpt-4o", "openai"), ("gemini-2.0-flash", "gemini")])
-    def test_non_anthropic_providers_never_injected(self, monkeypatch, model, provider):
+    def test_non_anthropic_providers_never_injected(self, monkeypatch, local_model_cost_map, model, provider):
         """These report supports_prompt_caching=True but never consume cache_control markers."""
         from litellm.utils import supports_prompt_caching
 
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
+        monkeypatch.setitem(litellm.model_cost, model, {
+            "litellm_provider": provider, "mode": "chat", "supports_prompt_caching": True,
+        })
+        monkeypatch.setitem(litellm.model_cost, f"{provider}/{model}", litellm.model_cost[model])
         assert supports_prompt_caching(model=model, custom_llm_provider=provider) is True
         assert self._points(model=model, provider=provider) == []
 
@@ -1610,17 +1609,16 @@ class TestEnableAnthropicPromptCaching:
         entry = {"litellm_provider": provider, "mode": "chat", "supports_prompt_caching": supported}
         monkeypatch.setitem(litellm.model_cost, model, entry)
         monkeypatch.setitem(litellm.model_cost, qualified, entry)
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", False)
         target = qualified if infer_provider else model
         resolved_provider = None if infer_provider else provider
         assert supports_prompt_caching(model=target, custom_llm_provider=resolved_provider) is supported
         points = AnthropicCacheControlHook.get_default_injection_points(
             messages=copy.deepcopy(self.MESSAGES), system=None, model=target,
-            custom_llm_provider=resolved_provider, enable_prompt_caching=True,
+            custom_llm_provider=resolved_provider,
         )
         assert [point["index"] for point in points] == ([None, -1] if supported else [])
         affinity_messages = AnthropicCacheControlHook.messages_with_default_injections(
-            copy.deepcopy(self.MESSAGES), models=[qualified], enable_prompt_caching=True,
+            copy.deepcopy(self.MESSAGES), models=[qualified],
         )
         assert sum(AnthropicCacheControlHook._count_cache_control_blocks(m) for m in affinity_messages) == (2 if supported else 0)
 
@@ -1643,7 +1641,6 @@ class TestEnableAnthropicPromptCaching:
         entry = {"litellm_provider": provider, "mode": "chat", "supports_prompt_caching": True}
         monkeypatch.setitem(litellm.model_cost, model, entry)
         monkeypatch.setitem(litellm.model_cost, qualified, entry)
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert supports_prompt_caching(model=model, custom_llm_provider=provider)
         assert self._points(model=model, provider=provider) == []
         assert self._points(model=qualified, provider=None) == []
@@ -1657,7 +1654,6 @@ class TestEnableAnthropicPromptCaching:
         from litellm.llms.vertex_ai.vertex_ai_partner_models.anthropic.transformation import VertexAIAnthropicConfig
 
         model = "claude-sonnet-5"
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         monkeypatch.setitem(litellm.model_cost, f"{provider}/{model}", {
             **litellm.model_cost[f"{provider}/{model}"], "supports_prompt_caching": True,
         })
@@ -1721,7 +1717,6 @@ class TestEnableAnthropicPromptCaching:
         import httpx
         from litellm.llms.custom_httpx.http_handler import HTTPHandler
 
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         monkeypatch.setattr(litellm, "model_alias_map", {model: target} if target else {})
         for qualified in (model, target):
             if qualified:
@@ -1770,13 +1765,11 @@ class TestEnableAnthropicPromptCaching:
     def test_databricks_claude_not_injected_despite_caching_support(self, monkeypatch, local_model_cost_map):
         from litellm.utils import supports_prompt_caching
 
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         model = "databricks/databricks-claude-sonnet-4-5"
         assert supports_prompt_caching(model=model, custom_llm_provider="databricks") is True
         assert self._points(model=model, provider="databricks") == []
 
     def test_model_without_caching_support_not_injected(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert self._points(model="anthropic.claude-3-5-sonnet-20240620-v1:0", provider="bedrock") == []
 
     @pytest.mark.parametrize("model", ["us.xai.grok-4.6", "global.xai.grok-4.6"])
@@ -1787,14 +1780,12 @@ class TestEnableAnthropicPromptCaching:
         false, while implicit cache hits still bill at the cache-read rate."""
         from litellm.utils import supports_prompt_caching
 
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert supports_prompt_caching(model=model, custom_llm_provider="bedrock") is False
         assert self._points(model=model, provider="bedrock") == []
         entry = litellm.model_cost[model]
         assert 0 < entry["cache_read_input_token_cost"] < entry["input_cost_per_token"]
 
     def test_stands_down_when_client_sent_cache_control(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = [
             {"role": "system", "content": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]},
             {"role": "user", "content": "latest turn"},
@@ -1802,7 +1793,6 @@ class TestEnableAnthropicPromptCaching:
         assert self._points(messages=messages) == []
 
     def test_stands_down_when_system_block_has_cache_control(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         system = [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]
         assert self._points(messages=[{"role": "user", "content": "hi"}], system=system) == []
 
@@ -1817,29 +1807,24 @@ class TestEnableAnthropicPromptCaching:
         """Caching just the tool definitions is a normal client pattern, and those
         breakpoints count toward the provider's four-block limit. Three of them plus
         our two would be five, which Anthropic rejects outright."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert self._points(tools=self._tools(3, cached=True)) == []
 
     def test_injects_when_tools_carry_no_cache_control(self, monkeypatch):
         """Tools alone must not suppress injection; only client-marked ones do."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert [p["index"] for p in self._points(tools=self._tools(3, cached=False))] == [None, -1]
 
     @pytest.mark.parametrize("tools", [None, []])
     def test_absent_tools_do_not_suppress_injection(self, monkeypatch, tools):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert [p["index"] for p in self._points(tools=tools)] == [None, -1]
 
     def test_stands_down_when_tool_function_carries_cache_control(self, monkeypatch):
         """OpenAI-shaped tools nest cache_control under ``function``; the Anthropic
         chat transform honors that location, so the stand-down must see it too."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         tools = [{"type": "function", "function": {"name": "t", "parameters": {}, "cache_control": {"type": "ephemeral"}}}]
         assert self._points(tools=tools) == []
 
     def test_seed_stands_down_when_only_tools_carry_cache_control(self, monkeypatch):
         """Same guard on the /chat/completions seeding path."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         params: dict = {}
         AnthropicCacheControlHook.maybe_seed_default_injection_points(
             non_default_params=params,
@@ -1852,12 +1837,11 @@ class TestEnableAnthropicPromptCaching:
 
     def test_v1_messages_stands_down_when_only_tools_carry_cache_control(self, monkeypatch):
         """Same guard on the /v1/messages path, where tools reach the hook directly."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         result_msgs, result_sys = AnthropicCacheControlHook.maybe_inject_cache_control(
             copy.deepcopy(messages),
             "sys",
-            {},
+            {"enable_prompt_caching": False},
             model="claude-sonnet-4-5",
             custom_llm_provider="anthropic",
             tools=self._tools(3, cached=True),
@@ -1866,17 +1850,14 @@ class TestEnableAnthropicPromptCaching:
         assert result_msgs == messages
 
     def test_default_ttl_is_anthropics_five_minute_cache(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         assert all(p["control"] == {"type": "ephemeral"} for p in self._points())
 
     @pytest.mark.parametrize("ttl", ["5m", "1h"])
     def test_ttl_override_applied(self, monkeypatch, ttl):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         monkeypatch.setattr(litellm, "anthropic_prompt_caching_ttl", ttl)
         assert all(p["control"] == {"type": "ephemeral", "ttl": ttl} for p in self._points())
 
     def test_seed_does_not_override_configured_points(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         configured = [{"location": "message", "role": "user", "index": 0}]
         params = {"cache_control_injection_points": configured}
         AnthropicCacheControlHook.maybe_seed_default_injection_points(
@@ -1888,7 +1869,6 @@ class TestEnableAnthropicPromptCaching:
         assert params["cache_control_injection_points"] is configured
 
     def test_seed_adds_defaults_when_enabled(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         params: dict = {}
         AnthropicCacheControlHook.maybe_seed_default_injection_points(
             non_default_params=params,
@@ -1898,18 +1878,18 @@ class TestEnableAnthropicPromptCaching:
         )
         assert [p["index"] for p in params["cache_control_injection_points"]] == [None, -1]
 
-    def test_seed_is_noop_when_disabled(self):
+    def test_seed_is_automatic_even_with_a_false_per_key_setting(self):
         params: dict = {}
         AnthropicCacheControlHook.maybe_seed_default_injection_points(
             non_default_params=params,
             messages=copy.deepcopy(self.MESSAGES),
             model="claude-sonnet-4-5",
             custom_llm_provider="anthropic",
+            enable_prompt_caching=False,
         )
-        assert params == {}
+        assert [p["index"] for p in params["cache_control_injection_points"]] == [None, -1]
 
     def test_v1_messages_applies_defaults_end_to_end(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = [
             {"role": "user", "content": [{"type": "text", "text": "first"}]},
             {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
@@ -1933,7 +1913,6 @@ class TestEnableAnthropicPromptCaching:
         the request is sent. Marking in place would leak litellm's breakpoints into the caller's
         messages, where the real injection pass later reads them back as client-supplied ones.
         """
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = copy.deepcopy(self.MESSAGES)
         before = copy.deepcopy(messages)
 
@@ -1980,7 +1959,6 @@ class TestClaudeCodeOneShotAutoCaching:
     )
     @pytest.mark.parametrize("tools", [None, []], ids=["absent_tools", "empty_tools"])
     def test_skips_defaults_and_attribution_for_one_shot_subagent(self, monkeypatch, system, tools):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = copy.deepcopy(self.MESSAGES)
         kwargs = self._kwargs()
 
@@ -1998,7 +1976,6 @@ class TestClaudeCodeOneShotAutoCaching:
         assert "litellm_gateway_injected_cache" not in kwargs["litellm_metadata"]
 
     def test_user_agent_header_lookup_is_case_insensitive(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs = self._kwargs()
         user_agent = kwargs["proxy_server_request"]["headers"].pop("user-agent")
         kwargs["proxy_server_request"]["headers"]["User-Agent"] = user_agent
@@ -2015,7 +1992,6 @@ class TestClaudeCodeOneShotAutoCaching:
         assert result_system == self.BILLING_SYSTEM
 
     def test_router_affinity_skips_string_billing_system(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         messages = copy.deepcopy(self.MESSAGES)
         kwargs = self._kwargs()
         kwargs["system"] = self.BILLING_TEXT
@@ -2046,7 +2022,6 @@ class TestClaudeCodeOneShotAutoCaching:
         ids=["malformed_headers", "malformed_billing", "missing_system", "malformed_block", "non_text_block"],
     )
     def test_malformed_untrusted_context_keeps_defaults(self, monkeypatch, headers, system):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
 
         points = AnthropicCacheControlHook.get_default_injection_points(
             messages=copy.deepcopy(self.MESSAGES),
@@ -2059,7 +2034,6 @@ class TestClaudeCodeOneShotAutoCaching:
         assert len(points) == 2
 
     def test_message_without_role_keeps_defaults(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
 
         points = AnthropicCacheControlHook.get_default_injection_points(
             messages=[{"content": "missing role"}],
@@ -2093,7 +2067,6 @@ class TestClaudeCodeOneShotAutoCaching:
         ids=["tools", "real_system", "history"],
     )
     def test_keeps_defaults_for_reusable_subagents(self, monkeypatch, messages, system, tools):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs = self._kwargs()
 
         result_messages, result_system = AnthropicCacheControlHook.maybe_inject_cache_control(
@@ -2134,7 +2107,6 @@ class TestClaudeCodeOneShotAutoCaching:
         ids=["different_client", "appended_instructions", "not_a_subagent"],
     )
     def test_ambiguous_or_unmatched_signals_fail_open(self, monkeypatch, user_agent, system):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs = self._kwargs()
         kwargs["proxy_server_request"]["headers"]["user-agent"] = user_agent
 
@@ -2149,7 +2121,6 @@ class TestClaudeCodeOneShotAutoCaching:
         assert AnthropicCacheControlHook.count_request_cache_breakpoints(result_messages, result_system) == 2
 
     def test_explicit_injection_points_remain_authoritative(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs = self._kwargs([{"location": "message", "role": "user"}])
 
         result_messages, _ = AnthropicCacheControlHook.maybe_inject_cache_control(
@@ -2164,7 +2135,7 @@ class TestClaudeCodeOneShotAutoCaching:
 
 
 class TestPerKeyEnablePromptCaching:
-    """Per-request enable_prompt_caching override (stamped from key metadata) with the global flag off."""
+    """Per-request enable_prompt_caching override stamped from key metadata."""
 
     MESSAGES: List[AllMessageValues] = [
         {"role": "system", "content": "a long system prompt"},
@@ -2180,20 +2151,28 @@ class TestPerKeyEnablePromptCaching:
             enable_prompt_caching=enable_prompt_caching,
         )
 
-    def test_true_injects_with_global_flag_off(self):
-        assert litellm.enable_anthropic_prompt_caching is False
+    def test_true_injects(self):
         assert self._points(True) == [
             {"location": "message", "role": "system", "index": None, "control": {"type": "ephemeral"}},
             {"location": "message", "role": None, "index": -1, "control": {"type": "ephemeral"}},
         ]
 
-    @pytest.mark.parametrize("enable_prompt_caching", [False, None])
-    def test_false_and_none_fall_back_to_global_flag(self, enable_prompt_caching):
-        assert self._points(enable_prompt_caching) == []
+    def test_false_does_not_disable_automatic_injection(self):
+        assert self._points(False) == self._points(True)
 
-    def test_false_does_not_suppress_global_flag(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
-        assert [p["index"] for p in self._points(False)] == [None, -1]
+    def test_none_uses_default_injection(self):
+        assert [p["index"] for p in self._points(None)] == [None, -1]
+
+    def test_affinity_messages_are_automatic_even_with_a_false_per_key_setting(self):
+        messages = copy.deepcopy(self.MESSAGES)
+        result = AnthropicCacheControlHook.messages_with_default_injections(
+            messages, ["anthropic/claude-sonnet-4-5"], enable_prompt_caching=False
+        )
+        assert result == AnthropicCacheControlHook.messages_with_default_injections(
+            messages, ["anthropic/claude-sonnet-4-5"]
+        )
+        assert result != messages
+        assert messages == self.MESSAGES
 
     def test_provider_gate_still_applies(self):
         assert self._points(True, model="gpt-4o", provider="openai") == []
@@ -2208,7 +2187,7 @@ class TestPerKeyEnablePromptCaching:
         ]
         assert self._points(True, messages=messages) == []
 
-    def test_seed_injects_with_global_flag_off(self):
+    def test_seed_injects_when_enabled(self):
         params: dict = {}
         AnthropicCacheControlHook.maybe_seed_default_injection_points(
             non_default_params=params,
@@ -2243,18 +2222,19 @@ class TestPerKeyEnablePromptCaching:
         )
         assert "enable_prompt_caching" not in kwargs
 
-    def test_v1_messages_is_noop_when_disabled(self):
+    def test_v1_messages_are_automatic_even_with_a_false_per_key_setting(self):
         messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         result_msgs, result_sys = AnthropicCacheControlHook.maybe_inject_cache_control(
             messages,
             "sys",
-            {},
+            {"enable_prompt_caching": False},
             model="claude-sonnet-4-5",
             custom_llm_provider="anthropic",
         )
 
-        assert result_sys == "sys"
-        assert result_msgs == messages
+        assert result_sys == [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]
+        assert result_msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert messages == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
 
 
 class TestConfiguredInjectionPointsStandDown:
@@ -2369,7 +2349,6 @@ class TestConfiguredInjectionPointsStandDown:
         ids=["automatic_defaults", "configured_points"],
     )
     def test_v1_messages_stands_down_for_root_cache_control(self, monkeypatch, configured):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         root_cache_control = {"type": "ephemeral"}
         kwargs = {"cache_control": root_cache_control, "litellm_metadata": {}}
         if configured is not None:
@@ -2402,9 +2381,9 @@ class TestConfiguredInjectionPointsStandDown:
 
 
 class TestAnthropicPromptCachingEnvVars:
-    """Both settings are read from the environment at import, so an admin can enable
-    auto-caching without a config file. Each case re-imports litellm in a subprocess
-    so the env is read fresh without contaminating this process's module graph.
+    """The TTL is read from the environment at import and auto-caching is always on.
+    Each case re-imports litellm in a subprocess so the env is read fresh without
+    contaminating this process's module graph.
     """
 
     @staticmethod
@@ -2416,7 +2395,12 @@ class TestAnthropicPromptCachingEnvVars:
         script = textwrap.dedent(
             """
             import json, litellm
-            print(json.dumps([litellm.enable_anthropic_prompt_caching, litellm.anthropic_prompt_caching_ttl]))
+            from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+            points = AnthropicCacheControlHook.get_default_injection_points(
+                messages=[{"role": "user", "content": "hello"}], system=None,
+                model="claude-sonnet-4-5", custom_llm_provider="anthropic",
+            )
+            print(json.dumps([bool(points), litellm.anthropic_prompt_caching_ttl]))
             """
         )
         result = subprocess.run(
@@ -2426,18 +2410,18 @@ class TestAnthropicPromptCachingEnvVars:
         enabled, ttl = json.loads(result.stdout.strip().splitlines()[-1])
         return enabled, ttl
 
-    def test_unset_env_leaves_auto_caching_off(self):
-        assert self._import_litellm_with_env({}) == (False, None)
+    def test_unset_env_uses_auto_caching_with_default_ttl(self):
+        assert self._import_litellm_with_env({}) == (True, None)
 
     @pytest.mark.parametrize("value", ["true", "True", "TRUE"])
-    def test_env_enables_auto_caching_case_insensitively(self, value):
+    def test_legacy_true_env_does_not_change_auto_caching(self, value):
         enabled, _ = self._import_litellm_with_env({"LITELLM_ENABLE_ANTHROPIC_PROMPT_CACHING": value})
         assert enabled is True
 
     @pytest.mark.parametrize("value", ["false", "0", "yes", ""])
-    def test_env_only_enables_on_true(self, value):
+    def test_legacy_false_env_does_not_disable_auto_caching(self, value):
         enabled, _ = self._import_litellm_with_env({"LITELLM_ENABLE_ANTHROPIC_PROMPT_CACHING": value})
-        assert enabled is False
+        assert enabled is True
 
     @pytest.mark.parametrize("value", ["5m", "1h"])
     def test_ttl_env_is_applied(self, value):
@@ -3270,7 +3254,6 @@ class TestRecordGatewayInjection:
         assert kwargs["litellm_metadata"][self.KEY] == self.DEPLOYMENT
 
     def test_v1_messages_auto_injection_stamps_the_marker(self, monkeypatch):
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs: dict = {"litellm_metadata": {}, "model_info": {"id": self.DEPLOYMENT}}
         result_msgs, result_sys = AnthropicCacheControlHook.maybe_inject_cache_control(
             [{"role": "user", "content": "latest turn"}],
@@ -3283,7 +3266,6 @@ class TestRecordGatewayInjection:
 
     def test_v1_messages_stand_down_leaves_no_marker(self, monkeypatch):
         """Client-supplied cache_control means the gateway did nothing to credit."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs: dict = {"litellm_metadata": {}}
         AnthropicCacheControlHook.maybe_inject_cache_control(
             [
@@ -3303,7 +3285,6 @@ class TestRecordGatewayInjection:
     def test_v1_messages_reentry_keeps_the_marker(self, monkeypatch):
         """A second pass over already-injected messages computes a zero delta, which must
         leave the first pass's mark standing rather than reading as no injection."""
-        monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
         kwargs: dict = {"litellm_metadata": {}, "model_info": {"id": self.DEPLOYMENT}}
         messages = [{"role": "user", "content": "latest turn"}]
         first_msgs, first_sys = AnthropicCacheControlHook.maybe_inject_cache_control(

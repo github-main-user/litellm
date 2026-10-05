@@ -674,21 +674,14 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         cache_control: object = None,
         request_kwargs: object = None,
     ) -> list[CacheControlInjectionPoint]:
-        """Default breakpoints when ``litellm.enable_anthropic_prompt_caching`` is on.
+        """Default breakpoints for supported Claude models.
 
-        ``enable_prompt_caching`` is the per-request override (stamped from key
-        metadata by the proxy); True turns auto-injection on for this request
-        even when the global flag is off. Caches the system prompt and the
-        trailing turn, so the stable prefix (system + tools + history) is
-        reused while the breakpoint advances with the conversation. Returns []
-        (stand down) when neither flag is on, the model is not Claude on a
-        supported explicit-cache transport, the model lacks prompt-caching
+        Caches the system prompt and the trailing turn, so the stable prefix
+        (system + tools + history) is reused while the breakpoint advances with
+        the conversation. Returns [] (stand down) when the model is not Claude
+        on a supported explicit-cache transport, the model lacks prompt-caching
         support, or the request already carries client-supplied cache_control.
         """
-        import litellm
-
-        if litellm.enable_anthropic_prompt_caching is not True and enable_prompt_caching is not True:
-            return []
 
         if not supports_anthropic_cache_control(model, custom_llm_provider):
             return []
@@ -901,10 +894,8 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         its own cache_control breakpoints anywhere in the request. The
         judgment happens once per request; points a prior pass wrote back
         carry the judged stamp and are never re-judged (see
-        ``_should_stand_down``). When none are configured but
-        ``litellm.enable_anthropic_prompt_caching`` or the per-request
-        ``enable_prompt_caching`` kwarg (stamped from key metadata) is on,
-        synthesize default breakpoints for the native /v1/messages path. Pops
+        ``_should_stand_down``). When none are configured, synthesize default
+        breakpoints for the native /v1/messages path. Pops
         both keys from kwargs;
         if remaining (non-message) points exist they are written back so
         downstream transforms can handle them.

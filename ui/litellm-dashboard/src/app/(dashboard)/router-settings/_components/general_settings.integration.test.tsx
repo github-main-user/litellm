@@ -27,15 +27,6 @@ const SETTINGS_FIXTURE = [
     field_default_value: null,
   },
   {
-    field_name: "enable_anthropic_prompt_caching",
-    field_type: "Boolean",
-    field_value: true,
-    field_description: "prompt caching toggle",
-    stored_in_db: true,
-    field_tab: "prompt_caching",
-    field_default_value: false,
-  },
-  {
     field_name: "anthropic_prompt_caching_ttl",
     field_type: "Select",
     field_value: "5m",
@@ -130,6 +121,20 @@ describe("GeneralSettings Prompt Caching tab", () => {
     expect(toggle).toBeChecked();
     expect(updateConfigFieldSetting).toHaveBeenCalledWith("token", "openai_system_messages_first", true);
     expect(deleteConfigFieldSetting).not.toHaveBeenCalled();
+  });
+
+  it("edits the cache lifetime without an enable toggle", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<GeneralSettings accessToken="token" userRole="Admin" userID="user" />);
+
+    await user.click(await screen.findByRole("tab", { name: "Prompt Caching" }));
+    const lifetime = await screen.findByRole("combobox");
+    expect(lifetime).toBeEnabled();
+    expect(screen.queryByText("Automatic Anthropic prompt caching")).not.toBeInTheDocument();
+    await user.click(lifetime);
+    await user.click(await screen.findByRole("option", { name: "1h" }));
+
+    expect(updateConfigFieldSetting).toHaveBeenCalledWith("token", "anthropic_prompt_caching_ttl", "1h");
   });
 
   it("keeps the prompt caching rows off the General tab table", async () => {

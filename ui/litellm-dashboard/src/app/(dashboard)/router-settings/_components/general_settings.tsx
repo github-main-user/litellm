@@ -16,7 +16,6 @@ import Fallbacks from "@/components/Settings/RouterSettings/Fallbacks/Fallbacks"
 import RoutingGroups from "@/components/routing_groups";
 
 const PROMPT_CACHING_TAB = "prompt_caching";
-const ENABLE_ANTHROPIC_PROMPT_CACHING = "enable_anthropic_prompt_caching";
 const ANTHROPIC_PROMPT_CACHING_TTL = "anthropic_prompt_caching_ttl";
 const OPENAI_SYSTEM_MESSAGES_FIRST = "openai_system_messages_first";
 
@@ -139,17 +138,14 @@ export const PromptCachingPanel: React.FC<{
   settings: generalSettingsItem[];
   onChange: (fieldName: string, newValue: any) => void;
 }> = ({ accessToken, settings, onChange }) => {
-  const enableSetting = settings.find((s) => s.field_name === ENABLE_ANTHROPIC_PROMPT_CACHING);
   const ttlSetting = settings.find((s) => s.field_name === ANTHROPIC_PROMPT_CACHING_TTL);
   const systemFirstSetting = settings.find((s) => s.field_name === OPENAI_SYSTEM_MESSAGES_FIRST);
 
   // The rows come from the same registry the General tab reads; if they
   // are not loaded yet there is nothing to render.
-  if (!enableSetting) {
+  if (!ttlSetting && !systemFirstSetting) {
     return null;
   }
-
-  const enabled = isOn(enableSetting.field_value);
 
   // Apply immediately: a toggle and a dropdown are direct controls, so there is
   // no separate Update button. Clearing the ttl resets it to the provider default.
@@ -167,22 +163,13 @@ export const PromptCachingPanel: React.FC<{
       <CardContent>
         <CardTitle>Prompt Caching</CardTitle>
 
-        <div className="mt-6 flex items-start justify-between gap-8">
-          <div className="min-w-0 max-w-2xl">
-            <p className="font-medium">Automatic Anthropic prompt caching</p>
-            <p className="mt-1 break-words text-xs text-muted-foreground">{enableSetting.field_description}</p>
-          </div>
-          <Switch checked={enabled} onCheckedChange={(checked) => persist(ENABLE_ANTHROPIC_PROMPT_CACHING, checked)} />
-        </div>
-
         {ttlSetting && (
           <div className="mt-6 flex items-start justify-between gap-8">
             <div className="min-w-0 max-w-2xl">
-              <p className={`font-medium ${enabled ? "" : "text-muted-foreground"}`}>Cache lifetime (TTL)</p>
+              <p className="font-medium">Cache lifetime (TTL)</p>
               <p className="mt-1 break-words text-xs text-muted-foreground">{ttlSetting.field_description}</p>
             </div>
             <Select
-              disabled={!enabled}
               value={ttlSetting.field_value ?? null}
               onValueChange={(newValue) => persist(ANTHROPIC_PROMPT_CACHING_TTL, newValue)}
             >
