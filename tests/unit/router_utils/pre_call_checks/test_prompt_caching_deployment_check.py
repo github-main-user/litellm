@@ -395,6 +395,47 @@ async def test_cache_reuses_stable_boundaries_but_prefers_the_longest_prefix(asy
     assert (first, next_turn) == original
 
 
+def test_implicit_cache_key_tracks_the_first_turn_and_tools_without_mutating_history():
+    messages: Final = cast(
+        list[AllMessageValues],
+        [
+            {"role": "system", "content": "Shared instructions"},
+            {"role": "user", "content": "Initial question"},
+        ],
+    )
+    original: Final = copy.deepcopy(messages)
+    key: Final = PromptCachingCache.implicit_prompt_cache_key(messages, None)
+    assert key is not None
+    assert len(key) == 64
+    assert (
+        PromptCachingCache.implicit_prompt_cache_key(
+            [*messages, {"role": "assistant", "content": "Answer"}, {"role": "user", "content": "Follow-up"}], None
+        )
+        == key
+    )
+    assert (
+        PromptCachingCache.implicit_prompt_cache_key(
+            [{"role": "system", "content": "Different instructions"}, messages[1]], None
+        )
+        != key
+    )
+    assert (
+        PromptCachingCache.implicit_prompt_cache_key(
+            [messages[0], {"role": "user", "content": "Different question"}], None
+        )
+        != key
+    )
+    assert (
+        PromptCachingCache.implicit_prompt_cache_key(
+            messages,
+            [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}],
+        )
+        != key
+    )
+    assert PromptCachingCache.implicit_prompt_cache_key([], None) is None
+    assert messages == original
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_cache", [False, True])
 async def test_message_boundary_outweighs_an_earlier_block_boundary(async_cache):
@@ -604,8 +645,18 @@ async def test_short_prompt_does_not_pin_a_prompt_cache_key():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(monkeypatch, respx_mock, stream):
+@pytest.mark.parametrize(
+    "model, stream, cache_key",
+    [
+        ("openai/gpt-6.1", False, "test-conversation"),
+        ("openai/gpt-6.1", True, "test-conversation"),
+        ("chatgpt/gpt-5.6-luna", True, "test-conversation"),
+        ("chatgpt/gpt-5.6-luna", True, None),
+    ],
+)
+async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(
+    monkeypatch, respx_mock, model, stream, cache_key
+):
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     monkeypatch.setattr(litellm, "callbacks", [])
     monkeypatch.setattr(litellm, "success_callback", [])
@@ -614,7 +665,7 @@ async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(
         {
             "model_name": MODEL_GROUP_ALIAS,
             "litellm_params": {
-                "model": "openai/gpt-6.1",
+                "model": model,
                 "api_key": "sk-fake",
                 "api_base": f"https://{name}.example.test/v1",
             },
@@ -645,7 +696,7 @@ async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(
     request: Final = {
         "model": MODEL_GROUP_ALIAS,
         "input": "word " * 2000,
-        "prompt_cache_key": "test-conversation",
+        **({"prompt_cache_key": cache_key} if cache_key else {}),
         "stream": stream,
     }
     first_response: Final = await router.aresponses(**request)
@@ -653,14 +704,25 @@ async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(
         async for _ in first_response:
             pass
     first_host: Final = respx_mock.calls[-1].request.url.host
-    key: Final = _prompt_cache_affinity_key(MODEL_GROUP_ALIAS, request)
+    sent_key: Final = json.loads(respx_mock.calls[-1].request.content)["prompt_cache_key"]
+    key: Final = _prompt_cache_affinity_key(MODEL_GROUP_ALIAS, {"prompt_cache_key": sent_key})
     assert await _eventually(lambda: router.cache.get_cache(key=key)) is not None
     for turn in range(3):
-        response: Final = await router.aresponses(**{**request, "input": request["input"] + f" Next turn {turn}"})
+        response: Final = await router.aresponses(
+            **{
+                **request,
+                "input": [
+                    {"role": "user", "content": request["input"]},
+                    {"role": "assistant", "content": "OK"},
+                    {"role": "user", "content": f"Next turn {turn}"},
+                ],
+            }
+        )
         if stream:
             async for _ in response:
                 pass
         assert respx_mock.calls[-1].request.url.host == first_host
+        assert json.loads(respx_mock.calls[-1].request.content)["prompt_cache_key"] == sent_key
 
 
 @pytest.mark.asyncio

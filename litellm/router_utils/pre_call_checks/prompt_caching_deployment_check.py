@@ -4,6 +4,7 @@ Check if prompt caching is valid for a given deployment
 Route to previously cached model id, if valid
 """
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -20,7 +21,7 @@ from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.litellm_core_utils.token_counter import offload_token_count
 from litellm.llms.anthropic.common_utils import supports_anthropic_cache_control
 from litellm.llms.anthropic.experimental_pass_through.messages.utils import anthropic_system_to_openai_message
-from litellm.types.llms.openai import AllMessageValues
+from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import CallTypes, StandardLoggingPayload
 from litellm.utils import get_prompt_cache_min_tokens, is_prompt_caching_valid_prompt
 
@@ -144,6 +145,24 @@ class PromptCachingDeploymentCheck(CustomLogger):
         if request_kwargs is not None and request_kwargs.get("_target_order") is not None:
             return healthy_deployments
 
+        models: Final = tuple(
+            deployment["litellm_params"]["model"]
+            for deployment in healthy_deployments
+            if isinstance(deployment.get("litellm_params"), dict) and deployment["litellm_params"].get("model")
+        )
+        cache_messages: Final = _routing_prompt_caching_messages(messages, request_kwargs, models)
+        if (
+            request_kwargs is not None
+            and cache_messages
+            and _prompt_cache_affinity_key(model, request_kwargs) is None
+            and models
+            and all(candidate.startswith("chatgpt/") for candidate in models)
+        ):
+            request_kwargs["prompt_cache_key"] = await asyncio.to_thread(
+                self.prompt_cache.implicit_prompt_cache_key,
+                cache_messages,
+                cast(list[ChatCompletionToolParam] | None, request_kwargs.get("tools")),
+            )
         request_key: Final = _prompt_cache_affinity_key(model, request_kwargs)
         if request_key is not None:
             cached_model_id: Final = await self.cache.async_get_cache(key=request_key)
@@ -154,12 +173,6 @@ class PromptCachingDeploymentCheck(CustomLogger):
             if cached_deployment is not None:
                 return [cached_deployment]
 
-        models: Final = tuple(
-            deployment["litellm_params"]["model"]
-            for deployment in healthy_deployments
-            if isinstance(deployment.get("litellm_params"), dict) and deployment["litellm_params"].get("model")
-        )
-        cache_messages: Final = _routing_prompt_caching_messages(messages, request_kwargs, models)
         if cache_messages is None or not await offload_token_count(is_prompt_caching_valid_prompt)(
             messages=cache_messages,
             model=model,

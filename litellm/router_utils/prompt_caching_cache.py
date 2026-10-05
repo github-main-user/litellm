@@ -184,6 +184,23 @@ class PromptCachingCache:
         return f"deployment:{hashed_data}:prompt_caching"
 
     @staticmethod
+    def implicit_prompt_cache_key(
+        messages: list[AllMessageValues],
+        tools: list[ChatCompletionToolParam] | None,
+    ) -> str | None:
+        if not messages:
+            return None
+        first_turn_end: Final = next(
+            (index + 1 for index, message in enumerate(messages) if message.get("role") not in ("system", "developer")),
+            len(messages),
+        )
+        prefix: Final = {"messages": messages[:first_turn_end], "tools": tools}
+        serialized: Final = json.dumps(
+            prefix, sort_keys=True, separators=(",", ":"), default=PromptCachingCache.serialize_object
+        )
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    @staticmethod
     def _cacheable_prefixes(messages: list[AllMessageValues]) -> Iterator[list[AllMessageValues]]:
         for message_index, message in enumerate(messages):
             content: Final = message.get("content")
