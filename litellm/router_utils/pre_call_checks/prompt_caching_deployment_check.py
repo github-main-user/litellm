@@ -199,8 +199,13 @@ class PromptCachingDeploymentCheck(CustomLogger):
             )
             return
 
+        native_messages: Final = kwargs.get("_prompt_caching_messages")
         messages: Final = (
-            _with_anthropic_system(cast(list[AllMessageValues], logged_messages), kwargs.get("system"))
+            (
+                native_messages
+                if isinstance(native_messages, list)
+                else _with_anthropic_system(cast(list[AllMessageValues], logged_messages), kwargs.get("system"))
+            )
             if call_type == CallTypes.anthropic_messages.value
             else logged_messages
         )

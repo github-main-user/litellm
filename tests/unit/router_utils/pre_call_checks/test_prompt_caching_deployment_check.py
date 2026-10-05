@@ -13,6 +13,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.router_utils.pre_call_checks.prompt_caching_deployment_check import (
     PromptCachingDeploymentCheck,
     _get_min_token_count_for_deployments,
+    _routing_prompt_caching_messages,
 )
 from litellm.router_utils.prompt_caching_cache import PromptCachingCache
 from litellm.types.llms.openai import AllMessageValues
@@ -357,11 +358,12 @@ async def test_responses_auto_cached_prefix_reuses_completion_affinity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("subscription", [False, True])
 @pytest.mark.parametrize(
     "api, explicit_system", [("responses", False), ("anthropic_messages", False), ("anthropic_messages", True)]
 )
 async def test_router_reuses_the_deployment_that_cached_the_prompt(
-    monkeypatch, respx_mock, stream, api, explicit_system
+    monkeypatch, respx_mock, stream, subscription, api, explicit_system
 ):
     monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
@@ -373,7 +375,7 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
             "model_name": MODEL_GROUP_ALIAS,
             "litellm_params": {
                 "model": AUTO_CACHING_MODEL,
-                "api_key": "sk-fake",
+                "api_key": "sk-ant-oat-test" if subscription else "sk-fake",
                 "api_base": f"https://{model_id}.example.test",
             },
             "model_info": {"id": model_id},
@@ -431,12 +433,16 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
         async for _ in first_response:
             pass
     first_host: Final = respx_mock.calls[-1].request.url.host
-    wire_body: Final = json.loads(respx_mock.calls[-1].request.content)
     sent_messages: Final = (
-        [{"role": "system", "content": wire_body["system"]}, *wire_body["messages"]]
+        _routing_prompt_caching_messages(
+            cast(list[AllMessageValues], request["messages"]),
+            {**request, "call_type": "anthropic_messages"},
+            (AUTO_CACHING_MODEL,),
+        )
         if native
         else _affinity_messages(_auto_caching_messages())
     )
+    assert sent_messages is not None
     affinity_key: Final = PromptCachingCache.get_prompt_caching_cache_key(sent_messages, None)
     assert await _eventually(lambda: router.cache.get_cache(key=affinity_key)) is not None
     for _ in range(3):

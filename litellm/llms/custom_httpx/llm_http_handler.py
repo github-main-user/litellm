@@ -2389,9 +2389,17 @@ class BaseLLMHTTPHandler:
                     anthropic_messages_optional_request_params, path
                 )
 
+        from litellm.llms.anthropic.experimental_pass_through.messages.utils import anthropic_system_to_openai_message
         from litellm.llms.anthropic.subscription_tools import (
             ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY,
             tool_name_reverse_map,
+        )
+
+        cache_system_message: Final = anthropic_system_to_openai_message(
+            anthropic_messages_optional_request_params.get("system")
+        )
+        logging_obj.model_call_details["_prompt_caching_messages"] = (
+            [cache_system_message, *messages] if cache_system_message is not None else list(messages)
         )
 
         # Prepare request body
