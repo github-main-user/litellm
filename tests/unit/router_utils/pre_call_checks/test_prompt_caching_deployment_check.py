@@ -357,7 +357,12 @@ async def test_responses_auto_cached_prefix_reuses_completion_affinity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_router_responses_reuses_the_deployment_that_cached_the_prompt(monkeypatch, respx_mock, stream):
+@pytest.mark.parametrize(
+    "api, explicit_system", [("responses", False), ("anthropic_messages", False), ("anthropic_messages", True)]
+)
+async def test_router_reuses_the_deployment_that_cached_the_prompt(
+    monkeypatch, respx_mock, stream, api, explicit_system
+):
     monkeypatch.setattr(litellm, "enable_anthropic_prompt_caching", True)
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     monkeypatch.setattr(litellm, "callbacks", [])
@@ -404,22 +409,43 @@ async def test_router_responses_reuses_the_deployment_that_cached_the_prompt(mon
     )
     for deployment in deployments:
         respx_mock.post(f"{deployment['litellm_params']['api_base']}/v1/messages").respond(200, **response_body)
-    request: Final = {"model": MODEL_GROUP_ALIAS, "instructions": "word " * 3000, "input": "hello", "stream": stream}
-    first_response: Final = await router.aresponses(**request)
+    native: Final = api == "anthropic_messages"
+    call: Final = router.aanthropic_messages if native else router.aresponses
+    system: Final = (
+        [{"type": "text", "text": "word " * 3000, "cache_control": {"type": "ephemeral"}}]
+        if explicit_system
+        else "word " * 3000
+    )
+    request: Final = {
+        "model": MODEL_GROUP_ALIAS,
+        "stream": stream,
+        **(
+            {"system": system, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 16}
+            if native
+            else {"instructions": system, "input": "hello"}
+        ),
+    }
+    original: Final = copy.deepcopy(request)
+    first_response: Final = await call(**request)
     if stream:
         async for _ in first_response:
             pass
     first_host: Final = respx_mock.calls[-1].request.url.host
-    affinity_key: Final = PromptCachingCache.get_prompt_caching_cache_key(
-        _affinity_messages(_auto_caching_messages()), None
+    wire_body: Final = json.loads(respx_mock.calls[-1].request.content)
+    sent_messages: Final = (
+        [{"role": "system", "content": wire_body["system"]}, *wire_body["messages"]]
+        if native
+        else _affinity_messages(_auto_caching_messages())
     )
+    affinity_key: Final = PromptCachingCache.get_prompt_caching_cache_key(sent_messages, None)
     assert await _eventually(lambda: router.cache.get_cache(key=affinity_key)) is not None
     for _ in range(3):
-        response: Final = await router.aresponses(**request)
+        response: Final = await call(**request)
         if stream:
             async for _ in response:
                 pass
         assert respx_mock.calls[-1].request.url.host == first_host
+    assert request == original
 
 
 @pytest.mark.asyncio

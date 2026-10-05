@@ -5749,7 +5749,7 @@ class Router:
         """
         if call_type == "anthropic_messages":
             return await self._aanthropic_messages_with_streaming_fallbacks(
-                original_function=original_function, **kwargs
+                original_function=original_function, **{**kwargs, "call_type": call_type}
             )
         return await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
 

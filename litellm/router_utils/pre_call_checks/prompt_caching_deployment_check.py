@@ -4,7 +4,7 @@ Check if prompt caching is valid for a given deployment
 Route to previously cached model id, if valid
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Final, cast
 
 from litellm import verbose_logger
@@ -16,6 +16,8 @@ from litellm.integrations.anthropic_cache_control_hook import (
 )
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.litellm_core_utils.token_counter import offload_token_count
+from litellm.llms.anthropic.common_utils import supports_anthropic_cache_control
+from litellm.llms.anthropic.experimental_pass_through.messages.utils import anthropic_system_to_openai_message
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import CallTypes, StandardLoggingPayload
 from litellm.utils import get_prompt_cache_min_tokens, is_prompt_caching_valid_prompt
@@ -73,6 +75,36 @@ def _responses_prompt_caching_messages(
     )
 
 
+def _with_anthropic_system(messages: list[AllMessageValues], system: object) -> list[AllMessageValues]:
+    system_message: Final = anthropic_system_to_openai_message(system)
+    if system_message is None:
+        return messages
+    return [system_message, *(message for message in messages if message.get("role") != "system")]
+
+
+def _routing_prompt_caching_messages(
+    messages: list[AllMessageValues] | None,
+    request_kwargs: Mapping[str, object] | None,
+    models: Sequence[str],
+) -> list[AllMessageValues] | None:
+    if messages is None:
+        return _responses_prompt_caching_messages(request_kwargs)
+    if request_kwargs is None or request_kwargs.get("call_type") != CallTypes.anthropic_messages.value:
+        return messages
+
+    model: Final = next((model for model in models if supports_anthropic_cache_control(model, None)), None)
+    system: Final = request_kwargs.get("system")
+    tools: Final = request_kwargs.get("tools")
+    native_messages, native_system = AnthropicCacheControlHook.maybe_inject_cache_control(
+        messages=cast(list[dict[str, object]], messages),
+        system=system if isinstance(system, (str, list)) else None,
+        kwargs={key: value for key, value in request_kwargs.items() if key not in ("metadata", "litellm_metadata")},
+        model=model,
+        tools=tools if isinstance(tools, list) else None,
+    )
+    return _with_anthropic_system(cast(list[AllMessageValues], native_messages), native_system)
+
+
 class PromptCachingDeploymentCheck(CustomLogger):
     def __init__(self, cache: DualCache):
         self.cache = cache
@@ -88,7 +120,12 @@ class PromptCachingDeploymentCheck(CustomLogger):
         if request_kwargs is not None and request_kwargs.get("_target_order") is not None:
             return healthy_deployments
 
-        cache_messages: Final = messages if messages is not None else _responses_prompt_caching_messages(request_kwargs)
+        models: Final = tuple(
+            deployment["litellm_params"]["model"]
+            for deployment in healthy_deployments
+            if isinstance(deployment.get("litellm_params"), dict) and deployment["litellm_params"].get("model")
+        )
+        cache_messages: Final = _routing_prompt_caching_messages(messages, request_kwargs, models)
         if cache_messages is not None and await offload_token_count(is_prompt_caching_valid_prompt)(
             messages=cache_messages,
             model=model,
@@ -103,11 +140,7 @@ class PromptCachingDeploymentCheck(CustomLogger):
             ## be derived from the messages as they will be sent, not as they arrive here.
             affinity_messages: Final = AnthropicCacheControlHook.messages_with_default_injections(
                 messages=cache_messages,
-                models=(
-                    deployment["litellm_params"]["model"]
-                    for deployment in healthy_deployments
-                    if isinstance(deployment.get("litellm_params"), dict) and deployment["litellm_params"].get("model")
-                ),
+                models=models,
                 tools=(
                     cast(  # cast-ok: request_kwargs is untyped; the stand-down scan duck-types every tool it reads
                         list[AllToolParamValues] | None, request_kwargs.get("tools")
@@ -148,16 +181,14 @@ class PromptCachingDeploymentCheck(CustomLogger):
             and call_type != CallTypes.responses.value
             and call_type != CallTypes.aresponses.value
         ):  # only use prompt caching for completion calls
-            verbose_logger.debug(
-                "Skipping prompt cache affinity for unsupported call type: %s", call_type
-            )
+            verbose_logger.debug("Skipping prompt cache affinity for unsupported call type: %s", call_type)
             return
 
         model: Final = standard_logging_object["model"]
-        messages: Final = standard_logging_object["messages"]
+        logged_messages: Final = standard_logging_object["messages"]
         model_id: Final = standard_logging_object["model_id"]
 
-        if messages is None or not isinstance(messages, list):
+        if logged_messages is None or not isinstance(logged_messages, list):
             verbose_logger.debug(
                 "litellm.router_utils.pre_call_checks.prompt_caching_deployment_check: skipping adding model id to prompt caching cache, MESSAGES IS NOT A LIST"
             )
@@ -168,6 +199,11 @@ class PromptCachingDeploymentCheck(CustomLogger):
             )
             return
 
+        messages: Final = (
+            _with_anthropic_system(cast(list[AllMessageValues], logged_messages), kwargs.get("system"))
+            if call_type == CallTypes.anthropic_messages.value
+            else logged_messages
+        )
         ## PROMPT CACHING - cache model id, if prompt caching valid prompt + provider
         if await offload_token_count(is_prompt_caching_valid_prompt)(
             model=model,
