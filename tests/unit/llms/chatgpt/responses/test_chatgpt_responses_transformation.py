@@ -7,11 +7,12 @@ Source: litellm/llms/chatgpt/responses/transformation.py
 import json
 from collections.abc import Generator
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+import respx
 
 import litellm
 from litellm.exceptions import AuthenticationError
@@ -89,6 +90,87 @@ def test_chatgpt_preserves_input_items() -> None:
         {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
         {"type": "function_call_output", "call_id": "call_test", "output": "Done"},
     ]
+
+
+@pytest.mark.parametrize("api", ["responses", "chat"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("cache_key", [None, "stable-prompt-key"], ids=["omitted-key", "explicit-key"])
+async def test_chatgpt_prompt_cache_key_reaches_wire(
+    api: Literal["responses", "chat"],
+    asynchronous: bool,
+    cache_key: str | None,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    local_model_cost_map: None,
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    model: Final = "gpt-5.6-luna"
+    payload: Final = {
+        "id": "resp_cache",
+        "object": "response",
+        "created_at": 1700000000,
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_cache",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+            }
+        ],
+    }
+    upstream: Final = respx_mock.post("https://chatgpt.test/backend-api/codex/responses").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\ndata: [DONE]\n\n",
+        )
+    )
+    params: Final = {
+        "model": f"chatgpt/{model}",
+        "api_key": "managed-token",
+        "api_base": "https://chatgpt.test/backend-api/codex",
+        "chatgpt_auth_account_id": "managed-account",
+        "num_retries": 0,
+        **({"prompt_cache_key": cache_key} if cache_key is not None else {}),
+    }
+    if api == "responses":
+        if asynchronous:
+            await litellm.aresponses(input="Hello", instructions="Keep it brief.", **params)
+        else:
+            litellm.responses(input="Hello", instructions="Keep it brief.", **params)
+    else:
+        messages: Final = [
+            {"role": "system", "content": "Keep it brief."},
+            {"role": "user", "content": "Hello"},
+        ]
+        completion: Final = (
+            await litellm.acompletion(messages=messages, **params)
+            if asynchronous
+            else litellm.completion(messages=messages, **params)
+        )
+        assert completion.choices[0].message.content == "Hello!"
+
+    assert upstream.call_count == 1
+    request: Final = upstream.calls[0].request
+    assert request.url == httpx.URL("https://chatgpt.test/backend-api/codex/responses")
+    assert request.headers["authorization"] == "Bearer managed-token"
+    assert request.headers["chatgpt-account-id"] == "managed-account"
+    assert json.loads(request.content) == {
+        "model": model,
+        "input": (
+            [{"role": "user", "content": "Hello"}]
+            if api == "responses"
+            else [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}]
+        ),
+        "instructions": "Keep it brief.",
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        **({"prompt_cache_key": cache_key} if cache_key is not None else {}),
+    }
 
 
 class TestChatGPTResponsesAPITransformation:
@@ -297,6 +379,7 @@ class TestChatGPTResponsesAPITransformation:
                 "metadata": {"foo": "bar"},
                 "max_output_tokens": 123,
                 "stream_options": {"include_usage": True},
+                "prompt_cache_retention": "24h",
                 # supported and should be preserved
                 "truncation": "auto",
                 "previous_response_id": "resp_123",
@@ -315,6 +398,7 @@ class TestChatGPTResponsesAPITransformation:
         assert "metadata" not in request
         assert "max_output_tokens" not in request
         assert "stream_options" not in request
+        assert "prompt_cache_retention" not in request
 
         assert request["truncation"] == "auto"
         assert request["previous_response_id"] == "resp_123"
