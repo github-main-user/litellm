@@ -13,6 +13,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.router_utils.pre_call_checks.prompt_caching_deployment_check import (
     PromptCachingDeploymentCheck,
     _get_min_token_count_for_deployments,
+    _prompt_cache_affinity_key,
     _routing_prompt_caching_messages,
 )
 from litellm.router_utils.prompt_caching_cache import PromptCachingCache
@@ -541,6 +542,128 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["completion", "acompletion", "responses", "aresponses"])
+@pytest.mark.parametrize("params_location", ["model_parameters", "optional_params", "extra_body"])
+async def test_prompt_cache_key_reuses_a_healthy_deployment_without_anthropic_markers(call_type, params_location):
+    check: Final = PromptCachingDeploymentCheck(cache=DualCache())
+    deployments: Final = _deployments("openai/gpt-6.1", "openai/gpt-6.1")
+    params: Final = {"prompt_cache_key": "conversation-one"}
+    request: Final = {"extra_body": params} if params_location == "extra_body" else params
+    logged: Final = {
+        "call_type": call_type,
+        "model": "openai/gpt-6.1",
+        "model_group": MODEL_GROUP_ALIAS,
+        "model_id": "dep-2",
+        "messages": "word " * 2000,
+        "prompt_tokens": 2000,
+        "model_parameters": params if params_location == "model_parameters" else {},
+    }
+    await check.async_log_success_event(
+        {"standard_logging_object": logged, "optional_params": request}, None, None, None
+    )
+    for overrides, healthy, group, expected in (
+        ({}, deployments, MODEL_GROUP_ALIAS, [deployments[1]]),
+        ({"previous_response_id": "resp_previous"}, deployments, MODEL_GROUP_ALIAS, [deployments[1]]),
+        ({"_target_order": 1}, deployments, MODEL_GROUP_ALIAS, deployments),
+        ({}, deployments[:1], MODEL_GROUP_ALIAS, deployments[:1]),
+        ({}, deployments, "different-group", deployments),
+        ({"prompt_cache_key": "conversation-two"}, deployments, MODEL_GROUP_ALIAS, deployments),
+    ):
+        assert (
+            await check.async_filter_deployments(
+                model=group,
+                healthy_deployments=healthy,
+                messages=None,
+                request_kwargs={**request, **overrides},
+            )
+            == expected
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_prompt_does_not_pin_a_prompt_cache_key():
+    check: Final = PromptCachingDeploymentCheck(cache=DualCache())
+    params: Final = {"prompt_cache_key": "short-conversation"}
+    await check.async_log_success_event(
+        {
+            "standard_logging_object": {
+                "call_type": "aresponses",
+                "model": "openai/gpt-6.1",
+                "model_group": MODEL_GROUP_ALIAS,
+                "model_id": "dep-2",
+                "messages": "hello",
+                "prompt_tokens": 1,
+                "model_parameters": params,
+            }
+        },
+        None,
+        None,
+        None,
+    )
+    assert await check.cache.async_get_cache(_prompt_cache_affinity_key(MODEL_GROUP_ALIAS, params)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_responses_prompt_cache_key_is_recorded_by_real_success_callbacks(monkeypatch, respx_mock, stream):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    deployments: Final = [
+        {
+            "model_name": MODEL_GROUP_ALIAS,
+            "litellm_params": {
+                "model": "openai/gpt-6.1",
+                "api_key": "sk-fake",
+                "api_base": f"https://{name}.example.test/v1",
+            },
+            "model_info": {"id": name},
+        }
+        for name in ("dep-1", "dep-2")
+    ]
+    router: Final = litellm.Router(model_list=deployments, optional_pre_call_checks=["prompt_caching"])
+    payload: Final = {
+        "id": "resp_cache",
+        "created_at": 0,
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1",
+        "output": [],
+        "usage": {"input_tokens": 2000, "output_tokens": 1, "total_tokens": 2001},
+    }
+    response_body: Final = (
+        {
+            "content": f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\n",
+            "headers": {"content-type": "text/event-stream"},
+        }
+        if stream
+        else {"json": payload}
+    )
+    for deployment in deployments:
+        respx_mock.post(f"{deployment['litellm_params']['api_base']}/responses").respond(200, **response_body)
+    request: Final = {
+        "model": MODEL_GROUP_ALIAS,
+        "input": "word " * 2000,
+        "prompt_cache_key": "test-conversation",
+        "stream": stream,
+    }
+    first_response: Final = await router.aresponses(**request)
+    if stream:
+        async for _ in first_response:
+            pass
+    first_host: Final = respx_mock.calls[-1].request.url.host
+    key: Final = _prompt_cache_affinity_key(MODEL_GROUP_ALIAS, request)
+    assert await _eventually(lambda: router.cache.get_cache(key=key)) is not None
+    for turn in range(3):
+        response: Final = await router.aresponses(**{**request, "input": request["input"] + f" Next turn {turn}"})
+        if stream:
+            async for _ in response:
+                pass
+        assert respx_mock.calls[-1].request.url.host == first_host
+
+
+@pytest.mark.asyncio
 async def test_per_request_enable_prompt_caching_reaches_the_affinity_key(monkeypatch, local_model_cost_map):
     """
     `enable_prompt_caching` turns auto-injection on for a single request while the global flag stays
@@ -569,7 +692,7 @@ async def test_per_request_enable_prompt_caching_reaches_the_affinity_key(monkey
 
 
 @pytest.mark.asyncio
-async def test_claude_code_one_shot_subagent_does_not_reuse_an_auto_injected_affinity_key(monkeypatch):
+async def test_claude_code_one_shot_subagent_does_not_reuse_an_auto_injected_affinity_key():
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
@@ -603,7 +726,7 @@ async def test_claude_code_one_shot_subagent_does_not_reuse_an_auto_injected_aff
 
 
 @pytest.mark.asyncio
-async def test_root_cache_control_does_not_reuse_an_auto_injected_affinity_key(monkeypatch):
+async def test_root_cache_control_does_not_reuse_an_auto_injected_affinity_key():
     cache = DualCache()
     check = PromptCachingDeploymentCheck(cache=cache)
     deployments = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
