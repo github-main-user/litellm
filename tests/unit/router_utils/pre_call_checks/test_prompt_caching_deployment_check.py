@@ -357,6 +357,47 @@ async def test_responses_auto_cached_prefix_reuses_completion_affinity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("async_cache", [False, True])
+@pytest.mark.parametrize("block_markers", [False, True])
+async def test_cache_reuses_stable_boundaries_but_prefers_the_longest_prefix(async_cache, block_markers):
+    def marked(role: str, text: str) -> dict[str, object]:
+        return (
+            {"role": role, "content": [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]}
+            if block_markers
+            else {"role": role, "content": text, "cache_control": {"type": "ephemeral"}}
+        )
+
+    cache: Final = PromptCachingCache(cache=DualCache())
+    system: Final = marked("system", "Shared system instructions")
+    first: Final = cast(list[AllMessageValues], [system, marked("user", "First turn")])
+    next_turn: Final = cast(
+        list[AllMessageValues],
+        [
+            system,
+            {"role": "user", "content": "First turn"},
+            {"role": "assistant", "content": "First answer"},
+            marked("user", "Next turn"),
+        ],
+    )
+    original: Final = copy.deepcopy((first, next_turn))
+    if async_cache:
+        await cache.async_add_model_id("dep-2", first, None)
+        assert await cache.async_get_model_id(next_turn, None) == {"model_id": "dep-2"}
+        await cache.async_add_model_id("dep-1", next_turn, None)
+        assert await cache.async_get_model_id(first, None) == {"model_id": "dep-2"}
+        assert await cache.async_get_model_id(next_turn, None) == {"model_id": "dep-1"}
+    else:
+        cache.add_model_id("dep-2", first, None)
+        assert cache.get_model_id(next_turn, None) == {"model_id": "dep-2"}
+        cache.add_model_id("dep-1", next_turn, None)
+        assert cache.get_model_id(first, None) == {"model_id": "dep-2"}
+        assert cache.get_model_id(next_turn, None) == {"model_id": "dep-1"}
+    changed: Final = cast(list[AllMessageValues], [marked("system", "Different instructions"), *next_turn[1:]])
+    assert await cache.async_get_model_id(changed, None) is None
+    assert (first, next_turn) == original
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("subscription", [False, True])
 @pytest.mark.parametrize(
@@ -413,10 +454,11 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
         respx_mock.post(f"{deployment['litellm_params']['api_base']}/v1/messages").respond(200, **response_body)
     native: Final = api == "anthropic_messages"
     call: Final = router.aanthropic_messages if native else router.aresponses
+    system_text: Final = f"Cache routing test {api}-{explicit_system}-{subscription}-{stream}. " + "word " * 3000
     system: Final = (
-        [{"type": "text", "text": "word " * 3000, "cache_control": {"type": "ephemeral"}}]
+        [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
         if explicit_system
-        else "word " * 3000
+        else system_text
     )
     request: Final = {
         "model": MODEL_GROUP_ALIAS,
@@ -440,7 +482,12 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
             (AUTO_CACHING_MODEL,),
         )
         if native
-        else _affinity_messages(_auto_caching_messages())
+        else _affinity_messages(
+            cast(
+                list[AllMessageValues],
+                [{"role": "system", "content": system_text}, {"role": "user", "content": "hello"}],
+            )
+        )
     )
     assert sent_messages is not None
     affinity_key: Final = PromptCachingCache.get_prompt_caching_cache_key(sent_messages, None)
@@ -451,6 +498,19 @@ async def test_router_reuses_the_deployment_that_cached_the_prompt(
             async for _ in response:
                 pass
         assert respx_mock.calls[-1].request.url.host == first_host
+    next_request: Final = {
+        **request,
+        "messages" if native else "input": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "OK"},
+            {"role": "user", "content": "Next turn"},
+        ],
+    }
+    next_response: Final = await call(**next_request)
+    if stream:
+        async for _ in next_response:
+            pass
+    assert respx_mock.calls[-1].request.url.host == first_host
     assert request == original
 
 
