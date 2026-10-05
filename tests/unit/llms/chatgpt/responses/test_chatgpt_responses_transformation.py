@@ -136,24 +136,28 @@ async def test_chatgpt_prompt_cache_key_reaches_wire(
         "num_retries": 0,
         **({"prompt_cache_key": cache_key} if cache_key is not None else {}),
     }
-    if api == "responses":
-        if asynchronous:
-            await litellm.aresponses(input="Hello", instructions="Keep it brief.", **params)
+    for attempt in range(2):
+        request_params: Final = {**params, "litellm_trace_id": f"trace-{attempt}"}
+        if api == "responses":
+            if asynchronous:
+                await litellm.aresponses(input="Hello", instructions="Keep it brief.", **request_params)
+            else:
+                litellm.responses(input="Hello", instructions="Keep it brief.", **request_params)
         else:
-            litellm.responses(input="Hello", instructions="Keep it brief.", **params)
-    else:
-        messages: Final = [
-            {"role": "system", "content": "Keep it brief."},
-            {"role": "user", "content": "Hello"},
-        ]
-        completion: Final = (
-            await litellm.acompletion(messages=messages, **params)
-            if asynchronous
-            else litellm.completion(messages=messages, **params)
-        )
-        assert completion.choices[0].message.content == "Hello!"
+            messages: Final = [
+                {"role": "system", "content": "Keep it brief."},
+                {"role": "user", "content": "Hello"},
+            ]
+            completion: Final = (
+                await litellm.acompletion(messages=messages, **request_params)
+                if asynchronous
+                else litellm.completion(messages=messages, **request_params)
+            )
+            assert completion.choices[0].message.content == "Hello!"
 
-    assert upstream.call_count == 1
+    assert upstream.call_count == 2
+    session_ids: Final = [call.request.headers["session_id"] for call in upstream.calls]
+    assert (session_ids[0] == session_ids[1]) is (cache_key is not None)
     request: Final = upstream.calls[0].request
     assert request.url == httpx.URL("https://chatgpt.test/backend-api/codex/responses")
     assert request.headers["authorization"] == "Bearer managed-token"

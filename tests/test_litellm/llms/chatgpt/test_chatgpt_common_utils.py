@@ -1,6 +1,8 @@
 import os
 from time import time
+from typing import Final
 from unittest.mock import patch
+from uuid import UUID
 
 import httpx
 
@@ -12,6 +14,7 @@ from litellm.llms.chatgpt.common_utils import (
     DEFAULT_USER_AGENT,
     chatgpt_quota_reset_seconds,
     get_chatgpt_default_headers,
+    get_chatgpt_session_id,
     get_chatgpt_user_agent,
 )
 
@@ -108,3 +111,18 @@ def test_user_agent_preserves_custom_originator_and_suffix() -> None:
     assert headers["user-agent"].startswith(f"custom-origin/{CODEX_CLI_VERSION} (")
     assert headers["user-agent"].endswith(" unknown (gateway)")
     assert "ChatGPT-Account-Id" not in headers
+
+
+def test_prompt_cache_session_is_stable_header_safe_and_respects_explicit_sessions() -> None:
+    params: Final = {"prompt_cache_key": "conversation-\u00e9\r\nignored-header", "litellm_trace_id": "trace-one"}
+    session: Final = get_chatgpt_session_id(params)
+    assert session is not None
+    assert str(UUID(session)) == session
+    assert get_chatgpt_session_id({**params, "litellm_trace_id": "trace-two"}) == session
+    assert get_chatgpt_session_id({**params, "prompt_cache_key": "different-conversation"}) != session
+    for explicit in (
+        {"litellm_session_id": "explicit-session"},
+        {"session_id": "explicit-session"},
+        {"metadata": {"session_id": "explicit-session"}},
+    ):
+        assert get_chatgpt_session_id({**params, **explicit}) == "explicit-session"

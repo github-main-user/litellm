@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Final
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
@@ -238,6 +238,9 @@ def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
         value = metadata.get("session_id")
         if value:
             return str(value)
+    prompt_cache_key: Final = params.get("prompt_cache_key")
+    if isinstance(prompt_cache_key, str) and prompt_cache_key:
+        return str(uuid5(NAMESPACE_URL, f"litellm:prompt-cache:{prompt_cache_key}"))
     for key in ("litellm_trace_id", "litellm_call_id"):
         value = params.get(key)
         if value:
