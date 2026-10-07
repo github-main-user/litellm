@@ -32,6 +32,7 @@ def _record(name: str, blocked: tuple[bool, ...] = (False,)) -> CatalogRecord:
 def _expected(row: CatalogRecord) -> dict[str, object]:
     return {
         "id": row.name,
+        "base_model": row.base_model,
         "object": "model",
         "created": int(row.created_at.timestamp()),
         "owned_by": "catalog-brand",
@@ -57,6 +58,17 @@ def test_catalog_filters_unbound_paused_wildcard_and_unauthorized_records() -> N
     )
     entries: Final = catalog_entries(records, "catalog-brand", {"public", "unhealthy"}, {"unhealthy"})
     assert [entry.model_dump(exclude_none=True) for entry in entries] == [_expected(visible)]
+
+
+def test_catalog_exposes_saved_identity_without_metadata_or_alias_matching() -> None:
+    records: Final = (
+        _record("custom-alias").model_copy(update={"base_model": "lab/canonical-a"}),
+        _record("another-alias").model_copy(update={"base_model": "other-lab/canonical-b"}),
+    )
+    entries: Final = catalog_entries(records, "catalog-brand", None, ())
+    assert [(entry.id, entry.base_model) for entry in entries] == [
+        (row.name, row.base_model) for row in records
+    ]
 
 
 @pytest.fixture

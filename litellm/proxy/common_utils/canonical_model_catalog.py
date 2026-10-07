@@ -40,6 +40,7 @@ class CatalogPricing(BaseModel):
 
 class CatalogEntry(CatalogMetadata):
     id: str
+    base_model: str
     object: Literal["model"] = "model"
     created: int
     owned_by: str
@@ -66,6 +67,7 @@ def catalog_entries(
     return tuple(
         CatalogEntry(
             id=row.name,
+            base_model=row.base_model,
             created=int(row.created_at.timestamp()),
             owned_by=owner,
             **(metadata.metadata(row.base_model).model_dump(exclude_none=True) if metadata is not None else {}),
