@@ -5,6 +5,8 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from litellm.proxy.common_utils.models_dev_catalog import CatalogMetadata, ModelsDevCatalog
+
 
 class CatalogDeployment(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -36,12 +38,11 @@ class CatalogPricing(BaseModel):
     cache_write: str
 
 
-class CatalogEntry(BaseModel):
+class CatalogEntry(CatalogMetadata):
     id: str
     object: Literal["model"] = "model"
     created: int
     owned_by: str
-    base_model: str
     pricing: CatalogPricing
 
 
@@ -50,6 +51,7 @@ def catalog_entries(
     owner: str,
     available_names: Container[str] | None,
     hidden_names: Container[str],
+    metadata: ModelsDevCatalog | None = None,
 ) -> tuple[CatalogEntry, ...]:
     visible: Final = (
         row
@@ -66,7 +68,7 @@ def catalog_entries(
             id=row.name,
             created=int(row.created_at.timestamp()),
             owned_by=owner,
-            base_model=row.base_model,
+            **(metadata.metadata(row.base_model).model_dump(exclude_none=True) if metadata is not None else {}),
             pricing=CatalogPricing(
                 input=format(row.input_price_per_million_tokens, "f"),
                 output=format(row.output_price_per_million_tokens, "f"),

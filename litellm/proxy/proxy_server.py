@@ -11053,6 +11053,7 @@ async def model_list(
         and (user_api_key_dict is None or not wants_anthropic_format)
     ):
         from litellm.proxy.common_utils.canonical_model_catalog import CatalogRecord, catalog_entries
+        from litellm.proxy.common_utils.models_dev_catalog import models_dev_catalog
 
         canonical_rows: Final = TypeAdapter(tuple[CatalogRecord, ...]).validate_python(
             await prisma_client.db.litellm_canonicalmodel.find_many(
@@ -11087,6 +11088,7 @@ async def model_list(
                 os.getenv("LITELLM_PUBLIC_API_BRAND") or "litellm",
                 catalog_available,
                 catalog_hidden,
+                await models_dev_catalog.load() if canonical_rows else None,
             )
             if wants_anthropic_format:
                 return create_anthropic_model_list_response(
@@ -11095,7 +11097,7 @@ async def model_list(
                         for entry in catalog_data
                     )
                 )
-            return {"data": [entry.model_dump() for entry in catalog_data], "object": "list"}
+            return {"data": [entry.model_dump(exclude_none=True) for entry in catalog_data], "object": "list"}
 
     if user_api_key_dict is None:
         raise HTTPException(status_code=401, detail="Authentication required")
