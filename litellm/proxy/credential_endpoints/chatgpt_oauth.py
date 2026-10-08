@@ -24,6 +24,7 @@ from litellm.llms.chatgpt.oauth_client import (
     ChatGPTDeviceCode,
     ChatGPTOAuthClient,
     ChatGPTTokens,
+    ManagedChatGPTAccessToken,
 )
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import UserAPIKeyAuth
@@ -47,6 +48,10 @@ CHATGPT_DEVICE_CODE_LIFETIME_SECONDS: Final = 15 * 60
 _CREDENTIAL_NAME_PATTERN: Final = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 router: Final = APIRouter()
+
+
+class _DatabaseChatGPTCredential(CredentialItem):
+    pass
 
 
 class ChatGPTOAuthStartRequest(BaseModel):
@@ -164,7 +169,7 @@ def _decrypt_credential(credential: CredentialItem) -> CredentialItem:
         for key, value in credential.credential_values.items()
     }
     proxy_url = values.get(CREDENTIAL_PROXY_VALUE_KEY)
-    return CredentialItem(
+    return _DatabaseChatGPTCredential(
         credential_name=credential.credential_name,
         credential_info={
             **credential.credential_info,
@@ -218,7 +223,7 @@ async def _store_tokens(
 
     if prisma_client is None:
         raise HTTPException(status_code=500, detail="Database not connected")
-    plaintext = CredentialItem(
+    plaintext = _DatabaseChatGPTCredential(
         credential_name=credential_name,
         credential_info={
             "provider": CHATGPT_CREDENTIAL_PROVIDER,
@@ -288,7 +293,7 @@ async def _store_tokens(
             existing_values = dict(row.credential_values)
             if proxy_url is None:
                 existing_values.pop(CREDENTIAL_PROXY_VALUE_KEY, None)
-            plaintext = CredentialItem(
+            plaintext = _DatabaseChatGPTCredential(
                 credential_name=credential_name,
                 credential_info={
                     **(row.credential_info or {}),
@@ -415,11 +420,15 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             return None
         credential_name: Final = kwargs.get("litellm_credential_name")
         if not isinstance(credential_name, str) or not credential_name:
-            return None
-        credential: Final = await self._find_or_load_credential(credential_name)
-        if credential is None or not _is_chatgpt_oauth_credential(credential):
-            return None
+            raise AuthenticationError(
+                model=model if isinstance(model, str) else "chatgpt",
+                llm_provider=CHATGPT_CREDENTIAL_PROVIDER,
+                message="ChatGPT requires a managed OAuth credential. Set litellm_credential_name.",
+            )
         try:
+            credential: Final = await self._find_or_load_credential(credential_name)
+            if credential is None or not _is_chatgpt_oauth_credential(credential):
+                raise ValueError("Credential is not a managed ChatGPT OAuth credential")
             tokens: Final = await self._get_tokens(credential_name)
         except Exception as error:
             raise AuthenticationError(
@@ -429,7 +438,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             ) from error
         return {
             **kwargs,
-            "api_key": tokens.access_token,
+            "api_key": ManagedChatGPTAccessToken(tokens.access_token),
             "chatgpt_auth_account_id": tokens.account_id,
         }
 
@@ -443,7 +452,9 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
 
     async def _find_or_load_credential(self, credential_name: str) -> CredentialItem | None:
         cached: Final = _find_credential(credential_name)
-        if cached is not None:
+        if cached is not None and (
+            isinstance(cached, _DatabaseChatGPTCredential) or not _is_chatgpt_oauth_credential(cached)
+        ):
             return cached
         from litellm.proxy.proxy_server import prisma_client
 
@@ -570,7 +581,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         await publish_config_change_for_object_type("litellm_credentialstable")
         CredentialAccessor.upsert_credentials(
             [
-                CredentialItem(
+                _DatabaseChatGPTCredential(
                     credential_name=credential_name,
                     credential_info=credential_info,
                     credential_values={

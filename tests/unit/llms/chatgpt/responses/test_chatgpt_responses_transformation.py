@@ -8,7 +8,7 @@ import json
 from collections.abc import Generator
 from pathlib import Path
 from typing import Final, Literal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -16,10 +16,12 @@ import respx
 
 import litellm
 from litellm.exceptions import AuthenticationError
+from litellm.llms.chatgpt.oauth_client import ChatGPTTokens, ManagedChatGPTAccessToken
 from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.main import responses_api_bridge_check
+from litellm.models.credentials import CredentialItem
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
@@ -34,25 +36,33 @@ def local_model_cost_map(monkeypatch: pytest.MonkeyPatch) -> Generator[None, Non
     litellm.get_model_info.cache_clear()
 
 
-def test_responses_requires_explicit_credentials_when_file_auth_disabled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.fixture
+def managed_credential(monkeypatch: pytest.MonkeyPatch) -> str:
+    tokens: Final = ChatGPTTokens("managed-token", "refresh", "id", 9999999999, "managed-account")
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="subscription-a",
+        credential_info={"provider": "chatgpt", "auth_type": "oauth"},
+        credential_values={"litellm_internal_chatgpt_auth_token": tokens.to_json()},
+    )])
+    return "subscription-a"
+
+
+@pytest.mark.parametrize("access_token", [None, "unmanaged-token"])
+def test_responses_requires_managed_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, access_token: str | None
 ) -> None:
     token_dir: Final = tmp_path / ".config" / "litellm" / "chatgpt"
-    monkeypatch.setenv("CHATGPT_ALLOW_FILE_AUTH", "false")
-    monkeypatch.delenv("CHATGPT_TOKEN_DIR", raising=False)
+    monkeypatch.setenv("CHATGPT_ALLOW_FILE_AUTH", "true")
+    monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(token_dir))
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(litellm, "credential_list", [])
     config: Final = ChatGPTResponsesAPIConfig()
 
-    with pytest.raises(AuthenticationError, match="file authentication is disabled"):
-        config.validate_environment(headers={}, model="gpt-5.5", litellm_params=GenericLiteLLMParams())
+    with pytest.raises(AuthenticationError, match="managed OAuth credential"):
+        config.validate_environment(
+            headers={}, model="test-model", litellm_params=GenericLiteLLMParams(api_key=access_token)
+        )
 
-    headers: Final = config.validate_environment(
-        headers={},
-        model="gpt-5.5",
-        litellm_params=GenericLiteLLMParams(api_key="managed-token", chatgpt_auth_account_id="managed-account"),
-    )
-    assert headers["Authorization"] == "Bearer managed-token"
-    assert headers["ChatGPT-Account-Id"] == "managed-account"
     assert not token_dir.exists()
 
 
@@ -102,6 +112,7 @@ async def test_chatgpt_prompt_cache_key_reaches_wire(
     respx_mock: respx.MockRouter,
     monkeypatch: pytest.MonkeyPatch,
     local_model_cost_map: None,
+    managed_credential: str,
 ) -> None:
     monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
     model: Final = "gpt-5.6-luna"
@@ -130,9 +141,10 @@ async def test_chatgpt_prompt_cache_key_reaches_wire(
     )
     params: Final = {
         "model": f"chatgpt/{model}",
-        "api_key": "managed-token",
+        "api_key": ManagedChatGPTAccessToken("managed-token"),
         "api_base": "https://chatgpt.test/backend-api/codex",
         "chatgpt_auth_account_id": "managed-account",
+        "litellm_credential_name": managed_credential,
         "num_retries": 0,
         **({"prompt_cache_key": cache_key} if cache_key is not None else {}),
     }
@@ -229,11 +241,8 @@ class TestChatGPTResponsesAPITransformation:
         assert model_info["mode"] == "responses"
         assert resolved_model == model_name
 
-    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
-    def test_chatgpt_responses_endpoint_url(self, mock_authenticator_class):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.get_api_base.return_value = "https://chatgpt.example.com"
-        mock_authenticator_class.return_value = mock_auth_instance
+    def test_chatgpt_responses_endpoint_url(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CHATGPT_API_BASE", "https://chatgpt.example.com")
 
         config = ChatGPTResponsesAPIConfig()
 
@@ -250,48 +259,43 @@ class TestChatGPTResponsesAPITransformation:
         )
         assert url_with_slash == "https://chatgpt.example.com/responses"
 
-    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
-    def test_validate_environment_headers(self, mock_authenticator_class):
-        mock_auth_instance = MagicMock()
-        mock_auth_instance.get_access_token.return_value = "access-123"
-        mock_auth_instance.get_account_id.return_value = "acct-123"
-        mock_authenticator_class.return_value = mock_auth_instance
-
+    def test_validate_environment_headers(self, managed_credential: str):
         config = ChatGPTResponsesAPIConfig()
-        litellm_params = GenericLiteLLMParams(litellm_session_id="session-123")
+        litellm_params = GenericLiteLLMParams(
+            litellm_session_id="session-123", api_key=ManagedChatGPTAccessToken("managed-token"),
+            litellm_credential_name=managed_credential, chatgpt_auth_account_id="managed-account"
+        )
         headers = config.validate_environment(
             headers={"originator": "custom-origin"},
             model="gpt-5.2",
             litellm_params=litellm_params,
         )
 
-        assert headers["Authorization"] == "Bearer access-123"
-        assert headers["ChatGPT-Account-Id"] == "acct-123"
+        assert headers["Authorization"] == "Bearer managed-token"
+        assert headers["ChatGPT-Account-Id"] == "managed-account"
         assert headers["originator"] == "custom-origin"
         assert headers["content-type"] == "application/json"
         assert headers["accept"] == "text/event-stream"
         assert headers["session_id"] == "session-123"
 
-    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
-    def test_validate_environment_uses_deployment_credentials(self, mock_authenticator_class):
-        mock_auth_instance = MagicMock()
-        mock_authenticator_class.return_value = mock_auth_instance
+    def test_validate_environment_uses_deployment_credentials(self, managed_credential: str):
         config = ChatGPTResponsesAPIConfig()
         litellm_params = GenericLiteLLMParams(
-            api_key="deployment-access",
-            chatgpt_auth_account_id="deployment-account",
+            api_key=ManagedChatGPTAccessToken("managed-token"),
+            chatgpt_auth_account_id="managed-account",
+            litellm_credential_name=managed_credential,
         )
 
         headers = config.validate_environment(
-            headers={},
+            headers={"authorization": "Bearer unmanaged-token", "chatgpt-account-id": "wrong-account"},
             model="gpt-5.4",
             litellm_params=litellm_params,
         )
 
-        assert headers["Authorization"] == "Bearer deployment-access"
-        assert headers["ChatGPT-Account-Id"] == "deployment-account"
-        mock_auth_instance.get_access_token.assert_not_called()
-        mock_auth_instance.get_account_id.assert_not_called()
+        assert headers["Authorization"] == "Bearer managed-token"
+        assert headers["ChatGPT-Account-Id"] == "managed-account"
+        assert "authorization" not in headers
+        assert "chatgpt-account-id" not in headers
 
     @pytest.mark.parametrize(
         "model_name",

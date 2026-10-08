@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import litellm
+from litellm.exceptions import AuthenticationError
 from litellm.llms.chatgpt.oauth_client import (
     ChatGPTAuthorizationCode,
     ChatGPTDeviceCode,
     ChatGPTTokens,
 )
+from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
@@ -22,10 +24,12 @@ from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     ChatGPTOAuthCredentialHook,
     ChatGPTOAuthPollRequest,
     ChatGPTOAuthStartRequest,
+    _DatabaseChatGPTCredential,
     poll_chatgpt_oauth,
     start_chatgpt_oauth,
 )
 from litellm.repositories.credentials_repository import CredentialsRepository
+from litellm.types.router import GenericLiteLLMParams
 from litellm.utils import load_credentials_from_list
 
 
@@ -37,7 +41,7 @@ def _credential(name: str, account_id: str, access_token: str) -> CredentialItem
         expires_at=int(time.time()) + 3600,
         account_id=account_id,
     )
-    return CredentialItem(
+    return _DatabaseChatGPTCredential(
         credential_name=name,
         credential_info={"provider": "chatgpt", "auth_type": "oauth"},
         credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
@@ -79,7 +83,7 @@ async def test_hook_resolves_each_deployment_subscription_independently() -> Non
 
 
 @pytest.mark.asyncio
-async def test_hook_ignores_non_oauth_chatgpt_credential() -> None:
+async def test_hook_rejects_non_oauth_chatgpt_credential() -> None:
     previous = litellm.credential_list
     litellm.credential_list = [
         CredentialItem(
@@ -89,17 +93,42 @@ async def test_hook_ignores_non_oauth_chatgpt_credential() -> None:
         )
     ]
     try:
-        resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
-            {
-                "model": "chatgpt/gpt-5.4",
-                "litellm_credential_name": "chatgpt-api-key",
-            },
-            None,
-        )
+        with pytest.raises(AuthenticationError, match="unavailable"):
+            await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
+                {
+                    "model": "chatgpt/gpt-5.4",
+                    "litellm_credential_name": "chatgpt-api-key",
+                },
+                None,
+            )
     finally:
         litellm.credential_list = previous
 
-    assert resolved is None
+
+@pytest.mark.asyncio
+async def test_hook_rejects_configured_oauth_tokens_without_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured = CredentialItem.model_validate(_credential("subscription-a", "account-a", "access-a").model_dump())
+    monkeypatch.setattr(litellm, "credential_list", [configured])
+    with patch("litellm.proxy.proxy_server.prisma_client", None):
+        with pytest.raises(AuthenticationError, match="unavailable"):
+            await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
+                {"model": "chatgpt/test-model", "litellm_credential_name": "subscription-a"}, None
+            )
+
+
+@pytest.mark.asyncio
+async def test_inflight_auth_survives_cache_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "credential_list", [_credential("subscription-a", "account-a", "access-a")])
+    resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
+        {"model": "chatgpt/test-model", "litellm_credential_name": "subscription-a"}, None
+    )
+    assert resolved is not None
+    monkeypatch.setattr(litellm, "credential_list", [_credential("subscription-a", "account-a", "access-new")])
+    headers = ChatGPTResponsesAPIConfig().validate_environment(
+        headers={}, model="test-model", litellm_params=GenericLiteLLMParams(**resolved)
+    )
+    assert headers["Authorization"] == "Bearer access-a"
+    assert headers["ChatGPT-Account-Id"] == "account-a"
 
 
 @pytest.mark.asyncio
@@ -128,12 +157,17 @@ async def test_hook_loads_oauth_credential_from_database_on_cache_miss() -> None
                 },
                 None,
             )
+            assert resolved is not None
+            headers = ChatGPTResponsesAPIConfig().validate_environment(
+                headers={}, model="gpt-5.4", litellm_params=GenericLiteLLMParams(**resolved)
+            )
     finally:
         litellm.credential_list = previous
 
-    assert resolved is not None
     assert resolved["api_key"] == "access-a"
     assert resolved["chatgpt_auth_account_id"] == "account-a"
+    assert headers["Authorization"] == "Bearer access-a"
+    assert headers["ChatGPT-Account-Id"] == "account-a"
 
 
 def test_internal_token_bundle_is_not_copied_into_request_kwargs() -> None:
@@ -166,7 +200,7 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
     )
     previous = litellm.credential_list
     litellm.credential_list = [
-        CredentialItem(
+        _DatabaseChatGPTCredential(
             credential_name="subscription-a",
             credential_info={"provider": "chatgpt", "auth_type": "oauth"},
             credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: expired.to_json()},

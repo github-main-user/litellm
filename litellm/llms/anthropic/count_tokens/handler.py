@@ -129,6 +129,8 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
             # Return Anthropic response directly - no transformation needed
             return anthropic_response
 
+        except litellm.AuthenticationError:
+            raise
         except AnthropicError:
             # Re-raise Anthropic exceptions as-is
             raise

@@ -89,6 +89,9 @@ class AnthropicTextConfig(BaseConfig):
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> dict:
+        from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
+
+        validate_anthropic_subscription_auth(api_key, headers)
         if api_key is None:
             raise ValueError(
                 "Missing Anthropic API Key - A call is being made to anthropic but no key is set either in the environment variables or via params"

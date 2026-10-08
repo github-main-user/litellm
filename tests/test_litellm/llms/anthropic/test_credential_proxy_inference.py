@@ -7,6 +7,7 @@ import pytest
 
 import litellm
 from litellm.llms.anthropic.count_tokens.token_counter import AnthropicTokenCounter
+from litellm.llms.chatgpt.oauth_client import ChatGPTTokens, ManagedChatGPTAccessToken
 from litellm.types.utils import CredentialItem
 
 
@@ -94,12 +95,24 @@ async def test_chatgpt_responses_and_native_messages_use_named_proxy(monkeypatch
         monkeypatch.setattr(
             litellm,
             "credential_list",
-            [_credential("chatgpt-account", responses_proxy), _credential("claude-account", messages_proxy)],
+            [
+                CredentialItem(
+                    credential_name="chatgpt-account",
+                    credential_info={"provider": "chatgpt", "auth_type": "oauth"},
+                    credential_values={
+                        **_credential("chatgpt-account", responses_proxy).credential_values,
+                        "litellm_internal_chatgpt_auth_token": ChatGPTTokens(
+                            "access-token", "refresh", "id", 9999999999, "account-id"
+                        ).to_json(),
+                    },
+                ),
+                _credential("claude-account", messages_proxy),
+            ],
         )
         response_stream = await litellm.aresponses(
             model="chatgpt/gpt-5",
             input="hello",
-            api_key="access-token",
+            api_key=ManagedChatGPTAccessToken("access-token"),
             chatgpt_auth_account_id="account-id",
             api_base="http://responses-upstream.invalid/backend-api/codex",
             litellm_credential_name="chatgpt-account",
@@ -108,7 +121,7 @@ async def test_chatgpt_responses_and_native_messages_use_named_proxy(monkeypatch
         bridged = await litellm.acompletion(
             model="chatgpt/gpt-5.5",
             messages=[{"role": "user", "content": "hello"}],
-            api_key="access-token",
+            api_key=ManagedChatGPTAccessToken("access-token"),
             chatgpt_auth_account_id="account-id",
             api_base="http://responses-upstream.invalid/backend-api/codex",
             litellm_credential_name="chatgpt-account",

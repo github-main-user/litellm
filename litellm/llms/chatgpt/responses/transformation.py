@@ -1,6 +1,5 @@
 from typing import TYPE_CHECKING, Any, Final
 
-from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
     _safe_convert_created_field,
@@ -20,24 +19,19 @@ from litellm.types.llms.openai import (
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 
-from ..authenticator import Authenticator
 from ..common_utils import (
-    CHATGPT_API_BASE,
-    GetAccessTokenError,
     ensure_chatgpt_session_id,
+    get_chatgpt_api_base,
     get_chatgpt_default_headers,
     get_chatgpt_default_instructions,
 )
+from ..oauth_client import require_managed_chatgpt_access_token
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 
 
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
-    def __init__(self) -> None:
-        super().__init__()
-        self.authenticator = Authenticator()
-
     @property
     def custom_llm_provider(self) -> LlmProviders:
         return LlmProviders.CHATGPT
@@ -48,30 +42,22 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         model: str,
         litellm_params: GenericLiteLLMParams | None,
     ) -> dict:
-        access_token: Final = (
-            litellm_params.api_key
-            if litellm_params is not None and litellm_params.api_key
-            else self._get_legacy_access_token(model)
-        )
-
-        account_id: Final = (
-            litellm_params.get("chatgpt_auth_account_id")
-            if litellm_params is not None and litellm_params.api_key
-            else self.authenticator.get_account_id()
+        access_token: Final = require_managed_chatgpt_access_token(
+            model,
+            litellm_params.get("litellm_credential_name") if litellm_params is not None else None,
+            litellm_params.api_key if litellm_params is not None else None,
         )
         session_id: Final = ensure_chatgpt_session_id(litellm_params)
+        account_id: Final = litellm_params.get("chatgpt_auth_account_id") if litellm_params is not None else None
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
-        return {**default_headers, **headers}
-
-    def _get_legacy_access_token(self, model: str) -> str:
-        try:
-            return self.authenticator.get_access_token()
-        except GetAccessTokenError as error:
-            raise AuthenticationError(
-                model=model,
-                llm_provider="chatgpt",
-                message=str(error),
-            ) from error
+        return {
+            **default_headers,
+            **{
+                name: value
+                for name, value in headers.items()
+                if name.lower() not in {"authorization", "chatgpt-account-id"}
+            },
+        }
 
     def transform_responses_api_request(
         self,
@@ -240,7 +226,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         api_base: str | None,
         litellm_params: dict,
     ) -> str:
-        api_base = api_base or self.authenticator.get_api_base() or CHATGPT_API_BASE
+        api_base = api_base or get_chatgpt_api_base()
         api_base = api_base.rstrip("/")
         return f"{api_base}/responses"
 

@@ -2588,6 +2588,18 @@ def _complete_custom_openai(
 
     headers = headers or litellm.headers
 
+    if custom_llm_provider == "chatgpt":
+        extra_headers = litellm.ChatGPTConfig().validate_environment(
+            headers={**(headers or {}), **(extra_headers or {})},
+            model=model,
+            messages=messages,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        headers = extra_headers
+
     use_base_llm_http_handler: Final = get_secret_bool("EXPERIMENTAL_OPENAI_BASE_LLM_HTTP_HANDLER")
 
     if extra_headers is not None and not use_base_llm_http_handler:
@@ -5656,6 +5668,7 @@ def completion(
             acompletion=acompletion,
             api_key=api_key,
             chatgpt_auth_account_id=kwargs.get("chatgpt_auth_account_id"),
+            litellm_credential_name=kwargs.get("litellm_credential_name"),
             force_timeout=force_timeout,
             logger_fn=logger_fn,
             verbose=verbose,

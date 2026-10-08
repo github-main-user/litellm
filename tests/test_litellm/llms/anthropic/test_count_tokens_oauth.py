@@ -17,9 +17,10 @@ sys.path.insert(
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
 )
+from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
 
 # Fake tokens for testing (not real secrets)
-FAKE_OAUTH_TOKEN = "sk-ant-oat01-fake-token-for-testing-123456789abcdef"
+FAKE_OAUTH_TOKEN = ManagedAnthropicOAuthToken("sk-ant-oat01-fake-token-for-testing-123456789abcdef")
 FAKE_REGULAR_KEY = "sk-ant-api03-regular-key-for-testing-123456789"
 
 
@@ -84,3 +85,18 @@ class TestCountTokensOAuthHeaders:
         assert (
             "oauth-2025-04-20" in beta_value
         ), f"oauth beta missing from OAuth headers: {beta_value}"
+
+
+async def test_count_tokens_handler_rejects_raw_subscription_before_http():
+    import pytest
+
+    from litellm.exceptions import AuthenticationError
+    from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
+
+    with pytest.raises(AuthenticationError, match="database-managed") as error:
+        await AnthropicCountTokensHandler().handle_count_tokens_request(
+            model="claude-test",
+            messages=[{"role": "user", "content": "hello"}],
+            api_key="sk-ant-oat-manual",
+        )
+    assert error.value.status_code == 401

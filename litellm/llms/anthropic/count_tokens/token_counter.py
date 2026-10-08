@@ -14,6 +14,7 @@ from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.oauth_client import (
     AnthropicOAuthError,
+    ManagedAnthropicOAuthToken,
     recover_managed_anthropic_oauth_headers,
     sanitize_retry_after,
 )
@@ -191,7 +192,7 @@ class AnthropicTokenCounter(BaseTokenCounter):
                 result = await handler.handle_count_tokens_request(
                     model=model_to_use,
                     messages=messages or [],
-                    api_key=authorization.removeprefix("Bearer "),
+                    api_key=ManagedAnthropicOAuthToken(authorization.removeprefix("Bearer ")),
                     api_base=litellm_params.get("api_base"),
                     tools=tools,
                     system=system,

@@ -128,6 +128,7 @@ def get_litellm_params(
     max_retries: int | None = None,
     litellm_request_debug: bool | None = None,
     chatgpt_auth_account_id: str | None = None,
+    litellm_credential_name: str | None = None,
     **kwargs,
 ) -> dict:
     _litellm_metadata_dict: Final = litellm_metadata if isinstance(litellm_metadata, dict) else None
@@ -148,6 +149,7 @@ def get_litellm_params(
         "allm_passthrough_route": allm_passthrough_route,
         "api_key": api_key,
         "chatgpt_auth_account_id": chatgpt_auth_account_id,
+        "litellm_credential_name": litellm_credential_name,
         "force_timeout": force_timeout,
         "logger_fn": logger_fn,
         "verbose": verbose,

@@ -18,10 +18,13 @@ from unittest.mock import patch
 
 import pytest
 
+from litellm.exceptions import AuthenticationError
+from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../..")))
 
 # Fake tokens for testing (not real secrets)
-FAKE_OAUTH_TOKEN = "sk-ant-oat01-fake-token-for-testing-123456789abcdef"
+FAKE_OAUTH_TOKEN = ManagedAnthropicOAuthToken("sk-ant-oat01-fake-token-for-testing-123456789abcdef")
 FAKE_REGULAR_KEY = "sk-ant-api03-regular-key-for-testing-123456789"
 FAKE_AUTH_TOKEN = "sk-ant-aut01-fake-auth-token-for-testing-123456789"
 
@@ -64,7 +67,7 @@ class TestOptionallyHandleAnthropicOAuth:
         )
 
         headers = {header_name: f"Bearer {FAKE_OAUTH_TOKEN}"}
-        updated_headers, extracted_api_key = optionally_handle_anthropic_oauth(headers, None)
+        updated_headers, extracted_api_key = optionally_handle_anthropic_oauth(headers, FAKE_OAUTH_TOKEN)
 
         assert extracted_api_key == FAKE_OAUTH_TOKEN
         assert set(updated_headers["anthropic-beta"].split(",")) == {"oauth-2025-04-20", "claude-code-20250219"}
@@ -82,7 +85,7 @@ class TestOptionallyHandleAnthropicOAuth:
         )
 
         headers = {api_key_header_name: FAKE_REGULAR_KEY, "Authorization": f"Bearer {FAKE_OAUTH_TOKEN}"}
-        updated_headers, extracted_api_key = optionally_handle_anthropic_oauth(headers, None)
+        updated_headers, extracted_api_key = optionally_handle_anthropic_oauth(headers, FAKE_OAUTH_TOKEN)
 
         assert extracted_api_key == FAKE_OAUTH_TOKEN
         assert [name for name in updated_headers if name.lower() == "x-api-key"] == []
@@ -283,7 +286,7 @@ class TestValidateEnvironmentOAuth:
             messages=[{"role": "user", "content": "Hello"}],
             optional_params={},
             litellm_params={},
-            api_key=None,
+            api_key=FAKE_OAUTH_TOKEN,
             api_base=None,
         )
 
@@ -393,7 +396,7 @@ class TestPassthroughOAuth:
             messages=[{"role": "user", "content": "Hello"}],
             optional_params={},
             litellm_params={},
-            api_key=None,
+            api_key=FAKE_OAUTH_TOKEN,
             api_base=None,
         )
 
@@ -1126,8 +1129,8 @@ class TestGetAuthHeader:
             {"ANTHROPIC_API_KEY": FAKE_OAUTH_TOKEN},
             clear=True,
         ):
-            result = AnthropicModelInfo.get_auth_header()
-            assert result == {"authorization": f"Bearer {FAKE_OAUTH_TOKEN}"}
+            with pytest.raises(AuthenticationError, match="database-managed"):
+                AnthropicModelInfo.get_auth_header()
 
     def test_custom_api_base_get_auth_header_uses_bearer(self):
         """Non-standard API key and custom api_base returns Bearer when use_bearer_for_custom_base=True."""
@@ -2321,7 +2324,7 @@ def test_subscription_sets_single_claude_cli_user_agent(forwarded, header_name):
     headers = {header_name: "other-client/1.0", "x-request-id": "keep-me"}
     if forwarded:
         headers["Authorization"] = f"Bearer {FAKE_OAUTH_TOKEN}"
-    result, token = optionally_handle_anthropic_oauth(headers, None if forwarded else FAKE_OAUTH_TOKEN)
+    result, token = optionally_handle_anthropic_oauth(headers, FAKE_OAUTH_TOKEN)
     repeated, _ = optionally_handle_anthropic_oauth(result, token)
 
     assert token == FAKE_OAUTH_TOKEN
@@ -2345,6 +2348,7 @@ def test_chat_environment_user_agent_is_subscription_only(oauth):
             messages=[{"role": "user", "content": "Hi"}],
             optional_params={},
             litellm_params={},
+            api_key=token,
         )
 
     assert [value for name, value in headers.items() if name.lower() == "user-agent"] == [
@@ -2369,3 +2373,50 @@ def test_native_messages_user_agent_is_subscription_only(oauth):
     assert [value for name, value in headers.items() if name.lower() == "user-agent"] == [
         ANTHROPIC_SUBSCRIPTION_USER_AGENT if oauth else "other-client/1.0"
     ]
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages", "count_tokens", "auth_header"])
+@pytest.mark.parametrize("token", ["sk-ant-oat-raw", "Bearer sk-ant-oat-raw", "bearer sk-ant-oat-raw"])
+def test_raw_subscription_tokens_require_database_managed_credentials(surface, token):
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    from litellm.llms.anthropic.count_tokens.transformation import AnthropicCountTokensConfig
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    with pytest.raises(AuthenticationError, match="database-managed"):
+        if surface == "auth_header":
+            AnthropicModelInfo.get_auth_header(token)
+        elif surface == "count_tokens":
+            AnthropicCountTokensConfig().get_required_headers(token)
+        elif surface == "messages":
+            AnthropicMessagesConfig().validate_anthropic_messages_environment(
+                {}, "claude-test", [], {}, {"litellm_credential_name": "forged"}, api_key=token
+            )
+        else:
+            AnthropicModelInfo().validate_environment(
+                {}, "claude-test", [], {}, {"litellm_credential_name": "forged"}, api_key=token
+            )
+
+
+@pytest.mark.parametrize("header_name", ["authorization", "Authorization", "AUTHORIZATION", "X-Api-Key"])
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_forwarded_subscription_headers_are_rejected(surface, header_name):
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    headers = {header_name: "Bearer sk-ant-oat-manually-supplied"}
+    with pytest.raises(AuthenticationError, match="database-managed"):
+        if surface == "chat":
+            AnthropicModelInfo().validate_environment(headers, "claude-test", [], {}, {}, api_key=FAKE_REGULAR_KEY)
+        else:
+            AnthropicMessagesConfig().validate_anthropic_messages_environment(
+                headers, "claude-test", [], {}, {}, api_key=FAKE_REGULAR_KEY
+            )
+
+
+@pytest.mark.parametrize("env_name", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_subscription_environment_tokens_are_rejected(env_name):
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    with patch.dict(os.environ, {env_name: "sk-ant-oat-from-environment"}, clear=True):
+        with pytest.raises(AuthenticationError, match="database-managed"):
+            AnthropicModelInfo.get_auth_header()

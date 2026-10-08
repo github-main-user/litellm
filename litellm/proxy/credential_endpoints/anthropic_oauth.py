@@ -25,6 +25,7 @@ from litellm.llms.anthropic.oauth_client import (
     AnthropicOAuthClient,
     AnthropicOAuthError,
     AnthropicOAuthTokens,
+    ManagedAnthropicOAuthToken,
 )
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
@@ -89,6 +90,10 @@ class _PrismaClient(Protocol):
 
 _STRING_OBJECT_MAPPING: Final = TypeAdapter(dict[str, object])
 _OBJECT_MAPPING: Final = TypeAdapter(dict[object, object])
+
+
+class _DatabaseAnthropicCredential(CredentialItem):
+    pass
 
 
 class AnthropicOAuthStartRequest(BaseModel):
@@ -307,7 +312,7 @@ def _plaintext_credential(
     proxy_url: str | None = None,
     credential_info: Mapping[str, object] | None = None,
 ) -> CredentialItem:
-    return CredentialItem(
+    return _DatabaseAnthropicCredential(
         credential_name=credential_name,
         credential_info={
             **(credential_info or {}),
@@ -559,7 +564,11 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             raise self._authentication_error(model, credential_name) from None
         except Exception:  # noqa: BLE001  # refresh failures must not disclose token bundles
             raise self._authentication_error(model, credential_name) from None
-        return {**kwargs, "api_key": tokens.access_token, "api_base": "https://api.anthropic.com"}
+        return {
+            **kwargs,
+            "api_key": ManagedAnthropicOAuthToken(tokens.access_token),
+            "api_base": "https://api.anthropic.com",
+        }
 
     async def get_subscription_usage_auth(self, credential_name: str) -> tuple[str, str | None, str | None]:
         credential: Final = await self._find_or_load(credential_name)
@@ -586,7 +595,7 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                 identity,
                 rejected_access_token=rejected_access_token,
             )
-        return recovered.access_token
+        return ManagedAnthropicOAuthToken(recovered.access_token)
 
     @staticmethod
     def _authentication_error(model: object, credential_name: str) -> AuthenticationError:
@@ -598,12 +607,33 @@ class AnthropicOAuthCredentialHook(CustomLogger):
 
     async def _find_or_load(self, credential_name: str) -> CredentialItem | None:
         cached: Final = _find_cached(credential_name)
-        if cached is not None:
+        if cached is not None and (
+            isinstance(cached, _DatabaseAnthropicCredential) or not _is_managed_credential(cached)
+        ):
             return cached
         from litellm.proxy.proxy_server import prisma_client
 
         if prisma_client is None:
+            if cached is not None:
+                raise RuntimeError("Database not connected")
             return None
+        if cached is not None:
+            database: Final = cast(_PrismaClient, prisma_client).db
+            async with database.tx(timeout=ANTHROPIC_REFRESH_TRANSACTION_TIMEOUT) as transaction:
+                stored: Final = await transaction.litellm_credentialstable.find_unique(
+                    where={"credential_name": credential_name}
+                )
+            if stored is None or not _is_managed_credential(stored):
+                return None
+            stored_tokens: Final = _tokens_from_row(stored)
+            cached_tokens: Final = _tokens_from_plaintext(cached)
+            if cached_tokens is not None and cached_tokens.account_id != stored_tokens.account_id:
+                raise ValueError("Anthropic OAuth account identity changed")
+            stored_plaintext: Final = _plaintext_credential(
+                credential_name, stored_tokens, _proxy_from_row(stored), _credential_info_from_row(stored)
+            )
+            CredentialAccessor.upsert_credentials([stored_plaintext])
+            return stored_plaintext
         row: Final = await CredentialsRepository(prisma_client).find_by_name(credential_name)
         if row is None or not _is_managed_credential(row):
             return row

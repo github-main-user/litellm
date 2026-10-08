@@ -12,6 +12,7 @@ from litellm.models.credentials import CredentialItem
 from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     CHATGPT_CREDENTIAL_VALUE_KEY,
     ChatGPTOAuthCredentialHook,
+    _DatabaseChatGPTCredential,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import ResponsesAPIResponse
@@ -30,7 +31,7 @@ def _credential(name: str, account_id: str, access_token: str, *, expired: bool 
         expires_at=int(time.time()) - 3600 if expired else int(time.time()) + 3600,
         account_id=account_id,
     )
-    return CredentialItem(
+    return _DatabaseChatGPTCredential(
         credential_name=name,
         credential_info={"provider": "chatgpt", "auth_type": "oauth"},
         credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
@@ -163,23 +164,15 @@ async def test_expired_managed_credentials_fail_over_to_third_account(
     def upstream(request: httpx.Request, **_kwargs: object) -> httpx.Response:
         assert request.url.host == "chatgpt.com"
         requests.append(request)
-        if api == "acompletion":
-            return httpx.Response(
-                200,
-                request=request,
-                json={
-                    "id": "chatcmpl-third",
-                    "object": "chat.completion",
-                    "created": 1741476542,
-                    "model": "gpt-5.4",
-                    "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                },
-            )
         response = _response(3).model_dump()
         response["object"] = "response"
+        response["output"] = [{
+            "type": "message",
+            "id": "msg-third",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }]
         return httpx.Response(
             200,
             request=request,

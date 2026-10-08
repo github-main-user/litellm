@@ -322,10 +322,13 @@ def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tup
     Returns:
         Tuple of (updated headers, api_key)
     """
+    from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
+
+    validate_anthropic_subscription_auth(api_key, headers)
     # Check Authorization header (passthrough / forwarded requests)
     auth_header: Final = next((value for name, value in headers.items() if name.lower() == "authorization"), "")
     if auth_header.startswith(f"Bearer {ANTHROPIC_OAUTH_TOKEN_PREFIX}"):
-        api_key = auth_header.removeprefix("Bearer ")
+        api_key = api_key or auth_header.removeprefix("Bearer ")
         for name in tuple(
             header_name for header_name in headers if header_name.lower() in ("x-api-key", "authorization")
         ):
@@ -999,6 +1002,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         api_base: str | None = None,
         use_bearer_for_custom_base: bool = False,
     ) -> dict:
+        from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
+
+        validate_anthropic_subscription_auth(api_key)
+        validate_anthropic_subscription_auth(auth_token)
         betas: Final = set()
         # Anthropic no longer requires the prompt-caching beta header
         # Prompt caching now works automatically when cache_control is used in messages
@@ -1149,9 +1156,12 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
     @staticmethod
     def get_api_key(api_key: str | None = None) -> str | None:
+        from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
         from litellm.secret_managers.main import get_secret_str
 
-        return api_key or get_secret_str("ANTHROPIC_API_KEY")
+        resolved_key: Final = api_key or get_secret_str("ANTHROPIC_API_KEY")
+        validate_anthropic_subscription_auth(resolved_key)
+        return resolved_key
 
     @staticmethod
     def get_auth_token(auth_token: str | None = None) -> str | None:
@@ -1160,9 +1170,12 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         Unlike api_key (which uses X-Api-Key header), auth_token uses
         Authorization: Bearer header, matching the official Anthropic SDK behavior.
         """
+        from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
         from litellm.secret_managers.main import get_secret_str
 
-        return auth_token or get_secret_str("ANTHROPIC_AUTH_TOKEN")
+        resolved_token: Final = auth_token or get_secret_str("ANTHROPIC_AUTH_TOKEN")
+        validate_anthropic_subscription_auth(resolved_token)
+        return resolved_token
 
     @staticmethod
     def get_auth_header(

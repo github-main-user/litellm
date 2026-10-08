@@ -37,6 +37,39 @@ ANTHROPIC_OAUTH_SCOPES: Final = ("org:create_api_key", *ANTHROPIC_OAUTH_REFRESH_
 ANTHROPIC_OAUTH_TIMEOUT_SECONDS: Final = 30.0
 
 
+class ManagedAnthropicOAuthToken(str):
+    pass
+
+
+def validate_anthropic_subscription_auth(
+    api_key: str | None, headers: Mapping[object, object] | None = None
+) -> None:
+    import litellm
+
+    managed: Final = isinstance(api_key, ManagedAnthropicOAuthToken)
+    raw_key: Final = _anthropic_auth_token(api_key) if api_key is not None else None
+    header_tokens: Final = tuple(
+        _anthropic_auth_token(value)
+        for name, value in (headers or {}).items()
+        if isinstance(name, str)
+        and name.lower() in {"authorization", "x-api-key"}
+        and isinstance(value, str)
+    )
+    if (raw_key is not None and raw_key.startswith("sk-ant-oat") and not managed) or any(
+        token.startswith("sk-ant-oat") and (not managed or token != api_key) for token in header_tokens
+    ):
+        raise litellm.AuthenticationError(
+            message="Anthropic subscription OAuth requires a database-managed credential via litellm_credential_name",
+            llm_provider="anthropic",
+            model="anthropic",
+        )
+
+
+def _anthropic_auth_token(value: str) -> str:
+    scheme, separator, token = value.strip().partition(" ")
+    return token.strip() if separator and scheme.lower() == "bearer" else value.strip()
+
+
 class AsyncHTTPClient(Protocol):
     async def post(
         self,

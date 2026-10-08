@@ -491,9 +491,19 @@ async def test_hook_selects_managed_accounts_and_bypasses_regular_api_keys() -> 
     ]
     try:
         hook = AnthropicOAuthCredentialHook()
-        result = await hook.async_pre_call_deployment_hook(
-            {"model": "anthropic/claude", "litellm_credential_name": "account-b"}, None
-        )
+        database = _AdvisoryLockDatabase(SimpleNamespace(
+            credential_info={"provider": "anthropic", "auth_type": "oauth"},
+            credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: AnthropicOAuthTokens(
+                "sk-ant-oat-b", "refresh-b", now, "id-b"
+            ).to_json()},
+        ))
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+            patch("litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper", side_effect=lambda value, *args, **kwargs: value),
+        ):
+            result = await hook.async_pre_call_deployment_hook(
+                {"model": "anthropic/claude", "litellm_credential_name": "account-b"}, None
+            )
         bypassed = await hook.async_pre_call_deployment_hook(
             {"model": "anthropic/claude", "litellm_credential_name": "api-key"}, None
         )
@@ -507,6 +517,27 @@ async def test_hook_selects_managed_accounts_and_bypasses_regular_api_keys() -> 
     assert result is not None
     assert result["api_key"] == "sk-ant-oat-b"
     assert result["api_base"] == "https://api.anthropic.com"
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+    from litellm.llms.anthropic.count_tokens.transformation import AnthropicCountTokensConfig
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+
+    managed_token = result["api_key"]
+    chat_headers = AnthropicModelInfo().validate_environment(
+        headers={}, model="claude-test", messages=[], optional_params={}, litellm_params={}, api_key=managed_token
+    )
+    native_headers, _ = AnthropicMessagesConfig().validate_anthropic_messages_environment(
+        headers={}, model="claude-test", messages=[], optional_params={}, litellm_params={}, api_key=managed_token
+    )
+    count_headers = AnthropicCountTokensConfig().get_required_headers(managed_token)
+    from litellm.llms.anthropic.skills.transformation import AnthropicSkillsConfig
+    from litellm.types.router import GenericLiteLLMParams
+
+    skills_headers = AnthropicSkillsConfig().validate_environment(
+        headers={}, litellm_params=GenericLiteLLMParams(api_key=managed_token)
+    )
+    assert skills_headers["authorization"] == chat_headers["authorization"]
+    assert chat_headers["authorization"] == native_headers["authorization"] == count_headers["authorization"]
+    assert chat_headers["authorization"] == f"Bearer {managed_token}"
     assert bypassed is None
 
 
@@ -790,7 +821,7 @@ async def test_rejected_token_recovery_uses_stored_proxy_and_preserves_concurren
 
             async def find_unique(self, *, where):
                 self.calls += 1
-                return old_row if self.calls == 1 else new_row
+                return old_row if self.calls <= 2 else new_row
 
             async def update(self, *, where, data):
                 updates.append(data)
@@ -999,3 +1030,21 @@ async def test_recovery_rechecks_stored_account_and_expiry(stored_account: str, 
             else:
                 assert result == stored.access_token
                 client.refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_auth_type", [None, "api_key"])
+async def test_cached_oauth_config_requires_managed_database_row(stored_auth_type):
+    tokens = AnthropicOAuthTokens("sk-ant-oat-config", "refresh-config", time.time() + 3600, "account")
+    stored = None if stored_auth_type is None else SimpleNamespace(
+        credential_info={"provider": "anthropic", "auth_type": stored_auth_type},
+        credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: tokens.to_json()},
+    )
+    with (
+        patch.object(litellm, "credential_list", [_credential("config-only", tokens)]),
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=_AdvisoryLockDatabase(stored))),
+    ):
+        with pytest.raises(AuthenticationError, match="unavailable"):
+            await AnthropicOAuthCredentialHook().async_pre_call_deployment_hook(
+                {"model": "anthropic/claude", "litellm_credential_name": "config-only"}, None
+            )

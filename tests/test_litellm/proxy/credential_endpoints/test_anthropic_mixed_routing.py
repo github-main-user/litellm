@@ -17,10 +17,12 @@ from litellm.models.credentials import CredentialItem
 from litellm.proxy.credential_endpoints.anthropic_oauth import (
     ANTHROPIC_CREDENTIAL_VALUE_KEY,
     AnthropicOAuthCredentialHook,
+    _DatabaseAnthropicCredential,
 )
 from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     CHATGPT_CREDENTIAL_VALUE_KEY,
     ChatGPTOAuthCredentialHook,
+    _DatabaseChatGPTCredential,
 )
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponse
@@ -40,7 +42,7 @@ def _anthropic_oauth_credential(name: str, token: str, account_id: str) -> Crede
         expires_at=time.time() + 3600,
         account_id=account_id,
     )
-    return CredentialItem(
+    return _DatabaseAnthropicCredential(
         credential_name=name,
         credential_info={"provider": "anthropic", "auth_type": "oauth"},
         credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: tokens.to_json()},
@@ -63,7 +65,7 @@ def _chatgpt_credential() -> CredentialItem:
         expires_at=int(time.time()) + 3600,
         account_id="chatgpt-account",
     )
-    return CredentialItem(
+    return _DatabaseChatGPTCredential(
         credential_name="chatgpt-subscription",
         credential_info={"provider": "chatgpt", "auth_type": "oauth"},
         credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
@@ -287,7 +289,10 @@ async def test_chat_routes_apply_only_the_selected_named_credential(
     for call, token in zip(anthropic_calls[:2], ("sk-ant-oat-a", "sk-ant-oat-b")):
         assert _header(call["headers"], "authorization") == f"Bearer {token}"
         assert _header(call["headers"], "x-api-key") is None
-        assert _system_texts(call["data"]) == [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT, "caller system"]
+        assert _system_texts(call["data"]) == [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT]
+        assert [block["text"] for block in call["data"]["messages"][0]["content"]] == [
+            "<system-reminder>", "caller system", "</system-reminder>", "hello"
+        ]
 
     api_key_call = anthropic_calls[2]
     assert _header(api_key_call["headers"], "authorization") is None
@@ -349,9 +354,14 @@ async def test_anthropic_failover_rebuilds_oauth_and_api_key_requests(
     assert [_system_texts(call["data"]) for call in attempts] == [
         ["do not leak this request"]
         if deployment == ANTHROPIC_API
-        else [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT, "do not leak this request"]
+        else [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT]
         for deployment in order
     ]
+    for call, deployment in zip(attempts, order):
+        if deployment != ANTHROPIC_API:
+            assert [block["text"] for block in call["data"]["messages"][0]["content"]] == [
+                "<system-reminder>", "do not leak this request", "</system-reminder>", "hello"
+            ]
 
 
 @pytest.mark.asyncio
@@ -385,4 +395,7 @@ async def test_streaming_route_uses_selected_anthropic_account_without_stale_sta
     assert _header(call["headers"], "authorization") == "Bearer sk-ant-oat-b"
     assert _header(call["headers"], "x-api-key") is None
     assert call["data"]["stream"] is True
-    assert _system_texts(call["data"]) == [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT, "stream system"]
+    assert _system_texts(call["data"]) == [ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT]
+    assert [block["text"] for block in call["data"]["messages"][0]["content"]] == [
+        "<system-reminder>", "stream system", "</system-reminder>", "hello"
+    ]

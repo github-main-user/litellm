@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Generic, Literal, TypeVar, get_type_hints
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidatorFunctionWrapHandler, field_validator, model_validator
 from typing_extensions import Protocol, ReadOnly, Required, TypedDict, runtime_checkable
 
 from litellm._logging import verbose_logger
@@ -263,6 +263,14 @@ class ModelInfo(MirroredPricingParams):
 
 
 class CredentialLiteLLMParams(BaseModel):
+    @field_validator("api_key", mode="wrap")
+    @classmethod
+    def preserve_api_key_type(cls, value: object, handler: ValidatorFunctionWrapHandler) -> str | None:
+        validated: Final = handler(value)
+        if validated is not None and not isinstance(validated, str):
+            raise ValueError("API key must be a string")
+        return value if isinstance(value, str) else validated
+
     api_key: str | None = None
     api_base: str | None = None
     api_version: str | None = None

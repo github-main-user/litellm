@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
 from litellm.llms.custom_httpx.http_handler import HTTPHandler, _get_httpx_client
 
@@ -83,6 +84,20 @@ class ChatGPTTokens:
         if not isinstance(parsed, dict):
             raise TypeError("ChatGPT token bundle must be an object")
         return cls.from_mapping(parsed)
+
+
+class ManagedChatGPTAccessToken(str):
+    pass
+
+
+def require_managed_chatgpt_access_token(model: str, credential_name: object, access_token: str | None) -> str:
+    if isinstance(access_token, ManagedChatGPTAccessToken) and isinstance(credential_name, str) and credential_name:
+        return access_token
+    raise AuthenticationError(
+        model=model,
+        llm_provider="chatgpt",
+        message="ChatGPT requires a managed OAuth credential. Connect an account and set litellm_credential_name.",
+    )
 
 
 class ChatGPTOAuthClient:

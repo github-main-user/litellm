@@ -5,6 +5,8 @@ import time
 import httpx
 import pytest
 
+import litellm
+from litellm.exceptions import AuthenticationError
 from litellm.llms.chatgpt.common_utils import (
     CHATGPT_DEVICE_CODE_URL,
     CHATGPT_DEVICE_TOKEN_URL,
@@ -15,8 +17,27 @@ from litellm.llms.chatgpt.oauth_client import (
     ChatGPTDeviceCode,
     ChatGPTOAuthClient,
     ChatGPTTokens,
+    require_managed_chatgpt_access_token,
 )
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
+from litellm.models.credentials import CredentialItem
+
+
+@pytest.mark.parametrize("provider,auth_type,bundle", [
+    ("anthropic", "oauth", ChatGPTTokens("token", "refresh", "id", 9999999999, "account").to_json()),
+    ("chatgpt", "api_key", ChatGPTTokens("token", "refresh", "id", 9999999999, "account").to_json()),
+    ("chatgpt", "oauth", "invalid-json"),
+])
+def test_rejects_credentials_not_managed_chatgpt_oauth(
+    monkeypatch: pytest.MonkeyPatch, provider: str, auth_type: str, bundle: str
+) -> None:
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="subscription",
+        credential_info={"provider": provider, "auth_type": auth_type},
+        credential_values={"litellm_internal_chatgpt_auth_token": bundle},
+    )])
+    with pytest.raises(AuthenticationError, match="managed OAuth credential"):
+        require_managed_chatgpt_access_token("test-model", "subscription", "token")
 
 
 def _jwt(payload: dict[str, object]) -> str:

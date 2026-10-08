@@ -72,6 +72,9 @@ class AnthropicBatchesConfig(BaseBatchesConfig):
         """Validate and prepare environment-specific headers and parameters."""
         if api_base is None and isinstance(litellm_params, dict):
             api_base = litellm_params.get("api_base")
+        from litellm.llms.anthropic.oauth_client import validate_anthropic_subscription_auth
+
+        validate_anthropic_subscription_auth(api_key, headers)
         auth_header: Final = self.anthropic_model_info.get_auth_header(api_key, api_base)
         if auth_header is None:
             raise ValueError(

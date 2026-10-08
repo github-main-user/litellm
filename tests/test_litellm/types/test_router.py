@@ -3,6 +3,8 @@ import logging
 import pytest
 from pydantic import ValidationError
 
+from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+from litellm.llms.chatgpt.oauth_client import ManagedChatGPTAccessToken
 from litellm.types.router import (
     SPECIAL_MODEL_INFO_PARAMS,
     Deployment,
@@ -11,6 +13,26 @@ from litellm.types.router import (
     ModelInfo,
 )
 from litellm.types.utils import CustomPricingLiteLLMParams, MirroredPricingParams
+
+
+@pytest.mark.parametrize("token", [ManagedAnthropicOAuthToken("sk-ant-oat-test"), ManagedChatGPTAccessToken("token")])
+def test_managed_token_provenance_survives_internal_parameter_roundtrip(token: str) -> None:
+    params = GenericLiteLLMParams(api_key=token)
+    restored = GenericLiteLLMParams(**params.model_dump())
+    assert restored.api_key is token
+    external = GenericLiteLLMParams.model_validate_json(params.model_dump_json())
+    assert type(external.api_key) is str
+
+
+@pytest.mark.parametrize("api_key", [None, "api-key", b"api-key"])
+def test_api_key_validation_keeps_existing_inputs(api_key: str | bytes | None) -> None:
+    assert GenericLiteLLMParams(api_key=api_key).api_key == ("api-key" if api_key is not None else None)
+
+
+@pytest.mark.parametrize("api_key", [123, [], {}])
+def test_api_key_validation_rejects_non_strings(api_key: object) -> None:
+    with pytest.raises(ValidationError):
+        GenericLiteLLMParams(api_key=api_key)
 
 
 def test_model_info_declares_mirrored_pricing_fields():

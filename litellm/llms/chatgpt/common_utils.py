@@ -30,6 +30,10 @@ DEFAULT_USER_AGENT: Final = f"{DEFAULT_ORIGINATOR}/{CODEX_CLI_VERSION} (Unknown 
 CHATGPT_DEFAULT_INSTRUCTIONS: Final = "You are a helpful assistant."
 
 
+def get_chatgpt_api_base() -> str:
+    return os.getenv("CHATGPT_API_BASE") or os.getenv("OPENAI_CHATGPT_API_BASE") or CHATGPT_API_BASE
+
+
 def chatgpt_quota_reset_seconds(exception: Exception) -> float | None:
     if getattr(exception, "status_code", None) != 429 or getattr(exception, "llm_provider", None) != "chatgpt":
         return None
