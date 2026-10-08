@@ -6679,3 +6679,58 @@ def test_subscription_normalization_does_not_contaminate_api_key_fallback():
     assert oauth_body["tools"][0]["name"] == "Read"
     assert api_body["tools"][0]["name"] == "read"
     assert ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY not in params
+
+
+def test_chat_router_bookkeeping_is_filtered_before_anthropic_http_request():
+    import json
+    from typing import Final
+
+    import httpx
+    from pydantic import JsonValue
+
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    bodies: Final[list[dict[str, JsonValue]]] = []
+    schema: Final = {
+        "type": "object",
+        "properties": {"_encrypted_content_affinity_pinned": {"type": "boolean"}},
+    }
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_internal",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Done"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(upstream)) as raw_client:
+        valid_params: Final = {
+            "model": "anthropic/claude-sonnet-4-6",
+            "api_key": "test-key",
+            "client": HTTPHandler(client=raw_client),
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "ping"}],
+            "tools": [{"type": "function", "function": {"name": "inspect", "parameters": schema}}],
+            "provider_extension": {"_encrypted_content_affinity_pinned": "user"},
+        }
+        litellm.completion(**valid_params)
+        litellm.completion(
+            **valid_params,
+            _encrypted_content_affinity_pinned=True,
+            _retry_skipped_deployment_ids=["skipped"],
+            _target_order=2,
+        )
+
+    assert len(bodies) == 2
+    assert bodies[1] == bodies[0]
+    assert bodies[1]["tools"][0]["input_schema"] == schema
+    assert bodies[1]["provider_extension"] == {"_encrypted_content_affinity_pinned": "user"}

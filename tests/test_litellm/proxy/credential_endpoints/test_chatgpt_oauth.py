@@ -379,3 +379,122 @@ async def test_start_reuses_saved_proxy_when_omitted_or_null(payload: dict[str, 
         litellm.credential_list = previous
 
     assert seen == [saved_proxy]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "chatgpt"])
+@pytest.mark.parametrize("lookup", ["saved", "new", "failure", "corrupt"])
+async def test_oauth_start_cold_cache_checks_database_before_network(monkeypatch, provider, lookup):
+    from fastapi import HTTPException
+
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.credential_endpoints import anthropic_oauth, chatgpt_oauth
+
+    module = anthropic_oauth if provider == "anthropic" else chatgpt_oauth
+    request_type = module.AnthropicOAuthStartRequest if provider == "anthropic" else module.ChatGPTOAuthStartRequest
+    start = module.start_anthropic_oauth if provider == "anthropic" else module.start_chatgpt_oauth
+    client_name = "AnthropicOAuthClient" if provider == "anthropic" else "ChatGPTOAuthClient"
+    monkeypatch.setenv("LITELLM_SALT_KEY", "cold-cache-key")
+    monkeypatch.setattr(litellm, "credential_list", [])
+    proxy = "socks5h://user:secret@proxy.invalid:1080"
+    row = CredentialItem(
+        credential_name="cold-subscription",
+        credential_info={"provider": provider, "auth_type": "oauth", "proxy_configured": True},
+        credential_values={CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(proxy)} if lookup == "saved" else {},
+    )
+    repository_lookup = AsyncMock(return_value=None if lookup == "new" else row)
+    if lookup == "failure":
+        repository_lookup.side_effect = RuntimeError("secret database connection")
+    client = MagicMock()
+    client.return_value.begin_authorization.return_value = SimpleNamespace(
+        state="state", code_verifier="verifier", authorization_url="https://example.com/auth"
+    )
+    client.return_value.request_device_code.return_value = ChatGPTDeviceCode(
+        device_auth_id="device", user_code="code", interval_seconds=1
+    )
+    prisma = SimpleNamespace(
+        db=SimpleNamespace(litellm_credentialstable=SimpleNamespace(find_unique=repository_lookup))
+    )
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),
+        patch.object(module, client_name, client),
+    ):
+        if lookup in {"failure", "corrupt"}:
+            with pytest.raises(HTTPException) as error:
+                await start(request_type(credential_name="cold-subscription"), UserAPIKeyAuth(
+                    user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
+                ))
+            assert "secret" not in str(error.value.detail)
+            client.assert_not_called()
+        else:
+            await start(request_type(credential_name="cold-subscription"), UserAPIKeyAuth(
+                user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
+            ))
+            client.assert_called_once_with(proxy_url=proxy if lookup == "saved" else None)
+        repository_lookup.assert_awaited_once_with(where={"credential_name": "cold-subscription"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "refresh-expired", "refresh-fresh", "store", "refresh-latest", "store-latest"])
+@pytest.mark.parametrize("proxy_value", [None, "", 17, False, "undecryptable", "encrypted-empty", "encrypted-invalid"])
+async def test_chatgpt_database_required_proxy_fails_closed(monkeypatch, operation, proxy_value):
+    from litellm.proxy.credential_endpoints.chatgpt_oauth import _store_tokens
+
+    monkeypatch.setenv("LITELLM_SALT_KEY", "chatgpt-required-proxy-key")
+    monkeypatch.setattr(litellm, "credential_list", [])
+    tokens = ChatGPTTokens(
+        access_token="access", refresh_token="refresh", id_token="id",
+        expires_at=int(time.time()) + (3600 if operation == "refresh-fresh" else -1), account_id="account",
+    )
+    if proxy_value == "encrypted-empty":
+        proxy_value = encrypt_value_helper("")
+    elif proxy_value == "encrypted-invalid":
+        proxy_value = encrypt_value_helper("not-a-proxy")
+    row = SimpleNamespace(
+        credential_name="subscription",
+        credential_info={"provider": "chatgpt", "auth_type": "oauth", "proxy_configured": True},
+        credential_values={
+            CHATGPT_CREDENTIAL_VALUE_KEY: encrypt_value_helper(tokens.to_json()),
+            **({CREDENTIAL_PROXY_VALUE_KEY: proxy_value} if proxy_value is not None else {}),
+        },
+    )
+    transaction = MagicMock()
+    transaction.execute_raw = AsyncMock()
+    valid_proxy = "http://proxy.invalid:8080"
+    valid_row = SimpleNamespace(
+        credential_name=row.credential_name, credential_info=row.credential_info,
+        credential_values={**row.credential_values, CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(valid_proxy)},
+    )
+    transaction.litellm_credentialstable.find_unique = AsyncMock(
+        side_effect=[valid_row, row] if operation.endswith("latest") else None,
+        return_value=row,
+    )
+    transaction.litellm_credentialstable.update = AsyncMock()
+    transaction.litellm_credentialstable.create = AsyncMock()
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=transaction)
+    context.__aexit__ = AsyncMock(return_value=None)
+    prisma = MagicMock()
+    prisma.db.tx.return_value = context
+    client = MagicMock()
+    client.refresh.return_value = tokens
+    hook = ChatGPTOAuthCredentialHook(oauth_client=client)
+    prisma.db.litellm_credentialstable.find_unique = AsyncMock(return_value=vars(row))
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),
+        patch("litellm.proxy.credential_endpoints.chatgpt_oauth.ChatGPTOAuthClient", return_value=client),
+    ):
+        with pytest.raises((ValueError, TypeError)):
+            if operation == "load":
+                await hook._find_or_load_credential("subscription")
+            elif operation.startswith("store"):
+                await _store_tokens("subscription", tokens, "admin", None,
+                    valid_proxy if operation.endswith("latest") else None)
+            else:
+                await hook._refresh_tokens("subscription")
+    if operation != "refresh-latest":
+        client.refresh.assert_not_called()
+    transaction.litellm_credentialstable.update.assert_not_awaited()
+    transaction.litellm_credentialstable.create.assert_not_awaited()
+    assert litellm.credential_list == []
+    assert row.credential_info["proxy_configured"] is True

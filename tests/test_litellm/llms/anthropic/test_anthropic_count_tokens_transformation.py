@@ -125,3 +125,36 @@ def test_subscription_transform_canonicalizes_identity_and_tools_without_mutatin
     assert result["messages"][1]["content"][0]["name"] == "Read"
     assert messages == original_messages
     assert tools == original_tools
+
+
+def test_count_tokens_filters_bookkeeping_only_at_top_level():
+    from typing import Final
+
+    schema: Final = {
+        "type": "object",
+        "properties": {"_encrypted_content_affinity_pinned": {"type": "boolean"}},
+    }
+    messages: Final = [{"role": "user", "content": "ping"}]
+    tools: Final = [{"name": "inspect", "input_schema": schema}]
+    tool_choice: Final = {"type": "tool", "name": "inspect"}
+    result: Final = AnthropicCountTokensConfig().transform_request_to_count_tokens(
+        model="claude-sonnet-4-6",
+        messages=messages,
+        tools=tools,
+        system="Be helpful",
+        optional_params={
+            "_encrypted_content_affinity_pinned": True,
+            "_retry_skipped_deployment_ids": ["skipped"],
+            "_target_order": 2,
+            "tool_choice": tool_choice,
+            "thinking": {"type": "disabled"},
+        },
+    )
+    assert result == {
+        "model": "claude-sonnet-4-6",
+        "messages": messages,
+        "tools": tools,
+        "system": "Be helpful",
+        "tool_choice": tool_choice,
+        "thinking": {"type": "disabled"},
+    }

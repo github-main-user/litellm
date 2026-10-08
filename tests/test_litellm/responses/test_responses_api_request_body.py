@@ -871,3 +871,87 @@ async def test_a_native_responses_provider_places_every_point_itself():
 
     assert user_only == [0, 2, 4, 6]
     assert with_unmatchable_system == user_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["anthropic/claude-sonnet-4-6", "openai/gpt-5.6"])
+async def test_responses_router_bookkeeping_never_reaches_http_body(model):
+    from typing import Final
+
+    from pydantic import JsonValue
+
+    internal_params: Final = {
+        "_encrypted_content_affinity_pinned": True,
+        "_target_order": 2,
+        "_excluded_deployment_ids": ["excluded"],
+        "_retry_skipped_deployment_ids": ["skipped"],
+        "_alias_marker_forwarded_params": ("temperature",),
+        "_router_weights": {"deployment": 1},
+    }
+    schema: Final = {
+        "type": "object",
+        "properties": {key: {"type": "string"} for key in internal_params},
+    }
+    bodies: Final[list[dict[str, JsonValue]]] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if model.startswith("openai/"):
+            return httpx.Response(200, json=_minimal_responses_api_payload("resp_internal", model.split("/", 1)[1]))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_internal",
+                "type": "message",
+                "role": "assistant",
+                "model": model.split("/", 1)[1],
+                "content": [{"type": "text", "text": "Done"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    injected_client: Final = AsyncHTTPHandler()
+    await injected_client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw_client:
+        injected_client.client = raw_client
+        valid_params: Final = {
+            "model": model,
+            "input": "ping",
+            "api_key": "test-key",
+            "client": injected_client,
+            "max_output_tokens": 50,
+            "tools": [{"type": "function", "name": "inspect", "parameters": schema}],
+            **({"provider_extension": {"_target_order": "top-level-user"}} if model.startswith("anthropic/") else {}),
+            "extra_body": {
+                "provider_extension": {"_target_order": "user"},
+                "another_extension": {"_router_weights": {"nested": 1}},
+                **({"max_tokens": 60, "metadata": {"user_id": "user-123"}} if model.startswith("anthropic/") else {}),
+            },
+        }
+        await litellm.aresponses(**valid_params)
+        await litellm.aresponses(
+            **{
+                **valid_params,
+                "extra_body": {
+                    **valid_params["extra_body"],
+                    **(internal_params if model.startswith("anthropic/") else {}),
+                },
+            },
+            **internal_params,
+        )
+
+    assert len(bodies) == 2
+    assert bodies[1] == bodies[0]
+    assert "extra_body" not in bodies[1]
+    assert not internal_params.keys() & bodies[1].keys()
+    assert bodies[1]["provider_extension"] == {"_target_order": "user"}
+    assert bodies[1]["another_extension"] == {"_router_weights": {"nested": 1}}
+    if model.startswith("anthropic/"):
+        assert bodies[1]["max_tokens"] == 60
+        assert bodies[1]["metadata"] == {"user_id": "user-123"}
+    assert valid_params["extra_body"]["provider_extension"] == {"_target_order": "user"}
+    assert bodies[1]["tools"][0].get("parameters", bodies[1]["tools"][0].get("input_schema")) == schema
+    assert internal_params["_encrypted_content_affinity_pinned"] is True
+    assert internal_params["_retry_skipped_deployment_ids"] == ["skipped"]

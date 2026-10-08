@@ -3831,8 +3831,18 @@ bedrock_batch_litellm_params: Final = (
     "bedrock_tags",
 )
 
+router_internal_litellm_params: Final = (
+    "_router_weights",
+    "_encrypted_content_affinity_pinned",
+    "_target_order",
+    "_excluded_deployment_ids",
+    "_retry_skipped_deployment_ids",
+    "_alias_marker_forwarded_params",
+)
+
 all_litellm_params = (
-    agentic_loop_internal_litellm_params
+    list(router_internal_litellm_params)
+    + agentic_loop_internal_litellm_params
     + [TRUSTED_CALLBACK_VARS_FIELD, ADDRESSED_RESPONSE_ID_FIELD, *bedrock_batch_litellm_params]
     + [
         "metadata",
@@ -3883,7 +3893,6 @@ all_litellm_params = (
         "id",
         "fallbacks",
         "routing_strategy",
-        "_router_weights",
         "azure",
         "headers",
         "model_list",

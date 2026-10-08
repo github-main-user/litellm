@@ -1917,6 +1917,13 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         from litellm.litellm_core_utils.prompt_templates.factory import (
             anthropic_messages_pt,
         )
+        from litellm.types.utils import router_internal_litellm_params
+
+        extra_body: Final = optional_params.pop("extra_body", None)
+        if isinstance(extra_body, dict):
+            optional_params.update(extra_body)
+        for internal_param in router_internal_litellm_params:
+            optional_params.pop(internal_param, None)
 
         subscription_request: Final = is_anthropic_subscription_request(headers)
         cast(dict[str, object], litellm_params).pop(ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, None)

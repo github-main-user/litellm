@@ -267,6 +267,20 @@ def _is_native_anthropic_config(provider_config: object) -> bool:
     return provider_config.__class__.__module__.startswith("litellm.llms.anthropic.")
 
 
+def _validate_anthropic_retry_proxy(client: AsyncHTTPHandler, params: Mapping[str, object]) -> None:
+    from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
+
+    credential_name: Final = params.get("litellm_credential_name")
+    if not isinstance(credential_name, str) or not credential_name:
+        return
+    try:
+        proxy_url: Final = get_credential_proxy_url(credential_name)
+    except ValueError:
+        raise _ManagedAnthropicOAuthRecoveryError("proxy routing validation", 503) from None
+    if client.proxy_url != proxy_url:
+        raise _ManagedAnthropicOAuthRecoveryError("proxy routing validation", 503)
+
+
 def _custom_logger_callbacks(logging_obj: LiteLLMLoggingObj) -> list["CustomLogger"]:
     from litellm.integrations.custom_logger import CustomLogger
     from litellm.litellm_core_utils.litellm_logging import (
@@ -430,6 +444,8 @@ class BaseLLMHTTPHandler:
                                     headers=request_headers,
                                     litellm_params=litellm_params,
                                 )
+                                if refreshed_headers is not None:
+                                    _validate_anthropic_retry_proxy(async_httpx_client, litellm_params)
                             except BaseException:
                                 await error.response.aclose()
                                 raise
@@ -2213,6 +2229,8 @@ class BaseLLMHTTPHandler:
                                     headers=request_headers,
                                     litellm_params=litellm_params_dict,
                                 )
+                                if refreshed_headers is not None:
+                                    _validate_anthropic_retry_proxy(async_httpx_client, litellm_params_dict)
                             except BaseException:
                                 await error.response.aclose()
                                 raise

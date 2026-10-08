@@ -4093,8 +4093,13 @@ class _NativeMessagesRecoveringHook:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_common_anthropic_chat_401_recovers_for_stream_and_nonstream(stream):
+async def test_common_anthropic_chat_401_recovers_for_stream_and_nonstream(stream, monkeypatch):
     from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.models.credentials import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-common", credential_values={}, credential_info={})
+    ])
 
     responses = [
         httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
@@ -4102,6 +4107,7 @@ async def test_common_anthropic_chat_401_recovers_for_stream_and_nonstream(strea
     ]
     client = AsyncMock(spec=AsyncHTTPHandler)
     client.post = AsyncMock(side_effect=responses)
+    client.proxy_url = None
     hook = _NativeMessagesRecoveringHook()
     litellm.callbacks.insert(0, hook)
     try:
@@ -4183,8 +4189,14 @@ async def test_common_anthropic_401_closes_response_when_recovery_is_cancelled()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_native_messages_401_recovers_once_before_stream_or_body(stream):
+async def test_native_messages_401_recovers_once_before_stream_or_body(stream, monkeypatch):
     from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+    from litellm.models.credentials import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-native", credential_values={}, credential_info={})
+    ])
 
     body = {
         "id": "msg_recovered",
@@ -4208,6 +4220,7 @@ async def test_native_messages_401_recovers_once_before_stream_or_body(stream):
     ]
     client = AsyncMock(spec=AsyncHTTPHandler)
     client.post = AsyncMock(side_effect=responses)
+    client.proxy_url = None
     logging_obj = Mock()
     logging_obj.model_call_details = {}
     logging_obj.dynamic_success_callbacks = []
@@ -4223,7 +4236,7 @@ async def test_native_messages_401_recovers_once_before_stream_or_body(stream):
             litellm_params=GenericLiteLLMParams(litellm_credential_name="managed-native"),
             logging_obj=logging_obj,
             client=client,
-            api_key="sk-ant-oat01-native-old",
+            api_key=ManagedAnthropicOAuthToken("sk-ant-oat01-native-old"),
             stream=stream,
             kwargs={},
         )
@@ -4274,3 +4287,71 @@ async def test_native_messages_does_not_retry_after_stream_response_started():
 
     assert hook.calls == []
     assert client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("removed", [False, True])
+async def test_anthropic_recovery_never_replays_on_stale_proxy_transport(monkeypatch, native, stream, removed):
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.base_llm.chat.transformation import BaseLLMException
+    from litellm.models.credentials import CredentialItem
+
+    requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401 if len(requests) == 1 else 200, content=b"{}")
+
+    class RecoveringHook:
+        async def recover_rejected_token(self, credential_name, rejected_access_token):
+            CredentialAccessor.upsert_credentials([
+                CredentialItem(
+                    credential_name=credential_name,
+                    credential_info={"proxy_configured": True},
+                    credential_values={} if removed else {"litellm_internal_proxy_url": "http://proxy.invalid:8080"},
+                )
+            ])
+            return "sk-ant-oat-refreshed"
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="subscription", credential_values={}, credential_info={})
+    ])
+    monkeypatch.setattr(litellm, "callbacks", [RecoveringHook()])
+    client = AsyncHTTPHandler()
+    await client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw_client:
+        client.client = raw_client
+        with pytest.raises(BaseLLMException) as caught:
+            if native:
+                await BaseLLMHTTPHandler()._async_post_anthropic_messages_with_http_error_retry(
+                    async_httpx_client=client,
+                    request_url="https://api.anthropic.com/v1/messages",
+                    headers={"authorization": "Bearer sk-ant-oat-rejected"},
+                    signed_json_body=None,
+                    request_body={"model": "claude-test"},
+                    stream=stream,
+                    logging_obj=Mock(model_call_details={}),
+                    provider_config=AnthropicMessagesConfig(),
+                    litellm_params=GenericLiteLLMParams(litellm_credential_name="subscription"),
+                    api_key=None,
+                    model="claude-test",
+                )
+            else:
+                await BaseLLMHTTPHandler()._make_common_async_call(
+                    async_httpx_client=client,
+                    provider_config=AnthropicConfig(),
+                    api_base="https://api.anthropic.com/v1/messages",
+                    headers={"authorization": "Bearer sk-ant-oat-rejected"},
+                    data={"model": "claude-test"},
+                    timeout=60,
+                    litellm_params={"litellm_credential_name": "subscription"},
+                    logging_obj=Mock(model_call_details={}),
+                    stream=stream,
+                )
+
+    assert caught.value.status_code == 503
+    assert len(requests) == 1

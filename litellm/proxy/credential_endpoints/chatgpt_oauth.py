@@ -34,6 +34,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
+from litellm.proxy.credential_endpoints.anthropic_oauth import _proxy_for_oauth_start, _proxy_from_row
 from litellm.proxy.credential_endpoints.endpoints import CredentialHelperUtils
 from litellm.proxy.utils import jsonify_object
 from litellm.repositories.credentials_repository import CredentialsRepository
@@ -164,11 +165,14 @@ def _is_chatgpt_oauth_credential(credential: CredentialItem) -> bool:
 
 
 def _decrypt_credential(credential: CredentialItem) -> CredentialItem:
+    proxy_url: Final = _proxy_from_row(credential)
     values = {
         key: decrypt_value_helper(value=value, key=key) or value
         for key, value in credential.credential_values.items()
+        if key != CREDENTIAL_PROXY_VALUE_KEY
     }
-    proxy_url = values.get(CREDENTIAL_PROXY_VALUE_KEY)
+    if proxy_url is not None:
+        values[CREDENTIAL_PROXY_VALUE_KEY] = proxy_url
     return _DatabaseChatGPTCredential(
         credential_name=credential.credential_name,
         credential_info={
@@ -254,15 +258,7 @@ async def _store_tokens(
             and existing_tokens.account_id != tokens.account_id
         ):
             raise HTTPException(status_code=409, detail="Credential name belongs to another ChatGPT account")
-        encrypted_proxy: Final = (
-            row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY) if row is not None else None
-        )
-        current_proxy_value: Final = (
-            decrypt_value_helper(encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
-            if isinstance(encrypted_proxy, str)
-            else None
-        )
-        current_proxy: Final = current_proxy_value or None
+        current_proxy: Final = _proxy_from_row(row) if row is not None else None
         if current_proxy != previous_proxy_url:
             raise HTTPException(
                 status_code=409,
@@ -271,17 +267,7 @@ async def _store_tokens(
         latest_row: Final = await transaction.litellm_credentialstable.find_unique(
             where={"credential_name": credential_name}
         )
-        latest_encrypted_proxy: Final = (
-            latest_row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
-            if latest_row is not None
-            else None
-        )
-        latest_proxy_value: Final = (
-            decrypt_value_helper(latest_encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
-            if isinstance(latest_encrypted_proxy, str)
-            else None
-        )
-        latest_proxy: Final = latest_proxy_value or None
+        latest_proxy: Final = _proxy_from_row(latest_row) if latest_row is not None else None
         if (row is None) != (latest_row is None) or latest_proxy != current_proxy:
             raise HTTPException(
                 status_code=409,
@@ -332,9 +318,7 @@ async def start_chatgpt_oauth(
 ) -> ChatGPTOAuthStartResponse:
     credential_name: Final = _validate_credential_name(payload.credential_name)
     try:
-        previous_proxy_url: Final = (
-            get_credential_proxy_url(credential_name) if credential_name is not None else None
-        )
+        previous_proxy_url: Final = await _proxy_for_oauth_start(credential_name)
         proxy_url: Final = (
             validate_proxy_url(payload.proxy_url) if payload.proxy_url is not None else previous_proxy_url
         )
@@ -519,17 +503,10 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             if not isinstance(decrypted_value, str):
                 raise TypeError("Credential token bundle cannot be decrypted")
             stored: Final = ChatGPTTokens.from_json(decrypted_value)
+            proxy_url = _proxy_from_row(row)
             if self._is_fresh(stored):
                 refreshed = stored
             else:
-                encrypted_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
-                proxy_url = (
-                    decrypt_value_helper(encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
-                    if isinstance(encrypted_proxy, str)
-                    else None
-                ) or None
-                if proxy_url is not None and not isinstance(proxy_url, str):
-                    raise TypeError("Credential proxy configuration cannot be decrypted")
                 refresh_client: Final = (
                     ChatGPTOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
                 )
@@ -540,13 +517,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                 if latest_row is None:
                     raise ValueError("Credential was removed during refresh")
                 row = latest_row
-                latest_encrypted_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
-                latest_proxy: Final = (
-                    decrypt_value_helper(latest_encrypted_proxy, CREDENTIAL_PROXY_VALUE_KEY)
-                    if isinstance(latest_encrypted_proxy, str)
-                    else None
-                )
-                proxy_url = latest_proxy if isinstance(latest_proxy, str) and latest_proxy else None
+                proxy_url = _proxy_from_row(row)
                 encrypted_bundle: Final = encrypt_value_helper(refreshed.to_json())
                 if not isinstance(encrypted_bundle, str):
                     raise ValueError("Credential token bundle cannot be encrypted")
@@ -571,12 +542,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                 "provider": CHATGPT_CREDENTIAL_PROVIDER,
                 "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
             }
-            cached_proxy: Final = row.credential_values.get(CREDENTIAL_PROXY_VALUE_KEY)
-            plaintext_proxy: Final = (
-                decrypt_value_helper(cached_proxy, CREDENTIAL_PROXY_VALUE_KEY)
-                if isinstance(cached_proxy, str)
-                else None
-            )
+            plaintext_proxy: Final = _proxy_from_row(row)
             credential_info["proxy_configured"] = bool(plaintext_proxy)
         await publish_config_change_for_object_type("litellm_credentialstable")
         CredentialAccessor.upsert_credentials(

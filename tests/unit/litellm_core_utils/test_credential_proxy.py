@@ -221,7 +221,9 @@ def test_named_credentials_are_isolated(monkeypatch):
     assert get_credential_proxy_url("one") == "http://one.invalid:8001"
     assert get_credential_proxy_url("two") == "socks5h://two.invalid:8002"
     assert get_credential_proxy_url("none") is None
-    assert get_credential_proxy_url("missing") is None
+    assert get_credential_proxy_url(None) is None
+    with pytest.raises(ValueError, match="Named credential configuration is unavailable"):
+        get_credential_proxy_url("missing")
 
 
 def test_router_rejects_missing_named_credential(monkeypatch):
@@ -238,7 +240,7 @@ def test_router_rejects_missing_named_credential(monkeypatch):
         ]
     )
     deployment = router.get_deployment_by_model_group_name("named")
-    with pytest.raises(ValueError, match="was not found"):
+    with pytest.raises(litellm.AuthenticationError, match="was not found"):
         router._update_kwargs_with_deployment(
             deployment=deployment,
             kwargs={"metadata": {}, "_credential_proxy_url": "http://attacker.invalid:1"},

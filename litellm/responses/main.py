@@ -1234,10 +1234,14 @@ def responses(
     Uses the synchronous HTTP handler to make requests.
     """
     proxy_handler: HTTPHandler | None = None
-    proxy_url: Final = None if isinstance(kwargs.get("client"), AsyncHTTPHandler) else _credential_proxy_url(kwargs)
+    proxy_url: Final = _credential_proxy_url(kwargs)
     if proxy_url is not None:
-        proxy_handler = HTTPHandler(proxy_url=proxy_url)
-        kwargs["client"] = proxy_handler
+        if kwargs.get("aresponses") is True:
+            if not isinstance(kwargs.get("client"), AsyncHTTPHandler) or kwargs["client"].proxy_url != proxy_url:
+                raise ValueError("Credential proxy transport does not match the selected route")
+        else:
+            proxy_handler = HTTPHandler(proxy_url=proxy_url)
+            kwargs["client"] = proxy_handler
         kwargs.pop("shared_session", None)
     local_vars: Final = locals()
     local_vars.pop("proxy_url", None)

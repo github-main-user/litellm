@@ -1,3 +1,4 @@
+import asyncio
 import json
 import socketserver
 import threading
@@ -19,7 +20,7 @@ class _Proxy(socketserver.StreamRequestHandler):
         self.server.seen.append(request_line)
         body = self.server.body
         self.wfile.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: "
+            f"HTTP/1.1 {self.server.status_code}\r\nContent-Type: ".encode()
             + self.server.content_type
             + b"\r\nContent-Length: "
             + str(len(body)).encode()
@@ -29,11 +30,12 @@ class _Proxy(socketserver.StreamRequestHandler):
 
 
 @contextmanager
-def _proxy(body: bytes, content_type: bytes = b"application/json"):
+def _proxy(body: bytes, content_type: bytes = b"application/json", status_code: int = 200):
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Proxy)
     server.daemon_threads = True
     server.body = body
     server.content_type = content_type
+    server.status_code = status_code
     server.seen = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -185,3 +187,189 @@ async def test_count_tokens_keeps_two_named_accounts_on_their_own_proxies(monkey
     assert one is not None and one.total_tokens == 11
     assert two is not None and two.total_tokens == 22
     assert len(first.seen) == len(second.seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_resolves_cold_credential_before_selecting_proxy(monkeypatch):
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+
+    with _proxy(b'{"input_tokens":23}') as proxy:
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setattr(litellm, "credential_list", [])
+
+        class LoadingHook:
+            async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                CredentialAccessor.upsert_credentials([_credential("cold-account", proxy)])
+                return {**kwargs, "api_key": "sk-ant-test"}
+
+        result = await AnthropicTokenCounter(oauth_credential_hook=LoadingHook()).count_tokens(
+            "claude-test",
+            [{"role": "user", "content": "hello"}],
+            None,
+            deployment={
+                "litellm_params": {
+                    "litellm_credential_name": "cold-account",
+                    "api_base": "http://count-upstream.invalid/v1/messages/count_tokens",
+                }
+            },
+        )
+
+    assert result is not None and not result.error, result
+    assert result.total_tokens == 23
+    assert proxy.seen == ["POST http://count-upstream.invalid/v1/messages/count_tokens HTTP/1.1\r\n"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [False, True])
+async def test_count_tokens_rechecks_proxy_after_token_recovery(monkeypatch, removed):
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+
+    with _proxy(b'{"error":{"type":"authentication_error"}}', status_code=401) as first, _proxy(
+        b'{"input_tokens":29}'
+    ) as second:
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setattr(litellm, "credential_list", [_credential("subscription", first)])
+
+        class RecoveringHook:
+            async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                return {**kwargs, "api_key": ManagedAnthropicOAuthToken("sk-ant-oat-rejected")}
+
+            async def recover_rejected_token(self, credential_name, rejected_access_token):
+                assert credential_name == "subscription"
+                assert rejected_access_token == "sk-ant-oat-rejected"
+                CredentialAccessor.upsert_credentials([
+                    CredentialItem(
+                        credential_name="subscription",
+                        credential_info={"proxy_configured": True},
+                        credential_values={} if removed else _credential("subscription", second).credential_values,
+                    )
+                ])
+                return "sk-ant-oat-refreshed"
+
+        hook = RecoveringHook()
+        monkeypatch.setattr(litellm, "callbacks", [hook])
+        result = await AnthropicTokenCounter(oauth_credential_hook=hook).count_tokens(
+            "claude-test",
+            [{"role": "user", "content": "hello"}],
+            None,
+            deployment={
+                "litellm_params": {
+                    "litellm_credential_name": "subscription",
+                    "api_base": "http://count-upstream.invalid/v1/messages/count_tokens",
+                }
+            },
+        )
+
+    expected_request = "POST http://count-upstream.invalid/v1/messages/count_tokens HTTP/1.1\r\n"
+    assert first.seen == [expected_request]
+    assert second.seen == ([] if removed else [expected_request])
+    assert result is not None and result.error is removed, result
+    assert result.total_tokens == (0 if removed else 29)
+
+
+@pytest.mark.asyncio
+async def test_sync_responses_does_not_trust_unproxied_async_client(monkeypatch):
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    body = json.dumps({
+        "id": "resp_proxy",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "test",
+        "output": [],
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+    }).encode()
+    with _proxy(body) as proxy:
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setattr(litellm, "credential_list", [_credential("responses-account", proxy)])
+        unproxied_client = AsyncHTTPHandler()
+        try:
+            response = await asyncio.to_thread(
+                litellm.responses,
+                model="openai/test",
+                input="hello",
+                api_key="test-key",
+                api_base="http://responses-upstream.invalid/v1",
+                litellm_credential_name="responses-account",
+                client=unproxied_client,
+                max_retries=0,
+            )
+        finally:
+            await unproxied_client.close()
+
+    assert response.status == "completed"
+    assert response.output == []
+    assert proxy.seen == ["POST http://responses-upstream.invalid/v1/responses HTTP/1.1\r\n"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_anthropic_api_surfaces_replace_direct_client_with_credential_proxy(monkeypatch, surface, stream):
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    message = {
+        "id": "msg_proxy",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": "proxied"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    events = (
+        {"type": "message_start", "message": {**message, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "proxied"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    )
+    body = (
+        "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        if stream else json.dumps(message)
+    ).encode()
+    with _proxy(body, b"text/event-stream" if stream else b"application/json") as proxy:
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setattr(litellm, "credential_list", [_credential("subscription", proxy)])
+        direct_client = AsyncHTTPHandler()
+        params = {
+            "model": "anthropic/claude-test",
+            "api_key": "sk-ant-test",
+            "api_base": "http://anthropic-upstream.invalid/v1/messages",
+            "litellm_credential_name": "subscription",
+            "client": direct_client,
+            "stream": stream,
+        }
+        try:
+            match surface:
+                case "chat":
+                    response = await litellm.acompletion(
+                        **params, messages=[{"role": "user", "content": "hello"}], max_tokens=10,
+                    )
+                case "responses":
+                    response = await litellm.aresponses(**params, input="hello", max_output_tokens=10)
+                case "messages":
+                    response = await litellm.anthropic.messages.acreate(
+                        **params, messages=[{"role": "user", "content": "hello"}], max_tokens=10,
+                    )
+            if stream:
+                assert any("proxied" in str(chunk) for chunk in [part async for part in response])
+            else:
+                match surface:
+                    case "chat":
+                        assert response.choices[0].message.content == "proxied"
+                    case "responses":
+                        assert response.output[0].content[0].text == "proxied"
+                    case "messages":
+                        assert response["content"][0]["text"] == "proxied"
+        finally:
+            await direct_client.close()
+
+    assert proxy.seen == ["POST http://anthropic-upstream.invalid/v1/messages HTTP/1.1\r\n"]

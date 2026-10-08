@@ -3,9 +3,11 @@ from typing import Final
 import httpx
 import pytest
 
+import litellm
 from litellm.exceptions import AuthenticationError
 from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
 from litellm.llms.anthropic.count_tokens.token_counter import AnthropicTokenCounter
+from litellm.models.credentials import CredentialItem
 from litellm.types.utils import CallTypes
 
 
@@ -17,6 +19,33 @@ class StubHTTPClient:
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_base", [None, "https://api.anthropic.com", "https://api.anthropic.com/"])
+async def test_count_tokens_posts_to_endpoint_instead_of_api_root(monkeypatch, api_base) -> None:
+    requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"input_tokens": 7})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        monkeypatch.setattr(
+            "litellm.llms.anthropic.count_tokens.handler.get_async_httpx_client",
+            lambda **kwargs: client,
+        )
+        result = await AnthropicCountTokensHandler().handle_count_tokens_request(
+            model="claude-test",
+            messages=[{"role": "user", "content": "hello"}],
+            api_key="sk-ant-api-test",
+            api_base=api_base,
+        )
+
+    assert result == {"input_tokens": 7}
+    assert [(request.method, str(request.url)) for request in requests] == [
+        ("POST", "https://api.anthropic.com/v1/messages/count_tokens")
+    ]
 
 
 @pytest.mark.asyncio
@@ -141,8 +170,17 @@ class RejectingHook:
         )
 
 
+@pytest.fixture
+def managed_credential(monkeypatch) -> None:
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [CredentialItem(credential_name="subscription", credential_values={}, credential_info={})],
+    )
+
+
 @pytest.mark.asyncio
-async def test_managed_credential_is_resolved_before_counting() -> None:
+async def test_managed_credential_is_resolved_before_counting(managed_credential) -> None:
     hook: Final = ResolvingHook()
     handler: Final = RecordingHandler()
     counter: Final = AnthropicTokenCounter(oauth_credential_hook=hook, count_tokens_handler=handler)
@@ -212,7 +250,7 @@ async def test_api_key_path_does_not_invoke_managed_credential_hook() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repeated_rejection", [False, True])
-async def test_managed_count_retries_rejected_token_only_once(monkeypatch, repeated_rejection):
+async def test_managed_count_retries_rejected_token_only_once(monkeypatch, repeated_rejection, managed_credential):
     import litellm
     from litellm.llms.anthropic.common_utils import AnthropicError
 

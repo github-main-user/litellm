@@ -124,6 +124,27 @@ async def test_start_is_admin_only_and_validates_name() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_url", [None, "socks5h://user:password@proxy.invalid:1080"])
+async def test_new_oauth_attempt_does_not_require_existing_credential(monkeypatch, proxy_url):
+    monkeypatch.setenv("LITELLM_SALT_KEY", "new-credential-attempt-key")
+    monkeypatch.setattr(litellm, "credential_list", [])
+    lookup = AsyncMock(return_value=None)
+    prisma = SimpleNamespace(db=SimpleNamespace(litellm_credentialstable=SimpleNamespace(find_unique=lookup)))
+    with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+        response = await start_anthropic_oauth(
+            AnthropicOAuthStartRequest(credential_name="new-subscription", proxy_url=proxy_url),
+            UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+        )
+    lookup.assert_awaited_once_with(where={"credential_name": "new-subscription"})
+    attempt = _decode_attempt(response.attempt_token, "admin")
+
+    assert attempt.credential_name == "new-subscription"
+    assert attempt.proxy_url == proxy_url
+    assert attempt.previous_proxy_url is None
+    assert "password" not in response.model_dump_json()
+
+
+@pytest.mark.asyncio
 async def test_complete_is_admin_only_and_rejects_malformed_or_expired_attempts() -> None:
     admin = UserAPIKeyAuth(user_id="admin-a", user_role=LitellmUserRoles.PROXY_ADMIN)
     non_admin = UserAPIKeyAuth(user_id="user-a", user_role=LitellmUserRoles.INTERNAL_USER)
@@ -1048,3 +1069,32 @@ async def test_cached_oauth_config_requires_managed_database_row(stored_auth_typ
             await AnthropicOAuthCredentialHook().async_pre_call_deployment_hook(
                 {"model": "anthropic/claude", "litellm_credential_name": "config-only"}, None
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires_in", [-1, 3600])
+@pytest.mark.parametrize("proxy_value", [None, "", 17, False, "undecryptable", "encrypted-empty"])
+async def test_required_database_proxy_cannot_be_downgraded_to_direct(expires_in, proxy_value, monkeypatch):
+    monkeypatch.setenv("LITELLM_SALT_KEY", "required-proxy-test-key")
+    tokens = AnthropicOAuthTokens("sk-ant-oat-config", "refresh-config", time.time() + expires_in, "account")
+    encrypted_proxy = encrypt_value_helper("") if proxy_value == "encrypted-empty" else proxy_value
+    row = SimpleNamespace(
+        credential_info={"provider": "anthropic", "auth_type": "oauth", "proxy_configured": True},
+        credential_values={
+            ANTHROPIC_CREDENTIAL_VALUE_KEY: encrypt_value_helper(tokens.to_json()),
+            **({CREDENTIAL_PROXY_VALUE_KEY: encrypted_proxy} if proxy_value is not None else {}),
+        },
+    )
+    client = MagicMock()
+    client.refresh = AsyncMock(return_value=tokens)
+    cached = _credential("subscription", tokens)
+    monkeypatch.setattr(litellm, "credential_list", [cached])
+    with patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=_AdvisoryLockDatabase(row))):
+        with pytest.raises(AuthenticationError, match="unavailable"):
+            await AnthropicOAuthCredentialHook(client).async_pre_call_deployment_hook(
+                {"model": "anthropic/claude", "litellm_credential_name": "subscription"}, None
+            )
+
+    client.refresh.assert_not_awaited()
+    assert litellm.credential_list == [cached]
+    assert row.credential_info["proxy_configured"] is True

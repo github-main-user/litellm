@@ -137,13 +137,13 @@ class AnthropicTokenCounter(BaseTokenCounter):
         credential_name: Final = litellm_params.get("litellm_credential_name")
 
         try:
-            proxy_url: Final = get_credential_proxy_url(
-                credential_name if isinstance(credential_name, str) else None
-            )
             resolved: Final = (
                 await self._resolve_named_credential(model=model_to_use, litellm_params=litellm_params)
                 if isinstance(credential_name, str) and credential_name
                 else None
+            )
+            proxy_url: Final = get_credential_proxy_url(
+                credential_name if isinstance(credential_name, str) else None
             )
             # Get Anthropic API key from deployment config or environment
             resolved_api_key: Final = resolved.get("api_key") if resolved is not None else litellm_params.get("api_key")
@@ -167,13 +167,15 @@ class AnthropicTokenCounter(BaseTokenCounter):
                     status_code=401,
                 )
 
+            resolved_api_base: Final = resolved.get("api_base") if resolved is not None else litellm_params.get("api_base")
+            api_base: Final = resolved_api_base if isinstance(resolved_api_base, str) else None
             handler: Final = self._count_tokens_handler or anthropic_count_tokens_handler
             try:
                 result = await handler.handle_count_tokens_request(
                     model=model_to_use,
                     messages=messages or [],
                     api_key=api_key,
-                    api_base=litellm_params.get("api_base"),
+                    api_base=api_base,
                     tools=tools,
                     system=system,
                     proxy_url=proxy_url,
@@ -193,10 +195,12 @@ class AnthropicTokenCounter(BaseTokenCounter):
                     model=model_to_use,
                     messages=messages or [],
                     api_key=ManagedAnthropicOAuthToken(authorization.removeprefix("Bearer ")),
-                    api_base=litellm_params.get("api_base"),
+                    api_base=api_base,
                     tools=tools,
                     system=system,
-                    proxy_url=proxy_url,
+                    proxy_url=get_credential_proxy_url(
+                        credential_name if isinstance(credential_name, str) else None
+                    ),
                 )
             input_tokens: Final = result.get("input_tokens")
             if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or input_tokens < 0:

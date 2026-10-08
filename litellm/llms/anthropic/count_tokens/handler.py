@@ -78,7 +78,11 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
             verbose_logger.debug("Transformed request: %s", request_body)
 
             # Get endpoint URL
-            endpoint_url: Final = api_base or self.get_anthropic_count_tokens_endpoint()
+            endpoint_url: Final = (
+                self.get_anthropic_count_tokens_endpoint()
+                if not api_base or api_base.rstrip("/") == "https://api.anthropic.com"
+                else api_base
+            )
 
             verbose_logger.debug("Making request to: %s", endpoint_url)
 

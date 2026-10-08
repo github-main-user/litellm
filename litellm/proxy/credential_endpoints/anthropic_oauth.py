@@ -256,17 +256,38 @@ def _credential_info_from_row(row: _CredentialRow) -> dict[str, object]:
 
 def _proxy_from_row(row: _CredentialRow) -> str | None:
     values: Final = _string_object_mapping(row.credential_values)
-    encrypted: Final = values.get(CREDENTIAL_PROXY_VALUE_KEY) if values is not None else None
-    if not isinstance(encrypted, str) or not encrypted:
+    if values is None:
+        raise TypeError("Credential values are invalid")
+    required: Final = bool(_credential_info_from_row(row).get("proxy_configured"))
+    encrypted: Final = values.get(CREDENTIAL_PROXY_VALUE_KEY)
+    if encrypted is None or encrypted == "":
+        if required:
+            raise ValueError("Credential proxy configuration is unavailable")
         return None
+    if not isinstance(encrypted, str):
+        raise TypeError("Credential proxy configuration is invalid")
     decrypted: Final = decrypt_value_helper(
         encrypted, CREDENTIAL_PROXY_VALUE_KEY, exception_type="debug"
     )
-    if decrypted == "":
+    if decrypted == "" and not required:
         return None
     if not isinstance(decrypted, str):
         raise TypeError("Credential proxy configuration cannot be decrypted")
     return validate_proxy_url(decrypted)
+
+
+async def _proxy_for_oauth_start(credential_name: str | None) -> str | None:
+    if credential_name is None:
+        return None
+    try:
+        if CredentialAccessor.find_credential(credential_name) is not None:
+            return get_credential_proxy_url(credential_name)
+        from litellm.proxy.proxy_server import prisma_client
+
+        row: Final = await CredentialsRepository(prisma_client).find_by_name(credential_name)
+        return _proxy_from_row(row) if row is not None else None
+    except Exception:
+        raise HTTPException(status_code=503, detail="Credential proxy configuration is unavailable") from None
 
 
 def _lock_key(identity: str, namespace: str = "credential") -> int:
@@ -450,7 +471,7 @@ async def start_anthropic_oauth(
             detail="Credential name may contain only letters, numbers, dots, underscores, and hyphens",
         )
     try:
-        previous_proxy_url: Final = get_credential_proxy_url(payload.credential_name)
+        previous_proxy_url: Final = await _proxy_for_oauth_start(payload.credential_name)
         proxy_url: Final = (
             validate_proxy_url(payload.proxy_url) if payload.proxy_url is not None else previous_proxy_url
         )

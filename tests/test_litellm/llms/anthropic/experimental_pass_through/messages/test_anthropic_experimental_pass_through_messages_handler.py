@@ -1438,3 +1438,58 @@ async def test_anthropic_messages_leaves_non_provider_failures_unmapped():
         )
 
     assert "Traceback" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_native_messages_filters_router_bookkeeping_without_changing_tool_json():
+    from typing import Final
+
+    from pydantic import JsonValue
+
+    bodies: Final[list[dict[str, JsonValue]]] = []
+    schema: Final = {
+        "type": "object",
+        "properties": {"_encrypted_content_affinity_pinned": {"type": "boolean"}},
+    }
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_internal",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Done"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    injected_client: Final = AsyncHTTPHandler()
+    await injected_client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw_client:
+        injected_client.client = raw_client
+        valid_params: Final = {
+            "model": "anthropic/claude-sonnet-4-6",
+            "api_key": "test-key",
+            "client": injected_client,
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "ping"}],
+            "tools": [{"name": "inspect", "input_schema": schema}],
+            "metadata": {"user_id": "user"},
+        }
+        await litellm.anthropic_messages(**valid_params)
+        await litellm.anthropic_messages(
+            **valid_params,
+            _encrypted_content_affinity_pinned=True,
+            _retry_skipped_deployment_ids=["skipped"],
+            _target_order=2,
+        )
+
+    assert len(bodies) == 2
+    assert bodies[1] == bodies[0]
+    assert bodies[1]["tools"][0]["input_schema"] == schema
+    assert bodies[1]["metadata"] == {"user_id": "user"}

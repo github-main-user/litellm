@@ -58,7 +58,7 @@ def get_credential_proxy_url(credential_name: str | None) -> str | None:
         return None
     credential: Final = CredentialAccessor.find_credential(credential_name)
     if credential is None:
-        return None
+        raise ValueError("Named credential configuration is unavailable")
     value: Final = credential.credential_values.get(_CREDENTIAL_PROXY_KEY)
     if value is None or value == "":
         if credential.credential_info.get("proxy_configured"):
