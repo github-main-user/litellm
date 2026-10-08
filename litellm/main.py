@@ -2588,20 +2588,6 @@ def _complete_custom_openai(
 
     headers = headers or litellm.headers
 
-    # Add GitHub Copilot headers (same as /responses endpoint does)
-    if custom_llm_provider == "github_copilot":
-        from litellm.llms.github_copilot.authenticator import Authenticator
-        from litellm.llms.github_copilot.common_utils import (
-            get_copilot_default_headers,
-        )
-
-        copilot_auth: Final = Authenticator()
-        copilot_api_key: Final = copilot_auth.get_api_key()
-        copilot_headers: Final = get_copilot_default_headers(copilot_api_key)
-        if extra_headers:
-            copilot_headers.update(extra_headers)
-        extra_headers = copilot_headers
-
     use_base_llm_http_handler: Final = get_secret_bool("EXPERIMENTAL_OPENAI_BASE_LLM_HTTP_HANDLER")
 
     if extra_headers is not None and not use_base_llm_http_handler:
@@ -6499,22 +6485,6 @@ def embedding(
                 aembedding=aembedding,
                 max_retries=max_retries,
                 headers=headers or extra_headers,
-                litellm_params=litellm_params_dict,
-            )
-        elif custom_llm_provider == "github_copilot":
-            api_key = api_key or litellm.api_key
-            response = base_llm_http_handler.embedding(
-                model=model,
-                input=input,
-                custom_llm_provider=custom_llm_provider,
-                api_base=api_base,
-                api_key=api_key,
-                logging_obj=logging,
-                timeout=timeout,
-                model_response=EmbeddingResponse(),
-                optional_params=optional_params,
-                client=client,
-                aembedding=aembedding,
                 litellm_params=litellm_params_dict,
             )
         elif (

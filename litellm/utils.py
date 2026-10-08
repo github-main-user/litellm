@@ -8298,7 +8298,6 @@ class ProviderConfigManager:
             LlmProviders.MINIMAX: (lambda: litellm.MinimaxChatConfig(), False),
             LlmProviders.GITHUB: (lambda: litellm.GithubChatConfig(), False),
             LlmProviders.COMPACTIFAI: (lambda: litellm.CompactifAIChatConfig(), False),
-            LlmProviders.GITHUB_COPILOT: (lambda: litellm.GithubCopilotConfig(), False),
             LlmProviders.CHATGPT: (lambda: litellm.ChatGPTConfig(), False),
             LlmProviders.GIGACHAT: (lambda: litellm.GigaChatConfig(), False),
             LlmProviders.RAGFLOW: (lambda: litellm.RAGFlowConfig(), False),
@@ -8597,8 +8596,6 @@ class ProviderConfigManager:
             return litellm.SnowflakeEmbeddingConfig()
         elif litellm.LlmProviders.COMETAPI == provider:
             return litellm.CometAPIEmbeddingConfig()
-        elif litellm.LlmProviders.GITHUB_COPILOT == provider:
-            return litellm.GithubCopilotEmbeddingConfig()
         elif litellm.LlmProviders.OPENROUTER == provider:
             from litellm.llms.openrouter.embedding.transformation import (
                 OpenrouterEmbeddingConfig,
@@ -8729,13 +8726,6 @@ class ProviderConfigManager:
             )
 
             return TencentAnthropicMessagesConfig()
-        elif litellm.LlmProviders.GITHUB_COPILOT == provider:
-            if "claude" in model_lower:
-                from litellm.llms.github_copilot.messages.transformation import (
-                    GithubCopilotAnthropicMessagesConfig,
-                )
-
-                return GithubCopilotAnthropicMessagesConfig()
 
         from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 
@@ -8917,14 +8907,6 @@ class ProviderConfigManager:
             return None
         elif litellm.LlmProviders.XAI == provider:
             return litellm.XAIResponsesAPIConfig()
-        elif litellm.LlmProviders.GITHUB_COPILOT == provider:
-            from litellm.llms.github_copilot.responses.transformation import (
-                github_copilot_supports_responses_api,
-            )
-
-            if model is None or github_copilot_supports_responses_api(model=model):
-                return litellm.GithubCopilotResponsesAPIConfig()
-            return None
         elif litellm.LlmProviders.CHATGPT == provider:
             return litellm.ChatGPTResponsesAPIConfig()
         elif litellm.LlmProviders.LITELLM_PROXY == provider:

@@ -4406,7 +4406,6 @@ def test_get_logging_payload_router_rejected_request_without_router_leaves_provi
 @pytest.mark.parametrize(
     "litellm_params,expected_provider",
     [
-        ({"model": "github_copilot/gpt-4o"}, "github_copilot"),
         ({"model": "gpt-5", "custom_llm_provider": "chatgpt"}, "chatgpt"),
     ],
 )
@@ -4428,7 +4427,6 @@ def test_get_logging_payload_inferred_provider_never_resolves_declared_authentic
 @pytest.mark.parametrize(
     "litellm_params",
     [
-        {"model": "github_copilot/gpt-4o"},
         {"model": "gpt-5", "custom_llm_provider": "chatgpt"},
         {"model": "openai/gpt-4o-mini", "api_key": "sk-a"},
     ],

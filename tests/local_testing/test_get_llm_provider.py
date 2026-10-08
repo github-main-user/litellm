@@ -133,8 +133,6 @@ def test_default_api_base():
     with patch.dict(os.environ, {}, clear=True):
         for provider in litellm.openai_compatible_providers:
             # Get the API base for the given provider
-            if provider == "github_copilot":
-                continue
             # Skip chatgpt as it requires OAuth authentication
             if provider == "chatgpt":
                 continue

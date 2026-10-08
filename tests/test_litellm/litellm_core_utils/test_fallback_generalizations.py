@@ -626,7 +626,7 @@ def test_shipped_version_boundaries(shipped_cost_map, model, provider, adaptive,
 
 
 def test_shipped_claude_version_regex_excludes_undelimited_41(shipped_cost_map):
-    unmatched = match_capability_generalizations("github_copilot/claude-opus-41")
+    unmatched = match_capability_generalizations("vendor/claude-opus-41")
     assert unmatched is None or "supports_adaptive_thinking" not in unmatched
     assert unmatched is None or "supports_mid_conversation_system" not in unmatched
 
@@ -915,7 +915,7 @@ def test_shipped_openai_reasoning_rule_skips_non_reasoning_gpt_ids(shipped_cost_
         "vendor/my-codex-embedding",
         "some-codex-model",
         "azure/gpt-35-turbo-0125-custom",
-        "github_copilot/gpt-41-copilot-new",
+        "vendor/gpt-41-new",
     ):
         assert match_capability_generalizations(model) is None, model
 

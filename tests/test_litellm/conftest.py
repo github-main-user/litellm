@@ -352,7 +352,6 @@ def isolate_litellm_state():
         "cost_margin_config",
         "cost_discount_config",
         "disable_hf_tokenizer_download",
-        "disable_copilot_system_to_assistant",
         "cohere_models",
         "anthropic_models",
         "token_counter",

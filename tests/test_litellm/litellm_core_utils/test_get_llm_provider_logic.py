@@ -53,3 +53,29 @@ def test_get_llm_provider_still_rejects_unregistered_prefix(registered_custom_pr
 )
 def test_is_registered_custom_provider(registered_custom_provider: str, candidate: str | None, expected: bool) -> None:
     assert is_registered_custom_provider(candidate) is expected
+
+
+@pytest.mark.parametrize("explicit_provider", [False, True])
+@pytest.mark.parametrize("endpoint", ["completion", "embedding"])
+def test_removed_copilot_provider_is_rejected(endpoint: str, explicit_provider: bool) -> None:
+    with pytest.raises(litellm.BadRequestError, match="LLM Provider NOT provided|Unmapped LLM provider"):
+        if endpoint == "completion":
+            litellm.completion(
+                model="gpt-5.4" if explicit_provider else "github_copilot/gpt-5.4",
+                custom_llm_provider="github_copilot" if explicit_provider else None,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        else:
+            litellm.embedding(
+                model="text-embedding-3-small" if explicit_provider else "github_copilot/text-embedding-3-small",
+                custom_llm_provider="github_copilot" if explicit_provider else None,
+                input=["hello"],
+            )
+
+
+def test_github_models_api_still_resolves() -> None:
+    model, provider, api_key, api_base = get_llm_provider(model="github/gpt-5.4", api_key="github-models-key")
+
+    assert (model, provider, api_key) == ("gpt-5.4", "github", "github-models-key")
+    assert api_base is not None
+    assert api_base.startswith("https://")

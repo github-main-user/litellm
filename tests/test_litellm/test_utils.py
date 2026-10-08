@@ -5339,7 +5339,7 @@ class TestIsVisionExplicitlyDisabled:
     as _supports_factory does, or a capability check on a copilot deployment blocks routing
     on a device-code prompt."""
 
-    @pytest.mark.parametrize("model", ["github_copilot/gpt-4o", "chatgpt/gpt-5"])
+    @pytest.mark.parametrize("model", ["chatgpt/gpt-5"])
     def test_never_resolves_an_authenticating_prefix(self, model, monkeypatch):
         from litellm.utils import is_vision_explicitly_disabled
 

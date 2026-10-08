@@ -4937,7 +4937,7 @@ def test_a_target_declaring_reasoning_effort_still_gets_its_tier():
 
 @pytest.mark.parametrize(
     "model",
-    ["snowflake/claude-sonnet-4-6", "databricks/databricks-claude-opus-4-7", "github_copilot/claude-sonnet-4"],
+    ["snowflake/claude-sonnet-4-6", "databricks/databricks-claude-opus-4-7"],
 )
 def test_a_caller_that_names_no_provider_carries_no_tier(model):
     """`translate_anthropic_to_openai` is also called without a provider, by `adapter_completion`

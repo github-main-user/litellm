@@ -726,7 +726,6 @@ LITELLM_CHAT_PROVIDERS: Final = [
     "lm_studio",
     "galadriel",
     "gradient_ai",
-    "github_copilot",  # GitHub Copilot Chat API
     "chatgpt",  # ChatGPT subscription API
     "novita",
     "meta_llama",
@@ -757,7 +756,6 @@ LITELLM_CHAT_PROVIDERS: Final = [
 # metadata or capability lookup against them can block for minutes waiting on a human.
 PROVIDERS_THAT_AUTHENTICATE_ON_PROVIDER_INFO: Final = frozenset(
     {
-        "github_copilot",
         "chatgpt",
     }
 )
@@ -962,7 +960,6 @@ openai_compatible_providers: Final[list] = [
     "llamafile",
     "lm_studio",
     "galadriel",
-    "github_copilot",  # GitHub Copilot Chat API
     "chatgpt",  # ChatGPT subscription API
     "novita",
     "meta_llama",

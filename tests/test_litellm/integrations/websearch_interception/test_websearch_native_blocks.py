@@ -523,7 +523,7 @@ class TestShortCircuitEmitsNativeBlocks:
 
     @pytest.mark.asyncio
     async def test_native_tool_short_circuit_emits_blocks(self):
-        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+        logger = WebSearchInterceptionLogger(enabled_providers=["snowflake"])
 
         with patch.object(
             logger,
@@ -531,7 +531,7 @@ class TestShortCircuitEmitsNativeBlocks:
             new=AsyncMock(return_value=("Title: x\nURL: y", _make_search_response())),
         ):
             result = await logger.try_short_circuit_search(
-                model="github_copilot/claude-sonnet-4",
+                model="snowflake/claude-sonnet-4",
                 messages=[{"role": "user", "content": "search query"}],
                 tools=[
                     {
@@ -540,7 +540,7 @@ class TestShortCircuitEmitsNativeBlocks:
                         "max_uses": 3,
                     }
                 ],
-                custom_llm_provider="github_copilot",
+                custom_llm_provider="snowflake",
             )
 
         assert result is not None
@@ -561,7 +561,7 @@ class TestShortCircuitEmitsNativeBlocks:
     @pytest.mark.asyncio
     async def test_litellm_standard_tool_short_circuit_stays_text_only(self):
         """Non-native tool → existing text-only short-circuit, no regression."""
-        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+        logger = WebSearchInterceptionLogger(enabled_providers=["snowflake"])
 
         with patch.object(
             logger,
@@ -569,7 +569,7 @@ class TestShortCircuitEmitsNativeBlocks:
             new=AsyncMock(return_value=("Title: x\nURL: y", _make_search_response())),
         ):
             result = await logger.try_short_circuit_search(
-                model="github_copilot/claude-sonnet-4",
+                model="snowflake/claude-sonnet-4",
                 messages=[{"role": "user", "content": "search query"}],
                 tools=[
                     {
@@ -581,7 +581,7 @@ class TestShortCircuitEmitsNativeBlocks:
                         },
                     }
                 ],
-                custom_llm_provider="github_copilot",
+                custom_llm_provider="snowflake",
             )
 
         assert result is not None
@@ -593,7 +593,7 @@ class TestShortCircuitEmitsNativeBlocks:
         """Search failure on native path: the tool result carries Anthropic's
         error object (rendered as "Web search error: <code>" by the client)
         next to the legacy text-error block."""
-        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+        logger = WebSearchInterceptionLogger(enabled_providers=["snowflake"])
 
         with patch.object(
             logger,
@@ -601,10 +601,10 @@ class TestShortCircuitEmitsNativeBlocks:
             side_effect=RateLimitError("slow down", llm_provider="tavily", model="tavily"),
         ):
             result = await logger.try_short_circuit_search(
-                model="github_copilot/claude-sonnet-4",
+                model="snowflake/claude-sonnet-4",
                 messages=[{"role": "user", "content": "search query"}],
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                custom_llm_provider="github_copilot",
+                custom_llm_provider="snowflake",
             )
 
         assert result is not None

@@ -157,12 +157,9 @@ class TestDeclaredAuthenticatingProvider:
     @pytest.mark.parametrize(
         "model, provider, expected",
         [
-            ("github_copilot/gpt-4o", None, "github_copilot"),
             ("chatgpt/gpt-5", None, "chatgpt"),
-            ("gpt-4o", "github_copilot", "github_copilot"),
             ("openai/gpt-4o", None, None),
             ("gpt-4o", "openai", None),
-            ("github_copilot", None, None),
             ("chatgpt", None, None),
         ],
     )
@@ -171,7 +168,7 @@ class TestDeclaredAuthenticatingProvider:
 
         assert declared_authenticating_provider(model, provider) == expected
 
-    @pytest.mark.parametrize("model", ["github_copilot/gpt-4o", "chatgpt/gpt-5"])
+    @pytest.mark.parametrize("model", ["chatgpt/gpt-5"])
     def test_supported_params_never_resolve_an_authenticating_prefix(self, model, monkeypatch):
         import litellm
 

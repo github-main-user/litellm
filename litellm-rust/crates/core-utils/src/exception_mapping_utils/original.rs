@@ -59,7 +59,6 @@ const OPENAI_COMPATIBLE_PROVIDERS: &[&str] = &[
     "llamafile",
     "lm_studio",
     "galadriel",
-    "github_copilot",
     "chatgpt",
     "novita",
     "meta_llama",

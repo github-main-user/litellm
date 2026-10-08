@@ -20,9 +20,6 @@ from litellm.llms.databricks.responses.transformation import (
 from litellm.llms.fireworks_ai.responses.transformation import (
     FireworksAIResponsesAPIConfig,
 )
-from litellm.llms.github_copilot.responses.transformation import (
-    GithubCopilotResponsesAPIConfig,
-)
 from litellm.llms.hosted_vllm.responses.transformation import (
     HostedVLLMResponsesAPIConfig,
 )
@@ -118,12 +115,6 @@ class TestResponsesAPIWebSocketSupport:
             config.supports_native_websocket() is False
         ), "XAI should use managed websocket handler"
 
-    def test_github_copilot_uses_managed_websocket(self):
-        """GitHub Copilot should use managed websocket handler"""
-        config = GithubCopilotResponsesAPIConfig()
-        assert (
-            config.supports_native_websocket() is False
-        ), "GitHub Copilot should use managed websocket handler"
 
     def test_chatgpt_uses_managed_websocket(self):
         """ChatGPT should use managed websocket handler"""

@@ -302,12 +302,9 @@ LLM_CONFIG_NAMES: Final = (
     "IBMWatsonXEmbeddingConfig",
     "GenAIHubEmbeddingConfig",
     "IBMWatsonXAudioTranscriptionConfig",
-    "GithubCopilotConfig",
-    "GithubCopilotResponsesAPIConfig",
     "ChatGPTConfig",
     "ChatGPTResponsesAPIConfig",
     "ManusResponsesAPIConfig",
-    "GithubCopilotEmbeddingConfig",
     "NebiusConfig",
     "WandbConfig",
     "GigaChatConfig",
@@ -1160,18 +1157,6 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
     "IBMWatsonXAudioTranscriptionConfig": (
         ".llms.watsonx.audio_transcription.transformation",
         "IBMWatsonXAudioTranscriptionConfig",
-    ),
-    "GithubCopilotConfig": (
-        ".llms.github_copilot.chat.transformation",
-        "GithubCopilotConfig",
-    ),
-    "GithubCopilotResponsesAPIConfig": (
-        ".llms.github_copilot.responses.transformation",
-        "GithubCopilotResponsesAPIConfig",
-    ),
-    "GithubCopilotEmbeddingConfig": (
-        ".llms.github_copilot.embedding.transformation",
-        "GithubCopilotEmbeddingConfig",
     ),
     "ChatGPTConfig": (".llms.chatgpt.chat.transformation", "ChatGPTConfig"),
     "ChatGPTResponsesAPIConfig": (

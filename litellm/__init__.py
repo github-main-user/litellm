@@ -493,7 +493,6 @@ prometheus_end_user_metrics_max_series_per_metric: Optional[int] = 10000
 prometheus_end_user_metrics_ttl_seconds: Optional[float] = 3600.0
 prometheus_end_user_metrics_cleanup_interval_seconds: Optional[float] = 60.0
 disable_add_prefix_to_prompt: bool = False  # used by anthropic, to disable adding prefix to prompt
-disable_copilot_system_to_assistant: bool = False  # If false (default), converts all 'system' role messages to 'assistant' for GitHub Copilot compatibility. Set to true to disable this behavior.
 public_mcp_servers: Optional[List[str]] = None
 public_mcp_hub_strict_whitelist: bool = True
 public_model_groups: Optional[List[str]] = None
@@ -695,7 +694,6 @@ lemonade_models: Set = set()
 docker_model_runner_models: Set = set()
 amazon_nova_models: Set = set()
 stability_models: Set = set()
-github_copilot_models: Set = set()
 chatgpt_models: Set = set()
 minimax_models: Set = set()
 aws_polly_models: Set = set()
@@ -971,8 +969,6 @@ def _populate_provider_model_sets(model_cost_map: Dict) -> None:
             amazon_nova_models.add(key)
         elif value.get("litellm_provider") == "stability":
             stability_models.add(key)
-        elif value.get("litellm_provider") == "github_copilot":
-            github_copilot_models.add(key)
         elif value.get("litellm_provider") == "chatgpt":
             chatgpt_models.add(key)
         elif value.get("litellm_provider") == "minimax":
@@ -1224,7 +1220,6 @@ def _build_models_by_provider() -> dict:
         "clarifai": clarifai_models,
         "amazon_nova": amazon_nova_models,
         "stability": stability_models,
-        "github_copilot": github_copilot_models,
         "chatgpt": chatgpt_models,
         "minimax": minimax_models,
         "aws_polly": aws_polly_models,
@@ -2039,15 +2034,6 @@ if TYPE_CHECKING:
     )
     from .llms.fireworks_ai.responses.transformation import (
         FireworksAIResponsesAPIConfig as FireworksAIResponsesAPIConfig,
-    )
-    from .llms.github_copilot.chat.transformation import (
-        GithubCopilotConfig as GithubCopilotConfig,
-    )
-    from .llms.github_copilot.responses.transformation import (
-        GithubCopilotResponsesAPIConfig as GithubCopilotResponsesAPIConfig,
-    )
-    from .llms.github_copilot.embedding.transformation import (
-        GithubCopilotEmbeddingConfig as GithubCopilotEmbeddingConfig,
     )
     from .llms.chatgpt.chat.transformation import ChatGPTConfig as ChatGPTConfig
     from .llms.chatgpt.responses.transformation import (

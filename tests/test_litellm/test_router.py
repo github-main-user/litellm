@@ -15450,9 +15450,7 @@ class TestTierParamsTheTargetAccepts:
     @pytest.mark.parametrize(
         "litellm_params",
         [
-            {"model": "github_copilot/gpt-4o"},
             {"model": "chatgpt/gpt-5"},
-            {"model": "gpt-4o", "custom_llm_provider": "github_copilot"},
         ],
     )
     def test_deployment_accepts_param_never_asks_a_provider_whose_lookup_authenticates(

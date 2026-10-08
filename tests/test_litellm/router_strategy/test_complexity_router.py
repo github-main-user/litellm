@@ -4755,62 +4755,6 @@ class TestRouterPreRoutingAliasOverrides:
         assert request_kwargs["output_config"] == {"effort": "max"}
         assert request_kwargs["temperature"] == 0.2
 
-    @pytest.mark.asyncio
-    async def test_routing_never_resolves_an_authenticating_provider(self, monkeypatch, tmp_path):
-        """Resolving github_copilot runs its OAuth device flow, so the whole routing path must
-        answer without it: the tier-param filter fails open, the savings baseline qualifies by
-        string, and model info adopts the declared prefix. The recording wrapper raises for a
-        copilot-directed resolution rather than calling through, so a regression fails on the
-        recorded call instead of hanging the suite in a device-code poll."""
-        import json
-        import time
-
-        monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
-        (tmp_path / "api-key.json").write_text(json.dumps({"token": "tid=test", "expires_at": int(time.time()) + 3600}))
-        router = Router(
-            model_list=[
-                {
-                    "model_name": "smart-router",
-                    "litellm_params": {
-                        "model": "auto_router/complexity_router",
-                        "complexity_router_config": {
-                            "tiers": {
-                                "SIMPLE": {
-                                    "model_name": "cop-mixed",
-                                    "litellm_params": {"reasoning_effort": "high"},
-                                }
-                            }
-                        },
-                    },
-                },
-                {"model_name": "cop-mixed", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-x"}},
-                {"model_name": "cop-mixed", "litellm_params": {"model": "github_copilot/gpt-4o"}},
-            ]
-        )
-        real_get_llm_provider = litellm.get_llm_provider
-        copilot_resolutions: List = []
-
-        def _guarded(*args, **kwargs):
-            target = str(kwargs.get("model") or (args[0] if args else "")) + str(
-                kwargs.get("custom_llm_provider") or ""
-            )
-            if "github_copilot" in target:
-                copilot_resolutions.append(target)
-                raise RuntimeError("routing must not resolve an authenticating provider")
-            return real_get_llm_provider(*args, **kwargs)
-
-        monkeypatch.setattr(litellm, "get_llm_provider", _guarded)
-        request_kwargs: Dict = {}
-
-        deployment = await router.async_get_available_deployment(
-            model="smart-router",
-            request_kwargs=request_kwargs,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-
-        assert deployment["model_name"] == "cop-mixed"
-        assert request_kwargs["reasoning_effort"] == "high"
-        assert copilot_resolutions == []
 
     @pytest.mark.asyncio
     async def test_alias_custom_pricing_is_not_applied_to_request_kwargs(self):
@@ -14060,49 +14004,6 @@ class TestContextWindowEscalation:
         assert result is not None
         assert result.model == "mid-model"
 
-    @pytest.mark.asyncio
-    async def test_the_gate_never_resolves_an_authenticating_provider(self, monkeypatch, tmp_path):
-        """Resolving github_copilot runs its OAuth device flow, so a window question must adopt
-        the declaration instead of resolving: the copilot group reads as unknown-window and the
-        request stays put, with zero copilot resolutions recorded."""
-        import json
-        import time
-
-        monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
-        (tmp_path / "api-key.json").write_text(json.dumps({"token": "tid=test", "expires_at": int(time.time()) + 3600}))
-        router = ComplexityRouter(
-            model_name="test-router",
-            litellm_router_instance=Router(
-                model_list=[
-                    {"model_name": "cop-pool", "litellm_params": {"model": "github_copilot/gpt-4o"}},
-                    {
-                        "model_name": "big-model",
-                        "litellm_params": {"model": "openai/gpt-4o-mini", "mock_response": "ok"},
-                        "model_info": {"max_input_tokens": 200000},
-                    },
-                ]
-            ),
-            complexity_router_config={"tiers": {"SIMPLE": "cop-pool", "COMPLEX": "big-model"}},
-        )
-        real_get_llm_provider = litellm.get_llm_provider
-        copilot_resolutions: List = []
-
-        def _guarded(*args, **kwargs):
-            target = str(kwargs.get("model") or (args[0] if args else "")) + str(
-                kwargs.get("custom_llm_provider") or ""
-            )
-            if "github_copilot" in target:
-                copilot_resolutions.append(target)
-                raise RuntimeError("the gate must not resolve an authenticating provider")
-            return real_get_llm_provider(*args, **kwargs)
-
-        monkeypatch.setattr(litellm, "get_llm_provider", _guarded)
-
-        result = await router.async_pre_routing_hook(model="test-router", request_kwargs={}, messages=_OVERSIZED_TURNS)
-
-        assert result is not None
-        assert result.model == "cop-pool"
-        assert copilot_resolutions == []
 
     @pytest.mark.asyncio
     async def test_the_full_routing_path_serves_the_escalated_deployment(self):
