@@ -7,7 +7,6 @@ import httpx
 import litellm
 from litellm._logging import verbose_logger
 from litellm.constants import XAI_API_BASE
-from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     filter_value_from_dict,
     strip_name_from_messages,
@@ -60,25 +59,7 @@ class XAIChatConfig(OpenAIGPTConfig):
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> dict:
-        from litellm.llms.xai.oauth import (
-            XAIOAuthAuthenticator,
-            XAIOAuthError,
-            should_use_xai_oauth,
-        )
-
         dynamic_api_key: Final = XAIModelInfo.get_api_key(api_key)
-        if should_use_xai_oauth(litellm_params) and not dynamic_api_key:
-            try:
-                headers["Authorization"] = f"Bearer {XAIOAuthAuthenticator().get_access_token()}"
-            except XAIOAuthError as exc:
-                raise AuthenticationError(
-                    model=model,
-                    llm_provider=self.custom_llm_provider or "xai",
-                    message=str(exc),
-                ) from exc
-            if "content-type" not in headers and "Content-Type" not in headers:
-                headers["Content-Type"] = "application/json"
-            return headers
 
         return super().validate_environment(
             headers=headers,
@@ -99,11 +80,7 @@ class XAIChatConfig(OpenAIGPTConfig):
         litellm_params: dict,
         stream: bool | None = None,
     ) -> str:
-        from litellm.llms.xai.oauth import XAIOAuthAuthenticator, should_use_xai_oauth
-
         dynamic_api_key: Final = XAIModelInfo.get_api_key(api_key)
-        if should_use_xai_oauth(litellm_params) and not dynamic_api_key:
-            api_base = XAIOAuthAuthenticator().get_api_base()
 
         return super().get_complete_url(
             api_base=api_base,

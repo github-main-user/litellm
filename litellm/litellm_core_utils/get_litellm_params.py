@@ -59,7 +59,6 @@ OPTIONAL_KWARGS_KEYS: Final = (
             "rpm",
             "itpm",
             "otpm",
-            "use_xai_oauth",
         }
     )
     | AWS_CREDENTIAL_KWARGS_KEYS

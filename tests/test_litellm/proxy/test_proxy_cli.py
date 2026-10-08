@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
+from click.testing import CliRunner
 import fastapi
 import pytest
 
@@ -2936,3 +2937,10 @@ class TestLibpqSslParamTranslation:
         assert query["sslmode"] == ["require"]
         assert query["sslcert"] == ["/certs/rds-bundle.pem"]
         assert query["sslaccept"] == ["strict"]
+
+
+def test_removed_subscription_login_is_unknown_command():
+    result = CliRunner().invoke(run_server, ["xai-oauth", "login"])
+
+    assert result.exit_code == 2
+    assert "Unknown command: xai-oauth login" in result.output

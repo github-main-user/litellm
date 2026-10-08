@@ -1,5 +1,5 @@
 import asyncio
-
+from typing import Final
 
 import pytest
 
@@ -289,3 +289,59 @@ def test_get_models_uses_xai_key_fallback(monkeypatch):
 
     assert XAIModelInfo().get_models() == ["xai/grok-test"]
     assert captured_kwargs["headers"]["Authorization"] == "Bearer xai_key_value"
+
+
+@pytest.mark.parametrize("api_key", [None, "explicit-api-key"])
+def test_chat_auth_ignores_removed_subscription_flag(monkeypatch, tmp_path, api_key):
+    monkeypatch.setattr(litellm, "xai_key", None)
+    monkeypatch.setattr(litellm, "api_key", None)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setenv("XAI_OAUTH_TOKEN_DIR", str(tmp_path))
+    headers: Final = XAIChatConfig().validate_environment(
+        headers={},
+        model="grok-3-mini",
+        messages=[],
+        optional_params={},
+        litellm_params={"use_xai_oauth": True},
+        api_key=api_key,
+    )
+
+    assert headers == (
+        {"Content-Type": "application/json"}
+        if api_key is None
+        else {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    )
+
+
+def test_responses_requires_api_key_despite_removed_subscription_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(litellm, "xai_key", None)
+    monkeypatch.setattr(litellm, "api_key", None)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setenv("XAI_OAUTH_TOKEN_DIR", str(tmp_path))
+
+    with pytest.raises(ValueError) as exc_info:
+        XAIResponsesAPIConfig().validate_environment(
+            {}, "grok-3-mini", GenericLiteLLMParams(use_xai_oauth=True)
+        )
+
+    assert str(exc_info.value) == (
+        "XAI API key is required. Set api_key, litellm.xai_key, litellm.api_key, or XAI_API_KEY."
+    )
+
+
+def test_subscription_settings_cannot_override_api_endpoints(monkeypatch):
+    monkeypatch.setattr(litellm, "xai_key", None)
+    monkeypatch.setattr(litellm, "api_key", None)
+    monkeypatch.setattr(litellm, "api_base", None)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setenv("XAI_API_BASE", "https://configured.example/v1/")
+    monkeypatch.setenv("XAI_OAUTH_API_BASE", "https://subscription.example/v1")
+    params: Final = {"use_xai_oauth": True}
+
+    assert XAIResponsesAPIConfig().get_complete_url(None, params) == "https://configured.example/v1/responses"
+    assert XAIResponsesAPIConfig().get_complete_url("https://explicit.example/v1/", params) == (
+        "https://explicit.example/v1/responses"
+    )
+    assert XAIChatConfig().get_complete_url(
+        "https://explicit.example/v1/", None, "grok-3-mini", {}, params
+    ) == "https://explicit.example/v1/chat/completions"

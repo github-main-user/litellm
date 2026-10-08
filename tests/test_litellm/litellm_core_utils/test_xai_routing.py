@@ -1,13 +1,11 @@
 
 
 from litellm import LlmProviders
-from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
 from litellm.litellm_core_utils.get_llm_provider_logic import (
     _get_openai_compatible_provider_info,
 )
 from litellm.llms.xai.chat.transformation import XAIChatConfig
 from litellm.llms.xai.responses.transformation import XAIResponsesAPIConfig
-from litellm.types.router import GenericLiteLLMParams
 from litellm.utils import (
     ProviderConfigManager,
     get_optional_params,
@@ -53,9 +51,7 @@ def test_xai_validate_environment_reads_api_key(monkeypatch):
     assert result == {"keys_in_environment": True, "missing_keys": []}
 
 
-def test_xai_oauth_flag_is_generic_litellm_param():
-    litellm_params = GenericLiteLLMParams(use_xai_oauth=True)
-    runtime_params = get_litellm_params(use_xai_oauth=True)
+def test_xai_optional_param_mapping():
     result = get_optional_params(
         model="grok-3-mini",
         custom_llm_provider="xai",
@@ -63,7 +59,4 @@ def test_xai_oauth_flag_is_generic_litellm_param():
         drop_params=True,
     )
 
-    assert result["temperature"] == 0.2
-    assert litellm_params.use_xai_oauth is True
-    assert runtime_params["use_xai_oauth"] is True
-    assert "use_xai_oauth" not in result
+    assert result == {"temperature": 0.2, "stream": False, "extra_body": {}}
