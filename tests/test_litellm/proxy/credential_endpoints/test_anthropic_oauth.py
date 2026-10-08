@@ -21,6 +21,8 @@ from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper, encrypt_value_helper
 from litellm.proxy.credential_endpoints.anthropic_oauth import (
     ANTHROPIC_CREDENTIAL_VALUE_KEY,
+    ANTHROPIC_REAUTH_REQUIRED_REASON_KEY,
+    ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY,
     ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY,
     ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY,
     CREDENTIAL_PROXY_VALUE_KEY,
@@ -218,7 +220,11 @@ async def test_start_complete_reconnect_supports_maximum_proxy_snapshots() -> No
     previous = litellm.credential_list
     with patch.dict("os.environ", {"LITELLM_SALT_KEY": "anthropic-proxy-lifecycle-key"}):
         row = SimpleNamespace(
-            credential_info={"provider": "anthropic", "auth_type": "oauth", "custom": "preserved"},
+            credential_info={
+                "provider": "anthropic", "auth_type": "oauth", "custom": "preserved",
+                ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY: "old-fingerprint",
+                ANTHROPIC_REAUTH_REQUIRED_REASON_KEY: "invalid_grant",
+            },
             credential_values={
                 ANTHROPIC_CREDENTIAL_VALUE_KEY: encrypt_value_helper(old_tokens.to_json()),
                 CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(old_proxy),
@@ -257,6 +263,10 @@ async def test_start_complete_reconnect_supports_maximum_proxy_snapshots() -> No
         finally:
             litellm.credential_list = previous
 
+        stored_info = json.loads(updated[0]["credential_info"])
+        assert ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY not in stored_info
+        assert ANTHROPIC_REAUTH_REQUIRED_REASON_KEY not in stored_info
+        assert stored_info["custom"] == "preserved"
         values = updated[0]["credential_values"]
         if isinstance(values, str):
             values = json.loads(values)
@@ -646,7 +656,8 @@ class _AdvisoryLockDatabase:
                 )
 
             async def update(self, where, data):
-                database.row.credential_values = json.loads(data["credential_values"])
+                if "credential_values" in data:
+                    database.row.credential_values = json.loads(data["credential_values"])
                 database.row.credential_info = json.loads(data["credential_info"])
 
             async def create(self, data):
@@ -1098,3 +1109,80 @@ async def test_required_database_proxy_cannot_be_downgraded_to_direct(expires_in
     client.refresh.assert_not_awaited()
     assert litellm.credential_list == [cached]
     assert row.credential_info["proxy_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_permanent_refresh_failure_survives_fresh_hook_and_token_replacement():
+    from litellm.proxy.credential_endpoints.anthropic_oauth import ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY
+
+    rejected = AnthropicOAuthTokens("sk-ant-oat-rejected", "refresh-old", time.time() + 3600, "account-a")
+    replacement = AnthropicOAuthTokens("sk-ant-oat-new", "refresh-new", time.time() + 3600, "account-a")
+    database = _AdvisoryLockDatabase(SimpleNamespace(
+        credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: rejected.to_json()},
+        credential_info={"provider": "anthropic", "auth_type": "oauth"},
+    ))
+    client = MagicMock()
+    client.refresh = AsyncMock(side_effect=AnthropicOAuthError("token refresh", 400, reason="invalid_grant"))
+    with (
+        patch.object(litellm, "credential_list", [_credential("subscription", rejected)]),
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper", side_effect=lambda value, *a, **k: value),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type", AsyncMock()),
+    ):
+        with pytest.raises(AnthropicOAuthError):
+            await AnthropicOAuthCredentialHook(client).recover_rejected_token("subscription", rejected.access_token)
+        with pytest.raises(AnthropicOAuthError) as cached:
+            await AnthropicOAuthCredentialHook(client).get_subscription_usage_auth("subscription")
+        assert cached.value.reason == "reauth_required"
+        litellm.credential_list = [_credential("subscription", rejected)]
+        with pytest.raises(AnthropicOAuthError) as fresh:
+            await AnthropicOAuthCredentialHook(client).get_subscription_usage_auth("subscription")
+        assert fresh.value.reason == "reauth_required"
+        marker = database.row.credential_info[ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY]
+        assert rejected.access_token not in marker and rejected.refresh_token not in marker
+        database.row.credential_values[ANTHROPIC_CREDENTIAL_VALUE_KEY] = replacement.to_json()
+        litellm.credential_list = [_credential("subscription", replacement)]
+        token, _, account = await AnthropicOAuthCredentialHook(client).get_subscription_usage_auth("subscription")
+        assert (token, account) == (replacement.access_token, replacement.account_id)
+    client.refresh.assert_awaited_once_with(rejected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_tokens", [False, True])
+async def test_refresh_failure_preserves_concurrent_proxy_and_token_edits(replace_tokens):
+    rejected = AnthropicOAuthTokens("sk-ant-oat-rejected", "refresh-old", time.time() + 3600, "account-a")
+    replacement = AnthropicOAuthTokens("sk-ant-oat-new", "refresh-new", time.time() + 3600, "account-a")
+    database = _AdvisoryLockDatabase(SimpleNamespace(
+        credential_values={ANTHROPIC_CREDENTIAL_VALUE_KEY: rejected.to_json()},
+        credential_info={"provider": "anthropic", "auth_type": "oauth"},
+    ))
+
+    async def refresh(tokens):
+        database.row.credential_values[CREDENTIAL_PROXY_VALUE_KEY] = "http://new-proxy.example:8080"
+        database.row.credential_info["proxy_configured"] = True
+        database.row.credential_info["custom"] = "new-value"
+        if replace_tokens:
+            database.row.credential_values[ANTHROPIC_CREDENTIAL_VALUE_KEY] = replacement.to_json()
+        raise AnthropicOAuthError("token refresh", 400, reason="invalid_grant")
+
+    client = MagicMock()
+    client.refresh = AsyncMock(side_effect=refresh)
+    with (
+        patch.object(litellm, "credential_list", [_credential("subscription", rejected)]),
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.decrypt_value_helper", side_effect=lambda value, *a, **k: value),
+        patch("litellm.proxy.credential_endpoints.anthropic_oauth.publish_config_change_for_object_type", AsyncMock()),
+    ):
+        hook = AnthropicOAuthCredentialHook(client)
+        if replace_tokens:
+            assert await hook.recover_rejected_token("subscription", rejected.access_token) == replacement.access_token
+            assert ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY not in database.row.credential_info
+        else:
+            with pytest.raises(AnthropicOAuthError):
+                await hook.recover_rejected_token("subscription", rejected.access_token)
+            assert ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY in database.row.credential_info
+        assert database.row.credential_values[CREDENTIAL_PROXY_VALUE_KEY] == "http://new-proxy.example:8080"
+        assert database.row.credential_info["custom"] == "new-value"
+        assert database.row.credential_values[ANTHROPIC_CREDENTIAL_VALUE_KEY] == (
+            replacement if replace_tokens else rejected
+        ).to_json()

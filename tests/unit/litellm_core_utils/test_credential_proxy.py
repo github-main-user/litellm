@@ -457,3 +457,29 @@ def test_proxy_failure_does_not_fall_back_directly():
             handler.get("http://127.0.0.1:1/direct-must-not-run")
     finally:
         handler.close()
+
+
+@pytest.mark.parametrize("transport_proxy", [None, "http://original.invalid:8080"])
+@pytest.mark.parametrize("required_proxy", [None, "http://original.invalid:8080", "http://user:secret@new.invalid:8080"])
+def test_credential_route_requires_current_proxy(monkeypatch, transport_proxy, required_proxy):
+    from litellm.litellm_core_utils.credential_proxy import validate_credential_proxy_route
+
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="subscription", credential_info={},
+        credential_values={"litellm_internal_proxy_url": required_proxy} if required_proxy else {},
+    )])
+    if transport_proxy == required_proxy:
+        assert validate_credential_proxy_route(transport_proxy, "subscription") is None
+    else:
+        with pytest.raises(ValueError) as caught:
+            validate_credential_proxy_route(transport_proxy, "subscription")
+        assert str(caught.value) == "Credential proxy routing validation failed"
+
+
+def test_credential_route_does_not_accept_unavailable_named_credential(monkeypatch):
+    from litellm.litellm_core_utils.credential_proxy import validate_credential_proxy_route
+
+    monkeypatch.setattr(litellm, "credential_list", [])
+    with pytest.raises(ValueError) as caught:
+        validate_credential_proxy_route(None, "missing")
+    assert str(caught.value) == "Credential proxy routing validation failed"

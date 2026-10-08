@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.llms.anthropic.oauth_client import AnthropicOAuthError
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -275,6 +276,12 @@ class SubscriptionUsageService:
             raise HTTPException(status_code=409, detail="Credential is not a supported OAuth subscription")
         try:
             auth: Final = await self._auth_resolver(provider, credential_name)
+        except AnthropicOAuthError as error:
+            return self._unavailable(
+                credential_name, provider,
+                "Anthropic credential requires reauthentication; reconnect the credential"
+                if error.reason is not None else "Credential authentication is unavailable",
+            )
         except Exception:  # noqa: BLE001  # OAuth and storage failures must not expose credential details
             return self._unavailable(credential_name, provider, "Credential authentication is unavailable")
         cache_key: Final = self._cache_key(credential_name, auth)

@@ -12,6 +12,15 @@ from litellm.llms.chatgpt.oauth_client import ChatGPTTokens, ManagedChatGPTAcces
 from litellm.types.utils import CredentialItem
 
 
+@pytest.fixture(autouse=True)
+async def flush_request_logging(isolate_litellm_state):
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    yield
+    GLOBAL_LOGGING_WORKER.start()
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+
+
 class _Proxy(socketserver.StreamRequestHandler):
     def handle(self):
         request_line = self.rfile.readline().decode("ascii")
@@ -373,3 +382,123 @@ async def test_anthropic_api_surfaces_replace_direct_client_with_credential_prox
             await direct_client.close()
 
     assert proxy.seen == ["POST http://anthropic-upstream.invalid/v1/messages HTTP/1.1\r\n"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("recovery", ["unchanged", "changed", "missing", "cancelled", "error", "rejected"])
+async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, surface, stream, recovery):
+    import httpx
+
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+    from litellm.llms.anthropic.oauth_client import AnthropicOAuthTokens, ManagedAnthropicOAuthToken
+    from litellm.llms.custom_httpx import http_handler
+
+    captured = []
+    closed = []
+    recovered = []
+    proxy_url = "http://proxy.invalid:8080"
+    identity = json.dumps({"user_id": "a" * 64, "account_id": "account", "session_id": "session"})
+    message = {
+        "id": "msg_retry", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "replayed"}], "stop_reason": "end_turn",
+        "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    events = (
+        {"type": "message_start", "message": {**message, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "replayed"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    )
+
+    class TrackedBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"error":{"type":"authentication_error","message":"rejected"}}'
+
+        async def aclose(self):
+            closed.append(True)
+
+    def upstream(request):
+        captured.append((dict(request.headers), json.loads(request.content)))
+        if len(captured) == 1 or recovery == "rejected":
+            return httpx.Response(401, stream=TrackedBody())
+        body = (
+            "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+            if stream else json.dumps(message)
+        )
+        return httpx.Response(200, content=body, headers={
+            "content-type": "text/event-stream" if stream else "application/json",
+        })
+
+    class RecoveringHook:
+        async def recover_rejected_token(self, credential_name, rejected_access_token):
+            recovered.append((credential_name, rejected_access_token))
+            if recovery == "cancelled":
+                raise asyncio.CancelledError()
+            if recovery == "error":
+                raise RuntimeError("secret-refresh-detail")
+            if recovery in ("changed", "missing"):
+                CredentialAccessor.upsert_credentials([CredentialItem(
+                    credential_name="subscription", credential_info={"proxy_configured": True},
+                    credential_values={} if recovery == "missing" else {
+                        "litellm_internal_proxy_url": "http://secret:password@changed.invalid:8080",
+                    },
+                )])
+            return "sk-ant-oat-refreshed"
+
+    monkeypatch.setattr(http_handler, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(upstream))
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="subscription", credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        credential_values={
+            "litellm_internal_proxy_url": proxy_url,
+            "litellm_internal_anthropic_auth_token": AnthropicOAuthTokens(
+                "sk-ant-oat-rejected", "refresh", 9999999999, "account", "a" * 64,
+            ).to_json(),
+        },
+    )])
+    monkeypatch.setattr(litellm, "callbacks", [RecoveringHook()])
+
+    async def invoke():
+        params = {
+            "model": "anthropic/claude-sonnet-5", "api_key": ManagedAnthropicOAuthToken("sk-ant-oat-rejected"),
+            "litellm_credential_name": "subscription", "stream": stream, "max_retries": 0,
+            "metadata": {"user_id": identity},
+        }
+        if surface == "chat":
+            result = await litellm.acompletion(**params, messages=[{"role": "user", "content": "hello"}], max_tokens=10)
+        elif surface == "responses":
+            result = await litellm.aresponses(**params, input="hello", max_output_tokens=10)
+        else:
+            result = await litellm.anthropic_messages(
+                **params, messages=[{"role": "user", "content": "hello"}], max_tokens=10,
+            )
+        if stream:
+            return [part async for part in result]
+        return result
+
+    if recovery == "unchanged":
+        result = await invoke()
+        assert "replayed" in str(result)
+    elif recovery == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await invoke()
+    else:
+        with pytest.raises(Exception) as caught:
+            await invoke()
+        assert caught.value.status_code == (401 if recovery == "rejected" else 503)
+        assert "secret-refresh-detail" not in str(caught.value)
+        assert "secret:password" not in str(caught.value)
+    assert recovered == [("subscription", "sk-ant-oat-rejected")]
+    assert len(captured) == (2 if recovery in ("unchanged", "rejected") else 1)
+    assert closed == [True] * (2 if recovery == "rejected" else 1)
+    outgoing_identity = json.loads(captured[0][1]["metadata"]["user_id"])
+    assert outgoing_identity["device_id"] == "a" * 64
+    assert outgoing_identity["account_uuid"] == "account"
+    assert outgoing_identity["session_id"] == captured[0][0]["x-claude-code-session-id"]
+    if len(captured) == 2:
+        assert captured[1][1] == captured[0][1]
+        assert captured[0][0]["authorization"] == "Bearer sk-ant-oat-rejected"
+        assert captured[1][0]["authorization"] == "Bearer sk-ant-oat-refreshed"

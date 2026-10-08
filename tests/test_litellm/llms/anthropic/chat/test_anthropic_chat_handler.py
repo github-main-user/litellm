@@ -61,7 +61,12 @@ class _RecoveringOAuthHook:
 
 
 @pytest.mark.asyncio
-async def test_stream_401_recovers_managed_oauth_once_before_output():
+async def test_stream_401_recovers_managed_oauth_once_before_output(monkeypatch):
+    from litellm.types.utils import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-one", credential_info={}, credential_values={}),
+    ])
     rejected = httpx.Response(
         401,
         content=b'{"error":"expired"}',
@@ -73,6 +78,7 @@ async def test_stream_401_recovers_managed_oauth_once_before_output():
         request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
     )
     client = AsyncMock()
+    client.proxy_url = None
     client.post = AsyncMock(side_effect=[rejected, accepted])
     hook = _RecoveringOAuthHook()
     litellm.callbacks.insert(0, hook)
@@ -98,12 +104,18 @@ async def test_stream_401_recovers_managed_oauth_once_before_output():
 
 
 @pytest.mark.asyncio
-async def test_stream_recovers_when_http_client_raises_status_error_directly():
+async def test_stream_recovers_when_http_client_raises_status_error_directly(monkeypatch):
+    from litellm.types.utils import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-one", credential_info={}, credential_values={}),
+    ])
     rejected = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
     with pytest.raises(httpx.HTTPStatusError) as raised:
         rejected.raise_for_status()
     accepted = httpx.Response(200, content=b"", request=rejected.request)
     client = AsyncMock()
+    client.proxy_url = None
     client.post = AsyncMock(side_effect=[raised.value, accepted])
     hook = _RecoveringOAuthHook()
     litellm.callbacks.insert(0, hook)
@@ -128,12 +140,18 @@ async def test_stream_recovers_when_http_client_raises_status_error_directly():
 
 
 @pytest.mark.asyncio
-async def test_async_nonstream_401_recovers_managed_oauth():
+async def test_async_nonstream_401_recovers_managed_oauth(monkeypatch):
+    from litellm.types.utils import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-one", credential_info={}, credential_values={}),
+    ])
     from litellm.llms.anthropic.chat.handler import AnthropicChatCompletion
 
     rejected = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
     accepted = httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
     client = AsyncMock()
+    client.proxy_url = None
     client.post = AsyncMock(side_effect=[rejected, accepted])
     provider_config = MagicMock()
     provider_config.transform_response.return_value = "transformed"
@@ -170,12 +188,18 @@ async def test_async_nonstream_401_recovers_managed_oauth():
 
 
 @pytest.mark.asyncio
-async def test_stream_second_401_stops_without_another_refresh():
+async def test_stream_second_401_stops_without_another_refresh(monkeypatch):
+    from litellm.types.utils import CredentialItem
+
+    monkeypatch.setattr(litellm, "credential_list", [
+        CredentialItem(credential_name="managed-one", credential_info={}, credential_values={}),
+    ])
     responses = [
         httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
         for _ in range(2)
     ]
     client = AsyncMock()
+    client.proxy_url = None
     client.post = AsyncMock(side_effect=responses)
     hook = _RecoveringOAuthHook()
     litellm.callbacks.insert(0, hook)

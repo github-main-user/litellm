@@ -345,3 +345,25 @@ async def test_token_response_rejects_nonfinite_expiry(expires_in: float) -> Non
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         with pytest.raises(AnthropicOAuthError):
             await AnthropicOAuthClient(http_client).exchange_code("code", "state", "verifier")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,payload,reason", [
+    (400, {"error": "invalid_grant"}, "invalid_grant"),
+    (401, {"error": {"type": "refresh_token_revoked"}}, "credential_revoked"),
+    (403, {"error": {"type": "permission_error", "message": "revoked"}}, None),
+    (400, {"error": "invalid_request"}, None),
+    (429, {"error": "invalid_grant"}, None),
+    (503, {"error": "invalid_grant"}, None),
+])
+async def test_only_definitive_refresh_credential_errors_have_permanent_reason(status, payload, reason):
+    http = AsyncMock()
+    http.post.return_value = httpx.Response(status, json=payload, request=httpx.Request("POST", ANTHROPIC_OAUTH_TOKEN_URL))
+    client = AnthropicOAuthClient(http)
+    with pytest.raises(AnthropicOAuthError) as caught:
+        await client.refresh(AnthropicOAuthTokens("sk-ant-oat-secret", "refresh-secret", 1000))
+    assert caught.value.reason == reason
+    assert "secret" not in str(caught.value)
+    with pytest.raises(AnthropicOAuthError) as exchange:
+        await client.exchange_code("code", "state", "verifier")
+    assert exchange.value.reason is None

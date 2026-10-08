@@ -72,6 +72,17 @@ def get_credential_proxy_url(credential_name: str | None) -> str | None:
     return validate_proxy_url(value)
 
 
+def validate_credential_proxy_route(proxy_url: str | None, credential_name: object) -> None:
+    if not isinstance(credential_name, str) or not credential_name:
+        return
+    try:
+        required_proxy: Final = get_credential_proxy_url(credential_name)
+    except ValueError:
+        raise ValueError("Credential proxy routing validation failed") from None
+    if proxy_url != required_proxy:
+        raise ValueError("Credential proxy routing validation failed")
+
+
 def pop_request_proxy_url(kwargs: dict[str, object]) -> str | None:
     from litellm.llms.custom_httpx.http_handler import CREDENTIAL_PROXY_TRUSTED
 
@@ -88,4 +99,4 @@ def pop_request_proxy_url(kwargs: dict[str, object]) -> str | None:
     return None
 
 
-__all__ = ["get_credential_proxy_url", "pop_request_proxy_url", "validate_proxy_url"]
+__all__ = ["get_credential_proxy_url", "pop_request_proxy_url", "validate_credential_proxy_route", "validate_proxy_url"]

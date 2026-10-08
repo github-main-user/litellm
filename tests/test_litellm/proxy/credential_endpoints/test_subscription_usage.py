@@ -16,10 +16,10 @@ from litellm.proxy.credential_endpoints.subscription_usage import (
     SubscriptionUsageAuth,
     SubscriptionUsageService,
     get_credential_subscription_usage,
-    reset_credential_subscription_usage,
     parse_anthropic_usage,
     parse_chatgpt_reset_credits,
     parse_chatgpt_usage,
+    reset_credential_subscription_usage,
 )
 
 
@@ -417,3 +417,21 @@ async def test_cached_errors_expire_and_retry_without_exposing_provider_body(mon
     await asyncio.sleep(0.03)
     assert (await service.get("subscription")).windows[0].used_percent == 0
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reauth_required_usage_is_actionable_without_provider_request():
+    from unittest.mock import AsyncMock
+
+    from litellm.llms.anthropic.oauth_client import AnthropicOAuthError
+
+    requester = AsyncMock()
+    service = SubscriptionUsageService(
+        requester=requester,
+        credential_finder=AsyncMock(return_value=_oauth_credential()),
+        auth_resolver=AsyncMock(side_effect=AnthropicOAuthError("reauthentication required", 401, reason="reauth_required")),
+    )
+    response = await service.get("subscription")
+    assert response.status == "unavailable"
+    assert response.error == "Anthropic credential requires reauthentication; reconnect the credential"
+    requester.assert_not_awaited()

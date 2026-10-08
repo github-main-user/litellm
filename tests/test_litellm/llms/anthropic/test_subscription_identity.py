@@ -1,3 +1,4 @@
+import asyncio
 import json
 from copy import deepcopy
 from uuid import UUID, uuid4
@@ -11,6 +12,15 @@ from litellm.llms.anthropic.common_utils import (
 )
 from litellm.llms.anthropic.oauth_client import AnthropicOAuthClient, AnthropicOAuthTokens
 from litellm.llms.anthropic.subscription_identity import SubscriptionIdentity, prepare_subscription_identity
+
+
+@pytest.fixture(autouse=True)
+async def flush_request_logging(isolate_litellm_state):
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    yield
+    GLOBAL_LOGGING_WORKER.start()
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
 
 
 def test_managed_identity_matches_session_header_and_preserves_customer_metadata():
@@ -207,3 +217,248 @@ def test_coding_agent_signature_moves_from_system_to_user_reminder():
     assert system == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
     assert signature not in json.dumps(system)
     assert signature in json.dumps(messages)
+
+
+@pytest.mark.parametrize("session", ["e96634a3-fa28-4083-b354-55542e2dca01", "conversation-123"])
+@pytest.mark.parametrize("owner_field", ["user_id", "team_id", "org_id", "project_id", "api_key"])
+def test_gateway_sessions_are_isolated_by_authenticated_owner(session, owner_field):
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    body = {"metadata": {"user_id": json.dumps({"session_id": session, "customer": "same"})}}
+
+    def prepare(owner):
+        params = {
+            "litellm_credential_name": "subscription",
+            "metadata": {"session_id": session, "user_api_key_auth": UserAPIKeyAuth(**{owner_field: owner})},
+        }
+        return prepare_subscription_identity(body, {}, params, identity)
+
+    first = prepare("owner-a")
+    assert first == prepare("owner-a")
+    assert first[1] != prepare("owner-b")[1]
+    assert first[1]["x-claude-code-session-id"] != session
+    UUID(first[1]["x-claude-code-session-id"])
+
+
+def test_gateway_selected_session_wins_and_is_stable_when_headers_are_reused():
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    params = {"metadata": {"session_id": "gateway-session", "user_api_key_auth": UserAPIKeyAuth(user_id="alice")}}
+    body = {"metadata": {"user_id": json.dumps({"session_id": "body-session", "customer": "alice"})}}
+    result = prepare_subscription_identity(body, {"X-Claude-Code-Session-Id": "native-session"}, params, identity)
+    assert result == prepare_subscription_identity(body, {}, params, identity)
+    assert prepare_subscription_identity(*result, params, identity) == result
+    assert json.loads(result[0]["metadata"]["user_id"])["customer"] == "alice"
+
+
+@pytest.mark.parametrize("session", ["e96634a3-fa28-4083-b354-55542e2dca01", "conversation-123"])
+def test_gateway_sessions_are_scoped_to_selected_credential(session):
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    metadata = {"session_id": session, "user_api_key_auth": UserAPIKeyAuth(user_id="alice")}
+    first = prepare_subscription_identity({}, {}, {"metadata": metadata, "litellm_credential_name": "one"}, identity)
+    second = prepare_subscription_identity({}, {}, {"metadata": metadata, "litellm_credential_name": "two"}, identity)
+    assert first[1] != second[1]
+
+
+def test_client_user_fields_and_serialized_auth_do_not_establish_gateway_scope():
+    session = "e96634a3-fa28-4083-b354-55542e2dca01"
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    body = {"metadata": {"user_id": json.dumps({"session_id": session})}}
+    params = {
+        "user": "spoof",
+        "metadata": {"user_id": "spoof", "user_api_key_user_id": "spoof", "user_api_key_auth": {"user_id": "spoof"}},
+    }
+    assert prepare_subscription_identity(body, {}, params, identity)[1] == {"x-claude-code-session-id": session}
+
+
+def test_unidentified_requests_generate_distinct_bounded_sessions():
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    first_body, first_headers = prepare_subscription_identity({}, {}, {}, identity)
+    second_body, second_headers = prepare_subscription_identity({}, {}, {}, identity)
+    assert first_headers != second_headers
+    assert len(first_body["metadata"]["user_id"]) <= 512
+    assert len(second_body["metadata"]["user_id"]) <= 512
+    UUID(first_headers["x-claude-code-session-id"])
+
+
+def test_gateway_generated_trace_session_survives_rewritten_headers_without_merging_requests():
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    params = {"litellm_trace_id": "request-one", "metadata": {"user_api_key_auth": UserAPIKeyAuth(user_id="alice")}}
+    first = prepare_subscription_identity({}, {}, params, identity)
+    assert prepare_subscription_identity(*first, params, identity) == first
+    assert prepare_subscription_identity({}, first[1], params, identity) == first
+    other = prepare_subscription_identity({}, {}, {**params, "litellm_trace_id": "request-two"}, identity)
+    assert first[1] != other[1]
+    assert len(first[0]["metadata"]["user_id"]) <= 512
+
+
+def test_dict_user_metadata_retains_customer_fields_during_subscription_normalization():
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    session = "e96634a3-fa28-4083-b354-55542e2dca01"
+    body = {"metadata": {"user_id": {"session_id": session, "customer": "alice"}, "custom": "retained"}}
+    original = deepcopy(body)
+    result, headers = prepare_subscription_identity(body, {}, {}, identity)
+    assert result == {
+        "metadata": {
+            "custom": "retained",
+            "user_id": json.dumps(
+                {"session_id": session, "customer": "alice", "device_id": "a" * 64, "account_uuid": "account-a"},
+                separators=(",", ":"),
+            ),
+        }
+    }
+    assert headers == {"x-claude-code-session-id": session}
+    assert body == original
+
+
+def test_client_end_user_id_does_not_change_authenticated_session_scope():
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    first = prepare_subscription_identity(
+        {},
+        {},
+        {
+            "metadata": {
+                "session_id": "shared-conversation",
+                "user_api_key_auth": UserAPIKeyAuth(user_id="alice", end_user_id="spoof-one"),
+            }
+        },
+        identity,
+    )
+    second = prepare_subscription_identity(
+        {},
+        {},
+        {
+            "metadata": {
+                "session_id": "shared-conversation",
+                "user_api_key_auth": UserAPIKeyAuth(user_id="alice", end_user_id="spoof-two"),
+            }
+        },
+        identity,
+    )
+    assert first == second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("oauth", [False, True])
+async def test_public_api_identity_isolates_gateway_users_without_changing_provider_payload(
+    surface: str, oauth: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Final
+
+    import httpx
+    from pydantic import JsonValue, TypeAdapter
+
+    import litellm
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from litellm.models.credentials import CredentialItem
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    bodies: Final[list[dict[str, JsonValue]]] = []
+    sessions: Final[list[str | None]] = []
+    body_adapter: Final = TypeAdapter(dict[str, JsonValue])
+    tokens: Final = AnthropicOAuthTokens("sk-ant-oat-test", "refresh-test", 2000000000, "account", "a" * 64)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="subscription", credential_info={"provider": "anthropic", "auth_type": "oauth"},
+        credential_values={"litellm_internal_anthropic_auth_token": tokens.to_json()},
+    )])
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        bodies.append(body_adapter.validate_json(request.content))
+        sessions.append(request.headers.get("x-claude-code-session-id"))
+        return httpx.Response(200, json={
+            "id": "msg_identity", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    client: Final = AsyncHTTPHandler()
+    await client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw:
+        client.client = raw
+        for user in ("alice", "bob", "alice"):
+            metadata: Final = {"session_id": "same-conversation", "user_api_key_auth": UserAPIKeyAuth(user_id=user)}
+            params: Final = {
+                "model": "anthropic/claude-sonnet-5", "client": client, "litellm_credential_name": "subscription",
+                "api_key": ManagedAnthropicOAuthToken(tokens.access_token) if oauth else "sk-ant-api-test",
+            }
+            if surface == "chat":
+                await litellm.acompletion(
+                    **params, messages=[{"role": "user", "content": "test"}], max_tokens=8, metadata=metadata,
+                )
+            elif surface == "responses":
+                await litellm.aresponses(**params, input="test", max_output_tokens=8, litellm_metadata=metadata)
+            else:
+                await litellm.anthropic_messages(
+                    **params, messages=[{"role": "user", "content": "test"}], max_tokens=8, litellm_metadata=metadata,
+                )
+
+    assert len(bodies) == len(sessions) == 3
+    assert bodies[0] == bodies[2]
+    if not oauth:
+        assert sessions == [None, None, None]
+        assert bodies[0] == bodies[1]
+        assert "metadata" not in bodies[0]
+        return
+    assert sessions[0] == sessions[2]
+    assert sessions[0] != sessions[1]
+    for body, session in zip(bodies, sessions, strict=True):
+        assert body["metadata"] == {"user_id": json.dumps({
+            "device_id": tokens.device_id, "account_uuid": tokens.account_id, "session_id": session,
+        }, separators=(",", ":"))}
+        assert body == {**bodies[0], "metadata": body["metadata"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{}, {"x-litellm-session-id": "gateway-session"}])
+async def test_proxy_dict_identity_reaches_native_messages_without_losing_customer_fields(headers) -> None:
+    from typing import Final
+
+    import httpx
+
+    import litellm
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+    identity: Final = {"session_id": "conversation-123", "customer": "synthetic"}
+    data: Final = {"metadata": {"user_id": identity}, "litellm_metadata": {}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers=headers, data=data, _metadata_variable_name="litellm_metadata",
+    )
+    bodies: Final[list[bytes]] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        return httpx.Response(200, json={
+            "id": "msg_metadata", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    client: Final = AsyncHTTPHandler()
+    await client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw:
+        client.client = raw
+        await litellm.anthropic_messages(
+            model="anthropic/claude-sonnet-5", messages=[{"role": "user", "content": "test"}],
+            max_tokens=8, api_key="sk-ant-api-test", client=client, **data,
+        )
+    assert len(bodies) == 1
+    assert json.loads(bodies[0]) == {
+        "model": "claude-sonnet-5", "max_tokens": 8, "stream": False,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "test", "cache_control": {"type": "ephemeral"}},
+        ]}],
+        "metadata": {"user_id": json.dumps(identity, separators=(",", ":"))},
+    }
+    assert identity == {"session_id": "conversation-123", "customer": "synthetic"}

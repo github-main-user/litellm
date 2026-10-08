@@ -268,17 +268,12 @@ def _is_native_anthropic_config(provider_config: object) -> bool:
 
 
 def _validate_anthropic_retry_proxy(client: AsyncHTTPHandler, params: Mapping[str, object]) -> None:
-    from litellm.litellm_core_utils.credential_proxy import get_credential_proxy_url
+    from litellm.litellm_core_utils.credential_proxy import validate_credential_proxy_route
 
-    credential_name: Final = params.get("litellm_credential_name")
-    if not isinstance(credential_name, str) or not credential_name:
-        return
     try:
-        proxy_url: Final = get_credential_proxy_url(credential_name)
+        validate_credential_proxy_route(client.proxy_url, params.get("litellm_credential_name"))
     except ValueError:
         raise _ManagedAnthropicOAuthRecoveryError("proxy routing validation", 503) from None
-    if client.proxy_url != proxy_url:
-        raise _ManagedAnthropicOAuthRecoveryError("proxy routing validation", 503)
 
 
 def _custom_logger_callbacks(logging_obj: LiteLLMLoggingObj) -> list["CustomLogger"]:

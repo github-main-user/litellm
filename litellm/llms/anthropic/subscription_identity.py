@@ -28,6 +28,8 @@ def _object(value: object) -> dict[str, object]:
 
 
 def _user_metadata(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return _object(value)
     if not isinstance(value, str) or not value:
         return {}
     try:
@@ -53,13 +55,31 @@ def get_subscription_identity(credential_name: object) -> SubscriptionIdentity |
     return SubscriptionIdentity(account_id=tokens.account_id or "", device_id=tokens.device_id)
 
 
-def _session_id(value: object, device_id: str) -> str | None:
+def _session_id(value: object, scope: str, gateway: bool) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        return str(UUID(value))
+        parsed: Final = UUID(value)
     except ValueError:
-        return str(uuid5(NAMESPACE_URL, f"litellm-anthropic:{device_id}:{value}"))
+        pass
+    else:
+        if not gateway:
+            return str(parsed)
+    return str(uuid5(NAMESPACE_URL, json.dumps(["litellm-anthropic", scope, value])))
+
+
+def _gateway_metadata(params: Mapping[str, object]) -> tuple[dict[str, object], list[str | None] | None]:
+    for slot in ("litellm_metadata", "metadata"):
+        metadata: Final = _object(params.get(slot))
+        auth: Final = metadata.get("user_api_key_auth")
+        if auth is None or isinstance(auth, (dict, list, str, int, float, bool)):
+            continue
+        from litellm.proxy._types import UserAPIKeyAuth
+
+        # only proxy-injected typed auth is trusted; end_user_id is caller-controlled.
+        if isinstance(auth, UserAPIKeyAuth):
+            return metadata, [auth.user_id, auth.team_id, auth.org_id, auth.project_id, auth.api_key]
+    return _object(params.get("metadata")), None
 
 
 def prepare_subscription_identity(
@@ -72,18 +92,26 @@ def prepare_subscription_identity(
         return dict(body), dict(headers)
     metadata: Final = _object(body.get("metadata"))
     incoming: Final = _user_metadata(metadata.get("user_id"))
-    request_metadata: Final = _object(params.get("metadata"))
+    request_metadata, owner = _gateway_metadata(params)
+    scope: Final = json.dumps([identity.account_id, identity.device_id, params.get("litellm_credential_name"), owner])
     header_session: Final = next((value for name, value in headers.items() if name.lower() == _SESSION_HEADER), None)
+    # the original gateway session takes precedence over headers rewritten by an earlier attempt.
+    gateway_session: Final = (
+        request_metadata.get("session_id") or params.get("litellm_session_id") or params.get("litellm_trace_id")
+        if owner is not None
+        else None
+    )
     session_id: Final = next(
         (
             normalized
             for candidate in (
+                gateway_session,
                 header_session,
                 incoming.get("session_id"),
                 request_metadata.get("session_id"),
                 params.get("litellm_trace_id"),
             )
-            if (normalized := _session_id(candidate, identity.device_id)) is not None
+            if (normalized := _session_id(candidate, scope, owner is not None)) is not None
         ),
         str(uuid4()),
     )

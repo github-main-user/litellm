@@ -3155,7 +3155,9 @@ def test_add_litellm_metadata_from_anthropic_user_id_dict_sets_session_id():
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers={}, data=data, _metadata_variable_name="metadata"
     )
-    assert data["metadata"]["user_id"] == "sess_4f8c1d2a-1234"
+    assert json.loads(data["metadata"]["user_id"]) == {
+        "device_id": "device", "account_uuid": "account", "session_id": "sess_4f8c1d2a-1234"
+    }
     assert data["metadata"]["session_id"] == "sess_4f8c1d2a-1234"
     assert data["litellm_session_id"] == "sess_4f8c1d2a-1234"
     assert "litellm_trace_id" not in data
@@ -8176,3 +8178,70 @@ def test_default_team_settings_bool_turn_off_message_logging_redacts():
         )
         is True
     )
+
+
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        ({}, "e96634a3-fa28-4083-b354-55542e2dca01"),
+        ({"x-litellm-session-id": "gateway-session", "x-claude-code-session-id": "native-session"}, "gateway-session"),
+    ],
+)
+def test_native_anthropic_user_id_json_is_preserved_when_extracting_session(headers, expected):
+    user_id = json.dumps(
+        {
+            "device_id": "device",
+            "account_uuid": "account",
+            "session_id": "e96634a3-fa28-4083-b354-55542e2dca01",
+            "customer": "alice",
+        }
+    )
+    data = {"metadata": {"user_id": user_id, "custom": "untouched"}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers=headers, data=data, _metadata_variable_name="metadata"
+    )
+    assert data["metadata"]["user_id"] == user_id
+    assert data["metadata"]["custom"] == "untouched"
+    assert data["metadata"]["session_id"] == expected
+    assert data["litellm_session_id"] == expected
+
+
+@pytest.mark.asyncio
+async def test_subscription_owner_uses_injected_auth_not_client_metadata_on_messages_route():
+    from litellm.llms.anthropic.subscription_identity import SubscriptionIdentity, prepare_subscription_identity
+
+    user_id = json.dumps({"session_id": "body-session", "customer": "alice"})
+    request = _make_request_mock("/v1/messages", {"Content-Type": "application/json"})
+    request.headers = Headers({"x-litellm-session-id": "gateway-session", "x-claude-code-session-id": "native-session"})
+    updated = await add_litellm_data_to_request(
+        data={
+            "model": "claude-sonnet-5",
+            "metadata": {"user_id": user_id, "user_api_key_auth": {"user_id": "spoof"}},
+            "litellm_metadata": {"user_api_key_auth": {"user_id": "spoof"}, "user_api_key_user_id": "spoof"},
+        },
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(user_id="alice", team_id="tenant"),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    assert updated["metadata"]["user_id"] == user_id
+    assert "user_api_key_auth" not in updated["metadata"]
+    assert isinstance(updated["litellm_metadata"]["user_api_key_auth"], UserAPIKeyAuth)
+    assert updated["litellm_metadata"]["user_api_key_auth"].user_id == "alice"
+    assert updated["litellm_metadata"]["session_id"] == "gateway-session"
+    identity = SubscriptionIdentity("account-a", "a" * 64)
+    actual = prepare_subscription_identity({"metadata": updated["metadata"]}, dict(request.headers), updated, identity)
+    expected = prepare_subscription_identity(
+        {"metadata": updated["metadata"]},
+        {},
+        {
+            "metadata": {
+                "session_id": "gateway-session",
+                "user_api_key_auth": UserAPIKeyAuth(user_id="alice", team_id="tenant"),
+            }
+        },
+        identity,
+    )
+    assert actual[0] == expected[0]
+    assert actual[1]["x-claude-code-session-id"] == expected[1]["x-claude-code-session-id"]

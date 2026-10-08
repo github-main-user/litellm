@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timezone
 from email.utils import format_datetime, parsedate_to_datetime
-from typing import Final, Protocol, TypeGuard, cast, runtime_checkable
+from typing import Final, Literal, Protocol, TypeGuard, cast, runtime_checkable
 from urllib.parse import urlencode
 
 import httpx
@@ -88,8 +88,12 @@ class AsyncHTTPClient(Protocol):
 
 
 class AnthropicOAuthError(RuntimeError):
-    def __init__(self, operation: str, status_code: int = 400, retry_after: str | None = None) -> None:
+    def __init__(
+        self, operation: str, status_code: int = 400, retry_after: str | None = None,
+        *, reason: Literal["invalid_grant", "credential_revoked", "reauth_required"] | None = None,
+    ) -> None:
         super().__init__(f"Anthropic OAuth {operation} failed")
+        self.reason = reason
         self.status_code = status_code
         self.retryable = status_code == 429 or status_code >= 500
         self.retry_after = retry_after if self.retryable else None
@@ -239,7 +243,10 @@ class AnthropicOAuthClient:
             payload: Final = _OAUTH_OBJECT_ADAPTER.validate_json(response.content)
         except httpx.HTTPStatusError as error:
             retry_after: Final = sanitize_retry_after(cast(str | None, error.response.headers.get("retry-after")))
-            raise AnthropicOAuthError(operation, error.response.status_code, retry_after) from None
+            raise AnthropicOAuthError(
+                operation, error.response.status_code, retry_after,
+                reason=_permanent_refresh_failure(error.response) if previous is not None else None,
+            ) from None
         except (httpx.TimeoutException, TimeoutError):
             raise AnthropicOAuthError(operation, 504) from None
         except httpx.HTTPError:
@@ -395,8 +402,27 @@ def _recovery_error(error: Exception) -> AnthropicOAuthError:
         else None
     )
     return AnthropicOAuthError(
-        "token refresh", status_code, sanitize_retry_after(retry_after) if isinstance(retry_after, str) else None
+        "token refresh", status_code, sanitize_retry_after(retry_after) if isinstance(retry_after, str) else None,
+        reason=error.reason if isinstance(error, AnthropicOAuthError) else None,
     )
+
+
+def _permanent_refresh_failure(
+    response: httpx.Response,
+) -> Literal["invalid_grant", "credential_revoked"] | None:
+    if response.status_code not in (400, 401, 403):
+        return None
+    try:
+        payload: Final = _OAUTH_OBJECT_ADAPTER.validate_json(response.content)
+    except ValueError:
+        return None
+    error: Final = payload.get("error")
+    code: Final = error.get("type") if isinstance(error, dict) else error
+    if code == "invalid_grant":
+        return "invalid_grant"
+    if code in ("token_revoked", "refresh_token_revoked"):
+        return "credential_revoked"
+    return None
 
 
 def sanitize_retry_after(value: str | None) -> str | None:

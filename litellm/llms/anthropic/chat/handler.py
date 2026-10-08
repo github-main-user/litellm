@@ -82,6 +82,15 @@ async def _recover_managed_anthropic_oauth(
         raise AnthropicError(status_code=error.status_code, message=str(error), headers=error.headers) from None
 
 
+def _validate_retry_proxy(client: AsyncHTTPHandler, credential_name: object) -> None:
+    from litellm.litellm_core_utils.credential_proxy import validate_credential_proxy_route
+
+    try:
+        validate_credential_proxy_route(client.proxy_url, credential_name)
+    except ValueError:
+        raise AnthropicError(status_code=503, message="Credential proxy routing validation failed") from None
+
+
 async def make_call(
     client: AsyncHTTPHandler | None,
     api_base: str,
@@ -121,6 +130,8 @@ async def make_call(
                             headers=request_headers,
                             credential_name=credential_name,
                         )
+                        if refreshed_headers is not None:
+                            _validate_retry_proxy(client, credential_name)
                     except BaseException:
                         await error.response.aclose()
                         raise
@@ -335,10 +346,16 @@ class AnthropicChatCompletion(BaseLLM):
                     break
                 except httpx.HTTPStatusError as error:
                     if attempt == 0 and error.response.status_code == 401:
-                        refreshed_headers = await _recover_managed_anthropic_oauth(
-                            headers=request_headers,
-                            credential_name=credential_name,
-                        )
+                        try:
+                            refreshed_headers = await _recover_managed_anthropic_oauth(
+                                headers=request_headers,
+                                credential_name=credential_name,
+                            )
+                            if refreshed_headers is not None:
+                                _validate_retry_proxy(async_handler, credential_name)
+                        except BaseException:
+                            await error.response.aclose()
+                            raise
                         if refreshed_headers is not None:
                             await error.response.aclose()
                             request_headers = refreshed_headers

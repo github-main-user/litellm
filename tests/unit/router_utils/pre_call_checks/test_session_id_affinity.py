@@ -771,3 +771,92 @@ def test_complexity_router_with_deployment_affinity_registers_affinity_callback(
         _cleanup_router_callbacks(enabled)
         _cleanup_router_callbacks(session_only)
         _cleanup_router_callbacks(disabled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+async def test_session_affinity_preserves_caller_isolation_and_removed_deployment_failover(
+    surface: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import httpx
+    import respx
+    from pydantic import JsonValue, TypeAdapter
+
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.types.router import DeploymentTypedDict, OptionalPreCallChecks
+
+    body_adapter: Final = TypeAdapter(dict[str, JsonValue])
+
+    async def requests_with_affinity(enabled: bool) -> list[tuple[str, dict[str, JsonValue]]]:
+        captured: Final[list[tuple[str, dict[str, JsonValue]]]] = []
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            captured.append((request.url.host, body_adapter.validate_json(request.content)))
+            return httpx.Response(200, json={
+                "id": "msg_session", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+
+        checks: Final[OptionalPreCallChecks] = [
+            "responses_api_deployment_check", "encrypted_content_affinity", "prompt_caching",
+        ]
+        router: Final = litellm.Router(
+            model_list=[{
+                "model_name": "session-model",
+                "litellm_params": {
+                    "model": "anthropic/claude-sonnet-5", "api_key": "test-key", "api_base": f"https://{name}.invalid",
+                },
+                "model_info": {"id": name},
+            } for name in ("first", "second")],
+            optional_pre_call_checks=[*checks, *(["session_affinity"] if enabled else [])],
+            enable_weighted_failover=True,
+            num_retries=0,
+        )
+        choices: Final[list[int]] = []
+
+        def choose(values: list[DeploymentTypedDict]) -> DeploymentTypedDict:
+            choices.append(len(values))
+            return values[-1] if len(choices) > 1 else values[0]
+
+        try:
+            with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
+                transport.post(host__in=["first.invalid", "second.invalid"], path="/v1/messages").mock(side_effect=upstream)
+                with patch("random.choice", side_effect=choose):
+                    for turn, caller in enumerate(("caller-a", "caller-a", "caller-b", "caller-a")):
+                        if turn == 3:
+                            router.delete_deployment("first")
+                        metadata: Final = {"session_id": "shared-session", "user_api_key_hash": caller}
+                        if surface == "chat":
+                            await router.acompletion(
+                                model="session-model", messages=[{"role": "user", "content": f"turn-{turn}"}],
+                                max_tokens=8, metadata=metadata,
+                            )
+                        elif surface == "responses":
+                            await router.aresponses(
+                                model="session-model", input=f"turn-{turn}", max_output_tokens=8, litellm_metadata=metadata,
+                            )
+                        else:
+                            await router.anthropic_messages(
+                                model="session-model", messages=[{"role": "user", "content": f"turn-{turn}"}],
+                                max_tokens=8, litellm_metadata=metadata,
+                            )
+        finally:
+            await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+            _cleanup_router_callbacks(router)
+        return captured
+
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    without_affinity: Final = await requests_with_affinity(False)
+    with_affinity: Final = await requests_with_affinity(True)
+
+    assert [host for host, body in without_affinity] == [
+        "first.invalid", "second.invalid", "second.invalid", "second.invalid",
+    ]
+    assert [host for host, body in with_affinity] == [
+        "first.invalid", "first.invalid", "second.invalid", "second.invalid",
+    ]
+    assert [body for host, body in with_affinity] == [body for host, body in without_affinity]

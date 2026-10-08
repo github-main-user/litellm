@@ -4253,6 +4253,7 @@ async def test_native_messages_401_recovers_once_before_stream_or_body(stream, m
 @pytest.mark.asyncio
 async def test_native_messages_does_not_retry_after_stream_response_started():
     from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
 
     upstream = httpx.Response(
         200,
@@ -4276,7 +4277,7 @@ async def test_native_messages_does_not_retry_after_stream_response_started():
             litellm_params=GenericLiteLLMParams(litellm_credential_name="managed-native"),
             logging_obj=logging_obj,
             client=client,
-            api_key="sk-ant-oat01-native-old",
+            api_key=ManagedAnthropicOAuthToken("sk-ant-oat01-native-old"),
             stream=True,
             kwargs={},
         )

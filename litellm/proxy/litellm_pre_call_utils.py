@@ -773,7 +773,14 @@ def _get_anthropic_session_id_from_metadata(metadata: object) -> str | None:
     if not isinstance(metadata, dict):
         return None
 
-    user_id: Final = metadata.get("user_id")
+    user_id = metadata.get("user_id")
+    if isinstance(user_id, str):
+        try:
+            decoded = json.loads(user_id)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            user_id = decoded
     if isinstance(user_id, dict):
         session_id = user_id.get("session_id")
         if isinstance(session_id, str) and _ANTHROPIC_SESSION_ID_VALUE_RE.fullmatch(session_id):
@@ -1553,6 +1560,13 @@ class LiteLLMProxyRequestSetup:
         agent_id_from_header: Final = headers.get("x-litellm-agent-id")
         # Explicit litellm headers take precedence; fall back to any x-*-session-id header.
         chain_id: Final = get_chain_id_from_headers(dict(headers))
+        body_metadata: Final = data.get("metadata")
+        session_id: Final = _get_anthropic_session_id_from_metadata(body_metadata)
+        if session_id and isinstance(body_metadata, dict) and isinstance(body_metadata.get("user_id"), dict):
+            data["metadata"] = {
+                **body_metadata,
+                "user_id": json.dumps(body_metadata["user_id"], separators=(",", ":"), ensure_ascii=True),
+            }
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
@@ -1564,15 +1578,10 @@ class LiteLLMProxyRequestSetup:
             data["litellm_session_id"] = chain_id
             data["litellm_trace_id"] = chain_id
             verbose_proxy_logger.debug("Extracted chain_id from header (trace-id/session-id): %s", chain_id)
-        else:
-            body_metadata: Final = data.get("metadata")
-            session_id: Final = _get_anthropic_session_id_from_metadata(body_metadata)
-            if session_id:
-                metadata_from_headers["session_id"] = session_id
-                data["litellm_session_id"] = session_id
-                if isinstance(body_metadata, dict) and isinstance(body_metadata.get("user_id"), dict):
-                    body_metadata["user_id"] = session_id
-                verbose_proxy_logger.debug("Extracted session_id from Anthropic metadata.user_id")
+        elif session_id:
+            metadata_from_headers["session_id"] = session_id
+            data["litellm_session_id"] = session_id
+            verbose_proxy_logger.debug("Extracted session_id from Anthropic metadata.user_id")
 
         # Last-resort fallback: the W3C standards for trace/session propagation
         # (https://www.w3.org/TR/trace-context/, https://www.w3.org/TR/baggage/).

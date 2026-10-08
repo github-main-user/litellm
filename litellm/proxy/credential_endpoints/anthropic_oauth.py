@@ -47,6 +47,8 @@ ANTHROPIC_REFRESH_TRANSACTION_TIMEOUT: Final = timedelta(minutes=2)
 ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY: Final = "anthropic_refresh_blocked_until"
 ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY: Final = "anthropic_refresh_blocked_token"
 ANTHROPIC_REFRESH_DEFAULT_BACKOFF_SECONDS: Final = 60
+ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY: Final = "anthropic_reauth_required_token"
+ANTHROPIC_REAUTH_REQUIRED_REASON_KEY: Final = "anthropic_reauth_required_reason"
 _CREDENTIAL_NAME_PATTERN: Final = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$")
 
 router: Final = APIRouter()
@@ -300,6 +302,25 @@ def _refresh_token_fingerprint(refresh_token: str) -> str:
     return hashlib.sha256(refresh_token.encode()).hexdigest()
 
 
+def _token_fingerprint(tokens: AnthropicOAuthTokens) -> str:
+    return hashlib.sha256(json.dumps((tokens.access_token, tokens.refresh_token)).encode()).hexdigest()
+
+
+def _check_reauth_required(info: Mapping[str, object], tokens: AnthropicOAuthTokens) -> None:
+    if info.get(ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY) == _token_fingerprint(tokens):
+        raise AnthropicOAuthError("reauthentication required", 401, reason="reauth_required")
+
+
+def _clear_refresh_state(info: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value for key, value in info.items()
+        if key not in (
+            ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY, ANTHROPIC_REAUTH_REQUIRED_REASON_KEY,
+            ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY, ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY,
+        )
+    }
+
+
 def _refresh_blocked_until(retry_after: str | None) -> float:
     now: Final = time.time()
     if retry_after is not None and retry_after.isdigit():
@@ -412,6 +433,12 @@ async def _complete_and_store(
                 status_code=409,
                 detail="Credential proxy configuration changed; restart authentication",
             )
+        if latest_row is not None and (
+            not _is_managed_credential(latest_row)
+            or existing_tokens is None
+            or _token_fingerprint(_tokens_from_row(latest_row)) != _token_fingerprint(existing_tokens)
+        ):
+            raise HTTPException(status_code=409, detail="Credential changed; restart authentication")
         row = latest_row
         existing_info = _credential_info_from_row(row) if row is not None else {}
         if (
@@ -427,7 +454,7 @@ async def _complete_and_store(
             attempt.credential_name,
             stored_tokens,
             attempt.proxy_url,
-            existing_info,
+            _clear_refresh_state(existing_info),
         )
         encrypted = CredentialHelperUtils.encrypt_credential_values(plaintext)
         if row is not None:
@@ -582,6 +609,12 @@ class AnthropicOAuthCredentialHook(CustomLogger):
         except AnthropicOAuthError as error:
             if error.retryable:
                 raise
+            if error.reason is not None:
+                raise AuthenticationError(
+                    model=model if isinstance(model, str) else "anthropic",
+                    llm_provider=ANTHROPIC_CREDENTIAL_PROVIDER,
+                    message=f"Anthropic credential '{credential_name}' requires reauthentication; reconnect the credential",
+                ) from None
             raise self._authentication_error(model, credential_name) from None
         except Exception:  # noqa: BLE001  # refresh failures must not disclose token bundles
             raise self._authentication_error(model, credential_name) from None
@@ -668,8 +701,9 @@ class AnthropicOAuthCredentialHook(CustomLogger):
     async def _get_tokens(self, credential_name: str) -> AnthropicOAuthTokens:
         cached: Final = _find_cached(credential_name)
         tokens: Final = _tokens_from_plaintext(cached) if cached is not None else None
-        if tokens is None:
+        if cached is None or tokens is None:
             raise ValueError("Credential token bundle is invalid")
+        _check_reauth_required(_string_object_mapping(cast(object, cached.credential_info)) or {}, tokens)
         if self._is_fresh(tokens):
             return tokens
         identity: Final = tokens.account_id or credential_name
@@ -679,6 +713,10 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             rechecked: Final = (
                 _tokens_from_plaintext(rechecked_credential) if rechecked_credential is not None else None
             )
+            if rechecked is not None and rechecked_credential is not None:
+                _check_reauth_required(
+                    _string_object_mapping(cast(object, rechecked_credential.credential_info)) or {}, rechecked
+                )
             if rechecked is not None and self._is_fresh(rechecked):
                 return rechecked
             return await self._refresh_tokens(credential_name, identity)
@@ -715,6 +753,7 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             ):
                 raise ValueError("Credential authentication type changed")
             stored: Final = _tokens_from_row(row)
+            _check_reauth_required(info, stored)
             if (stored.account_id or credential_name) != identity:
                 raise ValueError("Anthropic account identity changed before refresh")
             token_was_rotated: Final = (
@@ -732,25 +771,40 @@ class AnthropicOAuthCredentialHook(CustomLogger):
             try:
                 refreshed: Final = await refresh_client.refresh(stored) if should_refresh else stored
             except AnthropicOAuthError as error:
-                if error.status_code != 429:
+                if error.status_code != 429 and error.reason not in ("invalid_grant", "credential_revoked"):
                     raise
-                refresh_error = error
-                refreshed = stored
-                info = {
-                    **info,
-                    ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY: _refresh_token_fingerprint(stored.refresh_token),
-                    ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY: _refresh_blocked_until(error.retry_after),
-                }
-                await transaction.litellm_credentialstable.update(
-                    where={"credential_name": credential_name},
-                    data=_database_data(
-                        {
-                            "credential_values": row.credential_values,
+                failure_row: Final = await transaction.litellm_credentialstable.find_unique(
+                    where={"credential_name": credential_name}
+                )
+                if failure_row is None or not _is_managed_credential(failure_row):
+                    raise ValueError("Credential changed during refresh") from None
+                latest_tokens: Final = _tokens_from_row(failure_row)
+                proxy_url = _proxy_from_row(failure_row)
+                latest_info: Final = _credential_info_from_row(failure_row)
+                if _token_fingerprint(latest_tokens) != _token_fingerprint(stored):
+                    refreshed = latest_tokens
+                    info = latest_info
+                    _check_reauth_required(info, refreshed)
+                else:
+                    refresh_error = error
+                    refreshed = stored
+                    info = {
+                        **latest_info,
+                        **({
+                            ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY: _refresh_token_fingerprint(stored.refresh_token),
+                            ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY: _refresh_blocked_until(error.retry_after),
+                        } if error.status_code == 429 else {
+                            ANTHROPIC_REAUTH_REQUIRED_TOKEN_KEY: _token_fingerprint(stored),
+                            ANTHROPIC_REAUTH_REQUIRED_REASON_KEY: error.reason,
+                        }),
+                    }
+                    await transaction.litellm_credentialstable.update(
+                        where={"credential_name": credential_name},
+                        data=_database_data({
                             "credential_info": info,
                             "updated_by": "litellm-anthropic-oauth",
-                        }
-                    ),
-                )
+                        }),
+                    )
             if should_refresh and refresh_error is None:
                 if stored.account_id is not None and refreshed.account_id != stored.account_id:
                     raise ValueError("Anthropic account identity changed during refresh")
@@ -759,6 +813,17 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                 )
                 if latest_row is None:
                     raise ValueError("Credential was removed during refresh")
+                if not _is_managed_credential(latest_row):
+                    raise ValueError("Credential authentication type changed during refresh")
+                current_tokens: Final = _tokens_from_row(latest_row)
+                if _token_fingerprint(current_tokens) != _token_fingerprint(stored):
+                    current_plaintext: Final = _plaintext_credential(
+                        credential_name, current_tokens, _proxy_from_row(latest_row),
+                        _credential_info_from_row(latest_row),
+                    )
+                    CredentialAccessor.upsert_credentials([current_plaintext])
+                    _check_reauth_required(_credential_info_from_row(latest_row), current_tokens)
+                    return current_tokens
                 latest_proxy: Final = _proxy_from_row(latest_row)
                 latest_values: Final = _string_object_mapping(latest_row.credential_values)
                 if latest_values is None:
@@ -767,9 +832,7 @@ class AnthropicOAuthCredentialHook(CustomLogger):
                 # encrypted value rather than resurrecting the one used by this request.
                 values = latest_values
                 proxy_url = latest_proxy
-                info = _credential_info_from_row(latest_row)
-                info.pop(ANTHROPIC_REFRESH_BLOCKED_TOKEN_KEY, None)
-                info.pop(ANTHROPIC_REFRESH_BLOCKED_UNTIL_KEY, None)
+                info = _clear_refresh_state(_credential_info_from_row(latest_row))
                 encrypted: Final = encrypt_value_helper(refreshed.to_json())
                 if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime crypto boundary
                     encrypted, str
