@@ -2811,7 +2811,7 @@ class BaseLLMHTTPHandler:
 
         if extra_body:
             data.update(extra_body)
-        stream = bool(stream or data.get("stream"))
+        stream = bool(stream) if custom_llm_provider == "chatgpt" else bool(stream or data.get("stream"))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
         # hooks/metadata; the streaming iterator now consumes this to run deployment hooks
@@ -2999,7 +2999,7 @@ class BaseLLMHTTPHandler:
 
         if extra_body:
             data.update(extra_body)
-        stream = bool(stream or data.get("stream"))
+        stream = bool(stream) if custom_llm_provider == "chatgpt" else bool(stream or data.get("stream"))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
         # hooks/metadata; the streaming iterator now consumes this to run deployment hooks

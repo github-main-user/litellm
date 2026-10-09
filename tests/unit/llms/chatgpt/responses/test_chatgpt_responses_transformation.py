@@ -151,10 +151,14 @@ async def test_chatgpt_prompt_cache_key_reaches_wire(
     for attempt in range(2):
         request_params: Final = {**params, "litellm_trace_id": f"trace-{attempt}"}
         if api == "responses":
-            if asynchronous:
-                await litellm.aresponses(input="Hello", instructions="Keep it brief.", **request_params)
-            else:
-                litellm.responses(input="Hello", instructions="Keep it brief.", **request_params)
+            response = (
+                await litellm.aresponses(input="Hello", instructions="Keep it brief.", stream=False, **request_params)
+                if asynchronous
+                else litellm.responses(input="Hello", instructions="Keep it brief.", stream=False, **request_params)
+            )
+            assert response.object == "response"
+            assert response.status == "completed"
+            assert response.output[0].content[0].text == "Hello!"
         else:
             messages: Final = [
                 {"role": "system", "content": "Keep it brief."},
