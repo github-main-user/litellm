@@ -10,6 +10,8 @@ Regression test for https://github.com/BerriAI/litellm/issues/22040
 import os
 import sys
 
+import httpx
+
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
 )
@@ -62,8 +64,8 @@ class TestCountTokensOAuthHeaders:
         config = AnthropicCountTokensConfig()
 
         for key in [FAKE_REGULAR_KEY, FAKE_OAUTH_TOKEN]:
-            headers = config.get_required_headers(key)
-            assert headers["Content-Type"] == "application/json"
+            headers = httpx.Headers(config.get_required_headers(key))
+            assert headers["content-type"] == "application/json"
 
     def test_headers_always_have_anthropic_version(self):
         """Both paths should have anthropic-version."""

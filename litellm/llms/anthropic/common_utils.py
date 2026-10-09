@@ -78,7 +78,25 @@ _CLAUDE_CODE_USER_AGENT_PREFIXES: Final = ("claude-cli/", "claude-code/")
 ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 ANTHROPIC_SUBSCRIPTION_APP_HEADER: Final = "cli"
 ANTHROPIC_SUBSCRIPTION_BETA_HEADER: Final = "claude-code-20250219"
-ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.280 (external, cli)"
+ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.283 (external, cli)"
+# compatibility profile: Claude Code 2.1.283 Linux x64, inspected 2026-10-09, not the Python transport.
+# binary sha256: 1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2
+ANTHROPIC_SUBSCRIPTION_CLIENT_HEADERS: Final = MappingProxyType(
+    {
+        "user-agent": ANTHROPIC_SUBSCRIPTION_USER_AGENT,
+        "x-app": ANTHROPIC_SUBSCRIPTION_APP_HEADER,
+        "accept": "application/json",
+        "content-type": "application/json",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-stainless-lang": "js",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-os": "Linux",
+        "x-stainless-arch": "x64",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-retry-count": "0",
+    }
+)
 
 
 def supports_anthropic_cache_control(model: str, custom_llm_provider: str | None) -> bool:
@@ -215,10 +233,15 @@ def _merge_beta_headers(existing: str | None, new_beta: str) -> str:
     return ",".join(sorted(betas))
 
 
-def _subscription_user_agent_headers(headers: Mapping[str, str]) -> dict[str, str]:
+def _subscription_client_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {
-        **{name: value for name, value in headers.items() if name.lower() != "user-agent"},
-        "user-agent": ANTHROPIC_SUBSCRIPTION_USER_AGENT,
+        **{
+            name: value
+            for name, value in headers.items()
+            if name.lower() not in ANTHROPIC_SUBSCRIPTION_CLIENT_HEADERS
+            and not name.lower().startswith("x-stainless-")
+        },
+        **ANTHROPIC_SUBSCRIPTION_CLIENT_HEADERS,
     }
 
 
@@ -338,9 +361,7 @@ def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tup
             _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER),
             ANTHROPIC_SUBSCRIPTION_BETA_HEADER,
         )
-        headers["anthropic-dangerous-direct-browser-access"] = "true"
-        headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
-        return _subscription_user_agent_headers(headers), api_key
+        return _subscription_client_headers(headers), api_key
     # Check api_key directly (standard chat/completion flow)
     if api_key and api_key.startswith(ANTHROPIC_OAUTH_TOKEN_PREFIX):
         for name in tuple(header_name for header_name in headers if header_name.lower() == "x-api-key"):
@@ -350,9 +371,7 @@ def optionally_handle_anthropic_oauth(headers: dict, api_key: str | None) -> tup
             _merge_beta_headers(headers.get("anthropic-beta"), ANTHROPIC_OAUTH_BETA_HEADER),
             ANTHROPIC_SUBSCRIPTION_BETA_HEADER,
         )
-        headers["anthropic-dangerous-direct-browser-access"] = "true"
-        headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
-        return _subscription_user_agent_headers(headers), api_key
+        return _subscription_client_headers(headers), api_key
     return headers, api_key
 
 
@@ -1048,9 +1067,6 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         }
         if _is_oauth:
             headers["authorization"] = f"Bearer {api_key}"
-            headers["anthropic-dangerous-direct-browser-access"] = "true"
-            headers["x-app"] = ANTHROPIC_SUBSCRIPTION_APP_HEADER
-            headers["user-agent"] = ANTHROPIC_SUBSCRIPTION_USER_AGENT
             betas.add(ANTHROPIC_OAUTH_BETA_HEADER)
             betas.add(ANTHROPIC_SUBSCRIPTION_BETA_HEADER)
         elif auth_token and not api_key:
@@ -1071,7 +1087,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         elif len(betas) > 0:
             headers["anthropic-beta"] = ",".join(betas)
 
-        return headers
+        return _subscription_client_headers(headers) if _is_oauth else headers
 
     def validate_environment(
         self,
@@ -1141,7 +1157,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
         headers = {**headers, **anthropic_headers}
 
-        return _subscription_user_agent_headers(headers) if is_anthropic_oauth_key(api_key) else headers
+        return _subscription_client_headers(headers) if is_anthropic_oauth_key(api_key) else headers
 
     @staticmethod
     def get_api_base(api_base: str | None = None) -> str | None:

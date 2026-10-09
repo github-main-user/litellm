@@ -4022,6 +4022,7 @@ async def test_native_subscription_tool_names_round_trip_at_http_boundary(oauth,
     from openai._streaming import SSEDecoder
 
     from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
     from litellm.llms.anthropic.subscription_tools import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY
 
     wire_name = "Read" if oauth else "read"
@@ -4066,7 +4067,7 @@ async def test_native_subscription_tool_names_round_trip_at_http_boundary(oauth,
         anthropic_messages_optional_request_params=optional,
         custom_llm_provider="anthropic", litellm_params=params,
         logging_obj=logging_obj, client=client,
-        api_key="sk-ant-oat01-test" if oauth else "sk-test", stream=stream, kwargs={},
+        api_key=ManagedAnthropicOAuthToken("sk-ant-oat01-test") if oauth else "sk-test", stream=stream, kwargs={},
     )
     sent = json.loads(client.post.await_args.kwargs["data"])
     assert sent["tools"][0]["name"] == wire_name

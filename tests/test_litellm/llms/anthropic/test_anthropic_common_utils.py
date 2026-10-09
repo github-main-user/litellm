@@ -2328,7 +2328,6 @@ def test_subscription_sets_single_claude_cli_user_agent(forwarded, header_name):
     repeated, _ = optionally_handle_anthropic_oauth(result, token)
 
     assert token == FAKE_OAUTH_TOKEN
-    assert ANTHROPIC_SUBSCRIPTION_USER_AGENT == "claude-cli/2.1.280 (external, cli)"
     assert [(name, value) for name, value in result.items() if name.lower() == "user-agent"] == [
         ("user-agent", ANTHROPIC_SUBSCRIPTION_USER_AGENT)
     ]
@@ -2420,3 +2419,213 @@ def test_subscription_environment_tokens_are_rejected(env_name):
     with patch.dict(os.environ, {env_name: "sk-ant-oat-from-environment"}, clear=True):
         with pytest.raises(AuthenticationError, match="database-managed"):
             AnthropicModelInfo.get_auth_header()
+
+
+@pytest.fixture
+def subscription_client_headers() -> dict[str, str]:
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_USER_AGENT
+
+    # reference: installed Claude Code 2.1.283 Linux x64, inspected 2026-10-09.
+    # sha256: 1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2
+    return {
+        "user-agent": ANTHROPIC_SUBSCRIPTION_USER_AGENT,
+        "x-app": "cli",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-stainless-lang": "js",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-os": "Linux",
+        "x-stainless-arch": "x64",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-retry-count": "0",
+    }
+
+
+@pytest.mark.parametrize("forwarded", [False, True])
+def test_subscription_client_profile_replaces_conflicting_header_casing(
+    forwarded: bool, subscription_client_headers: dict[str, str],
+) -> None:
+    from typing import Final
+
+    from litellm.llms.anthropic.common_utils import optionally_handle_anthropic_oauth
+
+    original: Final = {
+        **{name.upper(): "conflicting-client" for name in subscription_client_headers},
+        "X-Stainless-Timeout": "9999",
+        "X-Stainless-Helper-Method": "foreign-helper",
+        "x-client-request-id": "preserved-request",
+        "X-Custom": "preserved-value",
+        **({"Authorization": f"Bearer {FAKE_OAUTH_TOKEN}"} if forwarded else {}),
+    }
+    result, token = optionally_handle_anthropic_oauth(dict(original), FAKE_OAUTH_TOKEN)
+    assert token == FAKE_OAUTH_TOKEN
+    assert result == {
+        **subscription_client_headers,
+        "x-client-request-id": "preserved-request",
+        "X-Custom": "preserved-value",
+        "authorization": f"Bearer {FAKE_OAUTH_TOKEN}",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    }
+    assert optionally_handle_anthropic_oauth(dict(result), token) == (result, token)
+    regular_headers: Final = {name: value for name, value in original.items() if name.lower() != "authorization"}
+    assert optionally_handle_anthropic_oauth(dict(regular_headers), FAKE_REGULAR_KEY) == (
+        regular_headers, FAKE_REGULAR_KEY,
+    )
+
+
+def test_oauth_header_builder_uses_the_same_subscription_client_profile(
+    subscription_client_headers: dict[str, str],
+) -> None:
+    from typing import Final
+
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    result: Final = AnthropicModelInfo().get_anthropic_headers(api_key=FAKE_OAUTH_TOKEN)
+    assert {name: value for name, value in result.items() if name in subscription_client_headers} == subscription_client_headers
+    assert result["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
+
+
+@pytest.fixture
+async def drain_subscription_header_logging(isolate_litellm_state):
+    import asyncio
+
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    yield
+    GLOBAL_LOGGING_WORKER.start()
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface,synchronous", [
+    ("chat", False), ("chat", True), ("responses", False), ("responses", True), ("messages", False),
+])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("oauth", [False, True])
+async def test_subscription_client_profile_reaches_final_inference_request(
+    surface: str, synchronous: bool, stream: bool, oauth: bool, subscription_client_headers: dict[str, str],
+    drain_subscription_header_logging, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from typing import Final
+
+    import httpx
+    import respx
+
+    import litellm
+    from litellm.models.credentials import CredentialItem
+
+    requests: Final[list[httpx.Request]] = []
+    response: Final = {
+        "id": "msg_headers", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    events: Final = (
+        {"type": "message_start", "message": {**response, "content": [], "stop_reason": None}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+        {"type": "message_stop"},
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if stream:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content="".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+            ))
+        return httpx.Response(200, json=response)
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="profile-test", credential_info={}, credential_values={},
+    )])
+    params: Final = {
+        "model": "anthropic/claude-sonnet-5", "stream": stream,
+        "api_key": FAKE_OAUTH_TOKEN if oauth else FAKE_REGULAR_KEY,
+        "litellm_credential_name": "profile-test", "max_retries": 0,
+        "extra_headers": {
+            "User-Agent": "caller-client/1.0", "X-Stainless-Lang": "python",
+            "X-Stainless-Runtime": "CPython", "x-profile-test": "preserved",
+        },
+    }
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
+        transport.post(host="api.anthropic.com", path="/v1/messages").mock(side_effect=upstream)
+        if surface == "chat" and synchronous:
+            result = await asyncio.to_thread(
+                litellm.completion, **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+            )
+        elif surface == "chat":
+            result = await litellm.acompletion(
+                **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+            )
+        elif surface == "responses" and synchronous:
+            result = await asyncio.to_thread(litellm.responses, **params, input="hello", max_output_tokens=8)
+        elif surface == "responses":
+            result = await litellm.aresponses(**params, input="hello", max_output_tokens=8)
+        else:
+            result = await litellm.anthropic_messages(
+                **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+            )
+        if stream and synchronous:
+            assert await asyncio.to_thread(list, result)
+        elif stream:
+            assert [part async for part in result]
+
+    assert len(requests) == 1
+    headers: Final = requests[0].headers
+    assert headers["x-profile-test"] == "preserved"
+    if oauth:
+        actual: Final = [
+            (name, value) for name, value in headers.multi_items()
+            if name in subscription_client_headers or name.startswith("x-stainless-")
+        ]
+        assert sorted(actual) == sorted(subscription_client_headers.items())
+        assert headers["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
+        assert "x-api-key" not in headers
+    else:
+        assert headers["user-agent"] == "caller-client/1.0"
+        assert headers["x-stainless-lang"] == "python"
+        assert headers["x-stainless-runtime"] == "CPython"
+        assert headers["x-api-key"] == FAKE_REGULAR_KEY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oauth", [False, True])
+async def test_subscription_client_profile_reaches_final_count_tokens_request(
+    oauth: bool, subscription_client_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Final
+
+    import httpx
+    import respx
+
+    import litellm
+    from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
+        route: Final = transport.post(host="api.anthropic.com", path="/v1/messages/count_tokens").mock(
+            return_value=httpx.Response(200, json={"input_tokens": 7}),
+        )
+        result: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
+            model="claude-sonnet-5", messages=[{"role": "user", "content": "hello"}],
+            api_key=FAKE_OAUTH_TOKEN if oauth else FAKE_REGULAR_KEY,
+        )
+    assert result == {"input_tokens": 7}
+    assert route.call_count == 1
+    headers: Final = route.calls[0].request.headers
+    if oauth:
+        actual: Final = [
+            (name, value) for name, value in headers.multi_items()
+            if name in subscription_client_headers or name.startswith("x-stainless-")
+        ]
+        assert sorted(actual) == sorted(subscription_client_headers.items())
+    else:
+        assert headers["x-api-key"] == FAKE_REGULAR_KEY
+        assert not any(name.startswith("x-stainless-") for name in headers)
