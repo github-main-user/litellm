@@ -97,6 +97,10 @@ from litellm.llms.base_llm.vector_store_files.transformation import (
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
 from litellm.llms.bedrock.base_aws_llm import SignsRequestsWithAWS, run_aws_signing, sign_request_off_loop_if_aws
 from litellm.llms.chatgpt.common_utils import merge_chatgpt_headers
+from litellm.llms.chatgpt.inference_recovery import (
+    async_post_chatgpt_with_recovery,
+    post_chatgpt_with_recovery,
+)
 from litellm.llms.custom_httpx.container_handler import raise_for_error_status
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
@@ -2865,7 +2869,17 @@ class BaseLLMHTTPHandler:
         )
 
         try:
-            if is_stream_request:
+            if custom_llm_provider == "chatgpt":
+                response = post_chatgpt_with_recovery(
+                    client=sync_httpx_client,
+                    url=api_base,
+                    headers=headers,
+                    body=signed_body if signed_body is not None else httpx.Request("POST", api_base, json=data).content,
+                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    stream=stream,
+                    params=dict(litellm_params),
+                )
+            elif is_stream_request:
                 response = sync_httpx_client.post(
                     url=api_base,
                     headers=headers,
@@ -2873,6 +2887,15 @@ class BaseLLMHTTPHandler:
                     stream=stream,
                     **body_kwargs,
                 )
+            else:
+                response = sync_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    **body_kwargs,
+                )
+
+            if is_stream_request:
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
                         response=response,
@@ -2895,13 +2918,7 @@ class BaseLLMHTTPHandler:
                     request_data=request_context,
                     call_type=CallTypes.responses.value,
                 )
-            else:
-                response = sync_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
-                    **body_kwargs,
-                )
+
         except Exception as e:
             raise self._handle_error(
                 e=e,
@@ -3056,7 +3073,18 @@ class BaseLLMHTTPHandler:
         )
 
         try:
-            if is_stream_request:
+            if custom_llm_provider == "chatgpt":
+                response = await async_post_chatgpt_with_recovery(
+                    client=async_httpx_client,
+                    url=api_base,
+                    headers=headers,
+                    body=signed_body if signed_body is not None else httpx.Request("POST", api_base, json=data).content,
+                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    stream=stream,
+                    params=dict(litellm_params),
+                    logging_obj=logging_obj,
+                )
+            elif is_stream_request:
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
@@ -3065,6 +3093,16 @@ class BaseLLMHTTPHandler:
                     logging_obj=logging_obj,
                     **body_kwargs,
                 )
+            else:
+                response = await async_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    logging_obj=logging_obj,
+                    **body_kwargs,
+                )
+
+            if is_stream_request:
 
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
@@ -3088,14 +3126,6 @@ class BaseLLMHTTPHandler:
                     custom_llm_provider=custom_llm_provider,
                     request_data=request_context,
                     call_type=CallTypes.responses.value,
-                )
-            else:
-                response = await async_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
-                    logging_obj=logging_obj,
-                    **body_kwargs,
                 )
 
         except Exception as e:

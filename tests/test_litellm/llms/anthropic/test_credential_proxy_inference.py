@@ -123,6 +123,7 @@ async def test_chatgpt_responses_and_native_messages_use_named_proxy(monkeypatch
         response_stream = await litellm.aresponses(
             model="chatgpt/gpt-5",
             input="hello",
+            stream=True,
             api_key=ManagedChatGPTAccessToken("access-token"),
             chatgpt_auth_account_id="account-id",
             api_base="http://responses-upstream.invalid/backend-api/codex",

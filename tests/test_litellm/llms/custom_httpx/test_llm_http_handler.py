@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import AsyncIterable, Iterable
 from typing import Final
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -4415,3 +4416,327 @@ async def test_anthropic_recovery_never_replays_on_stale_proxy_transport(monkeyp
 
     assert caught.value.status_code == 503
     assert len(requests) == 1
+
+
+def _chatgpt_recovered_body() -> dict[str, object]:
+    return {
+        "id": "resp_recovered",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "recovery-test-model",
+        "output": [{
+            "id": "msg_recovered", "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+
+
+def _chatgpt_recovered_sse() -> str:
+    body: Final = _chatgpt_recovered_body()
+    events: Final = (
+        {"type": "response.created", "response": {**body, "status": "in_progress", "output": []}},
+        {"type": "response.output_item.added", "output_index": 0, "item": {
+            "id": "msg_recovered", "type": "message", "role": "assistant", "status": "in_progress", "content": [],
+        }},
+        {"type": "response.content_part.added", "item_id": "msg_recovered", "output_index": 0, "content_index": 0,
+         "part": {"type": "output_text", "text": "", "annotations": []}},
+        {"type": "response.output_text.delta", "item_id": "msg_recovered", "output_index": 0,
+         "content_index": 0, "delta": "ok"},
+        {"type": "response.completed", "response": body},
+    )
+    return "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+
+
+@pytest.fixture
+def chatgpt_recovery(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    from litellm.llms.chatgpt.oauth_client import ChatGPTTokens
+    from litellm.models.credentials import CredentialItem
+
+    tokens: Final = ChatGPTTokens("access-old", "refresh", "id", 9999999999, "account")
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name="managed-chatgpt", credential_info={"provider": "chatgpt", "auth_type": "oauth"},
+        credential_values={"litellm_internal_chatgpt_auth_token": tokens.to_json()},
+    )])
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    monkeypatch.setitem(litellm.model_cost, "chatgpt/recovery-test-model", {
+        "litellm_provider": "chatgpt", "mode": "responses", "supports_native_streaming": True,
+        "input_cost_per_token": 0, "output_cost_per_token": 0, "max_tokens": 100,
+    })
+    recover: Final = AsyncMock(return_value=ChatGPTTokens("access-new", "refresh-new", "id", 9999999999, "account"))
+    monkeypatch.setattr(
+        "litellm.proxy.credential_endpoints.chatgpt_oauth.get_chatgpt_oauth_credential_hook",
+        lambda: SimpleNamespace(recover_after_unauthorized=recover),
+    )
+    return recover
+
+
+async def _public_chatgpt_request(
+    *, is_async: bool, chat: bool, stream: bool, client: HTTPHandler | AsyncHTTPHandler | None = None,
+):
+    from litellm.llms.chatgpt.oauth_client import ManagedChatGPTAccessToken
+
+    params: Final = {
+        "model": "chatgpt/responses/recovery-test-model" if chat else "chatgpt/recovery-test-model",
+        "api_key": ManagedChatGPTAccessToken("access-old"),
+        "chatgpt_auth_account_id": "account",
+        "litellm_credential_name": "managed-chatgpt",
+        "api_base": "https://chatgpt.test",
+        "extra_headers": {"x-recovery-test": "unchanged"},
+        "stream": stream,
+        "num_retries": 0,
+        "timeout": 10,
+        "client": client,
+    }
+    if chat:
+        if is_async:
+            return await litellm.acompletion(messages=[{"role": "user", "content": "héllo"}], **params)
+        return litellm.completion(messages=[{"role": "user", "content": "héllo"}], **params)
+    if is_async:
+        return await litellm.aresponses(input="héllo", **params)
+    return litellm.responses(input="héllo", **params)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("wire_format,stream,fake_stream", [
+    ("json", False, False), ("sse", False, False), ("sse", True, False), ("sse", True, True),
+])
+@pytest.mark.parametrize("proxy_url", [None, "http://proxy.test:8080"])
+async def test_public_chatgpt_401_replays_identical_wire_once(
+    chatgpt_recovery, respx_mock, monkeypatch, is_async, chat, wire_format, stream, fake_stream, proxy_url,
+):
+    from litellm.models.credentials import CredentialItem
+
+    credential: Final = litellm.credential_list[0]
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name=credential.credential_name, credential_info=credential.credential_info,
+        credential_values={**credential.credential_values, **(
+            {"litellm_internal_proxy_url": proxy_url} if proxy_url else {}
+        )},
+    )])
+    monkeypatch.setitem(litellm.model_cost, "chatgpt/recovery-test-model", {
+        **litellm.model_cost["chatgpt/recovery-test-model"], "supports_native_streaming": not fake_stream,
+    })
+    accepted: Final = (
+        httpx.Response(200, json=_chatgpt_recovered_body()) if wire_format == "json"
+        else httpx.Response(200, text=_chatgpt_recovered_sse(), headers={"content-type": "text/event-stream"})
+    )
+    upstream: Final = respx_mock.post("https://chatgpt.test/responses").mock(side_effect=[
+        httpx.Response(401, json={"error": {"message": "expired"}}), accepted,
+    ])
+    result: Final = await _public_chatgpt_request(is_async=is_async, chat=chat, stream=stream)
+    if stream:
+        chunks: Final = [chunk async for chunk in result] if is_async else list(result)
+        text: Final = (
+            "".join(chunk.choices[0].delta.content or "" for chunk in chunks) if chat
+            else "".join(chunk.delta for chunk in chunks if chunk.type == "response.output_text.delta")
+        )
+        assert text == "ok"
+    elif chat:
+        assert result.choices[0].message.content == "ok"
+    else:
+        assert result.output[0].content[0].text == "ok"
+    assert upstream.call_count == 2
+    chatgpt_recovery.assert_awaited_once_with("managed-chatgpt", "access-old")
+    first, second = (call.request for call in upstream.calls)
+    assert second.content == first.content
+    assert second.url == first.url
+    assert second.extensions == first.extensions
+    assert first.headers["authorization"] == "Bearer access-old"
+    assert second.headers["authorization"] == "Bearer access-new"
+    assert first.headers["session_id"]
+    assert first.headers["x-recovery-test"] == "unchanged"
+    assert {name: value for name, value in second.headers.items() if name != "authorization"} == {
+        name: value for name, value in first.headers.items() if name != "authorization"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [401, 403, 429])
+async def test_public_chatgpt_only_recovers_first_401(chatgpt_recovery, respx_mock, is_async, chat, stream, status):
+    from litellm.exceptions import APIError, AuthenticationError, RateLimitError
+
+    statuses: Final = [401, 401] if status == 401 else [status]
+    upstream: Final = respx_mock.post("https://chatgpt.test/responses").mock(side_effect=[
+        httpx.Response(code, json={"error": {"message": "request rejected"}}) for code in statuses
+    ])
+    exception: Final = {401: AuthenticationError, 403: APIError, 429: RateLimitError}[status]
+    with pytest.raises(exception) as error:
+        await _public_chatgpt_request(is_async=is_async, chat=chat, stream=stream)
+    assert error.value.status_code == status
+    assert upstream.call_count == len(statuses)
+    assert chatgpt_recovery.await_count == (1 if status == 401 else 0)
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("recovery_result", ["none", "different-account", "invalid-token", "temporary-error"])
+async def test_public_chatgpt_failed_recovery_never_replays(
+    chatgpt_recovery, respx_mock, is_async, stream, chat, recovery_result,
+):
+    from litellm.exceptions import AuthenticationError, BadGatewayError, ServiceUnavailableError
+    from litellm.llms.chatgpt.oauth_client import ChatGPTTokens
+
+    if recovery_result == "none":
+        chatgpt_recovery.return_value = None
+    elif recovery_result == "different-account":
+        chatgpt_recovery.return_value = ChatGPTTokens("access-new", "refresh", "id", 9999999999, "other-account")
+    elif recovery_result == "invalid-token":
+        chatgpt_recovery.return_value = ChatGPTTokens("invalid\ntoken", "refresh", "id", 9999999999, "account")
+    else:
+        chatgpt_recovery.side_effect = RuntimeError("do not disclose refresh-token-secret or proxy-password")
+    upstream: Final = respx_mock.post("https://chatgpt.test/responses").mock(return_value=httpx.Response(
+        401, json={"error": {"message": "expired"}},
+    ))
+    exception: Final = (
+        BadGatewayError if recovery_result == "invalid-token" else
+        ServiceUnavailableError if recovery_result == "temporary-error" else AuthenticationError
+    )
+    with pytest.raises(exception) as error:
+        await _public_chatgpt_request(is_async=is_async, chat=chat, stream=stream)
+    assert "refresh-token-secret" not in str(error.value)
+    assert "proxy-password" not in str(error.value)
+    assert upstream.call_count == 1
+    chatgpt_recovery.assert_awaited_once_with("managed-chatgpt", "access-old")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("proxy_url", [None, "http://proxy.test:8080"])
+async def test_public_chatgpt_replay_revalidates_proxy_route_fail_closed(
+    chatgpt_recovery, respx_mock, monkeypatch, is_async, chat, proxy_url,
+):
+    from litellm.exceptions import ServiceUnavailableError
+    from litellm.llms.chatgpt.oauth_client import ChatGPTTokens
+    from litellm.models.credentials import CredentialItem
+
+    original: Final = litellm.credential_list[0]
+    monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+        credential_name=original.credential_name, credential_info=original.credential_info,
+        credential_values={**original.credential_values, **(
+            {"litellm_internal_proxy_url": proxy_url} if proxy_url else {}
+        )},
+    )])
+
+    async def recover(credential_name: str, rejected_access_token: str) -> ChatGPTTokens:
+        monkeypatch.setattr(litellm, "credential_list", [CredentialItem(
+            credential_name=original.credential_name, credential_info=original.credential_info,
+            credential_values={**original.credential_values, "litellm_internal_proxy_url": "http://changed.test:8080"},
+        )])
+        return ChatGPTTokens("access-new", "refresh", "id", 9999999999, "account")
+
+    chatgpt_recovery.side_effect = recover
+    upstream: Final = respx_mock.post("https://chatgpt.test/responses").mock(return_value=httpx.Response(
+        401, json={"error": {"message": "expired"}},
+    ))
+    with pytest.raises(ServiceUnavailableError, match="proxy routing validation failed"):
+        await _public_chatgpt_request(is_async=is_async, chat=chat, stream=True)
+    assert upstream.call_count == 1
+    chatgpt_recovery.assert_awaited_once_with("managed-chatgpt", "access-old")
+
+
+class _ChatGPTUnauthorizedAfterBytes(httpx.SyncByteStream, httpx.AsyncByteStream):
+    def __iter__(self):
+        yield _chatgpt_recovered_sse().split("event: response.completed")[0].encode()
+        raise httpx.HTTPStatusError(
+            "authentication failed after output", request=httpx.Request("POST", "https://chatgpt.test/responses"),
+            response=httpx.Response(401, json={"error": {"message": "expired"}}),
+        )
+
+    async def __aiter__(self):
+        for chunk in self:
+            yield chunk
+
+
+async def _consume_chatgpt_stream(stream: Iterable[object] | AsyncIterable[object], is_async: bool) -> None:
+    if is_async:
+        assert isinstance(stream, AsyncIterable)
+        _ = tuple([chunk async for chunk in stream])
+        return
+    assert isinstance(stream, Iterable)
+    _ = tuple(stream)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+async def test_public_chatgpt_never_recovers_after_stream_bytes(chatgpt_recovery, respx_mock, is_async, chat):
+    upstream: Final = respx_mock.post("https://chatgpt.test/responses").mock(return_value=httpx.Response(
+        200, stream=_ChatGPTUnauthorizedAfterBytes(), headers={"content-type": "text/event-stream"},
+    ))
+    result: Final = await _public_chatgpt_request(is_async=is_async, chat=chat, stream=True)
+    first: Final = await result.__anext__() if is_async else next(result)
+    assert first is not None
+    with pytest.raises((httpx.HTTPStatusError, litellm.APIConnectionError), match="authentication failed after output"):
+        await _consume_chatgpt_stream(result, is_async)
+    assert upstream.call_count == 1
+    chatgpt_recovery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async,chat", [(False, False), (True, False), (False, True)])
+async def test_public_chatgpt_replay_uses_supplied_client_and_session(chatgpt_recovery, respx_mock, is_async, chat):
+    requests: Final[list[httpx.Request]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"message": "expired"}}) if len(requests) == 1 else httpx.Response(
+            200, json=_chatgpt_recovered_body(),
+        )
+
+    transport: Final = httpx.MockTransport(respond)
+    async with httpx.AsyncClient(transport=transport, headers={"x-session-marker": "session-preserved"}) as async_client:
+        with httpx.Client(transport=transport, headers={"x-session-marker": "session-preserved"}) as sync_client:
+            client: Final = AsyncHTTPHandler() if is_async else HTTPHandler(client=sync_client)
+            if isinstance(client, AsyncHTTPHandler):
+                await client.close()
+                client.client = async_client
+            result: Final = await _public_chatgpt_request(is_async=is_async, chat=chat, stream=False, client=client)
+            text: Final = result.choices[0].message.content if chat else result.output[0].content[0].text
+            assert text == "ok"
+    assert len(requests) == 2
+    assert tuple(request.headers["x-session-marker"] for request in requests) == ("session-preserved", "session-preserved")
+    assert requests[0].content == requests[1].content
+    chatgpt_recovery.assert_awaited_once_with("managed-chatgpt", "access-old")
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_401_closes_rejected_response_on_cancelled_recovery(chatgpt_recovery):
+    from litellm.llms.chatgpt.oauth_client import ManagedChatGPTAccessToken
+    from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+
+    chatgpt_recovery.side_effect = asyncio.CancelledError()
+    rejected: Final = httpx.Response(401, request=httpx.Request("POST", "https://chatgpt.test/responses"))
+    rejected.aclose = AsyncMock(wraps=rejected.aclose)
+    client: Final = AsyncMock(spec=AsyncHTTPHandler)
+    client.proxy_url = None
+    client.post = AsyncMock(return_value=rejected)
+    logging_obj: Final = Mock()
+    logging_obj.model_call_details = {}
+    with pytest.raises(asyncio.CancelledError):
+        await BaseLLMHTTPHandler().async_response_api_handler(
+            model="recovery-test-model", input="hi", responses_api_provider_config=ChatGPTResponsesAPIConfig(),
+            response_api_optional_request_params={"stream": True}, custom_llm_provider="chatgpt",
+            litellm_params=GenericLiteLLMParams(
+                api_key=ManagedChatGPTAccessToken("access-old"), api_base="https://chatgpt.test",
+                litellm_credential_name="managed-chatgpt", chatgpt_auth_account_id="account",
+            ),
+            logging_obj=logging_obj, client=client,
+        )
+    assert rejected.is_closed
+    rejected.aclose.assert_awaited_once()
+    client.post.assert_awaited_once()
+    chatgpt_recovery.assert_awaited_once_with("managed-chatgpt", "access-old")
