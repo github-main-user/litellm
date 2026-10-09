@@ -505,8 +505,11 @@ def _safe_read_response(response: httpx.Response, timeout: float | None = None) 
         return b""
 
 
-def _raise_masked_sync_error(e: httpx.HTTPStatusError, stream: bool) -> NoReturn:
+def _raise_masked_sync_error(
+    e: httpx.HTTPStatusError, stream: bool, *, proxy_configured: bool | None = None, logging_obj: object = None,
+) -> NoReturn:
     """Raise a MaskedHTTPStatusError for sync HTTP handlers."""
+    from litellm.llms.anthropic.subscription_diagnostics import log_subscription_failure
     if stream:
         try:
             _body: Final = mask_sensitive_info(
@@ -515,6 +518,7 @@ def _raise_masked_sync_error(e: httpx.HTTPStatusError, stream: bool) -> NoReturn
                     timeout=_STREAMING_ERROR_BODY_READ_TIMEOUT_SECONDS,
                 )
             )
+            log_subscription_failure(e.response, _body, proxy_configured=proxy_configured, logging_obj=logging_obj)
             raise MaskedHTTPStatusError(e, message=_body, text=_body) from None
         finally:
             try:
@@ -522,11 +526,15 @@ def _raise_masked_sync_error(e: httpx.HTTPStatusError, stream: bool) -> NoReturn
             except Exception:
                 pass
     _text: Final = mask_sensitive_info(_safe_get_response_text(e.response))
+    log_subscription_failure(e.response, _text, proxy_configured=proxy_configured, logging_obj=logging_obj)
     raise MaskedHTTPStatusError(e, message=_text, text=_text) from None
 
 
-async def _raise_masked_async_error(e: httpx.HTTPStatusError, stream: bool) -> NoReturn:
+async def _raise_masked_async_error(
+    e: httpx.HTTPStatusError, stream: bool, *, proxy_configured: bool | None = None, logging_obj: object = None,
+) -> NoReturn:
     """Raise a MaskedHTTPStatusError for async HTTP handlers."""
+    from litellm.llms.anthropic.subscription_diagnostics import log_subscription_failure
     if stream:
         try:
             _body: Final = mask_sensitive_info(
@@ -535,6 +543,7 @@ async def _raise_masked_async_error(e: httpx.HTTPStatusError, stream: bool) -> N
                     timeout=_STREAMING_ERROR_BODY_READ_TIMEOUT_SECONDS,
                 )
             )
+            log_subscription_failure(e.response, _body, proxy_configured=proxy_configured, logging_obj=logging_obj)
             raise MaskedHTTPStatusError(e, message=_body, text=_body) from None
         finally:
             try:
@@ -542,6 +551,7 @@ async def _raise_masked_async_error(e: httpx.HTTPStatusError, stream: bool) -> N
             except Exception:
                 pass
     _text: Final = mask_sensitive_info(_safe_get_response_text(e.response))
+    log_subscription_failure(e.response, _text, proxy_configured=proxy_configured, logging_obj=logging_obj)
     raise MaskedHTTPStatusError(e, message=_text, text=_text) from None
 
 
@@ -867,7 +877,7 @@ class AsyncHTTPHandler:
                 headers=headers,
             )
         except httpx.HTTPStatusError as e:
-            await _raise_masked_async_error(e, stream)
+            await _raise_masked_async_error(e, stream, proxy_configured=self.proxy_url is not None, logging_obj=logging_obj)
         except Exception as e:
             raise e
 
@@ -1534,7 +1544,7 @@ class HTTPHandler:
                 llm_provider="litellm-httpx-handler",
             )
         except httpx.HTTPStatusError as e:
-            _raise_masked_sync_error(e, stream)
+            _raise_masked_sync_error(e, stream, proxy_configured=self.proxy_url is not None, logging_obj=logging_obj)
         except Exception as e:
             raise e
 

@@ -533,6 +533,10 @@ class SubscriptionUsageService:
         except httpx.HTTPError:
             raise _UsageFetchError("Usage provider request failed") from None
         if response.status_code != 200:
+            if provider == "anthropic":
+                from litellm.llms.anthropic.subscription_diagnostics import log_subscription_failure
+
+                log_subscription_failure(response, response.content, proxy_configured=proxy_url is not None)
             raise _UsageFetchError(f"Usage provider returned HTTP {response.status_code}")
         try:
             return _PAYLOAD_ADAPTER.validate_json(response.content, strict=True)
