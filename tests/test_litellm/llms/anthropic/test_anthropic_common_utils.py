@@ -2487,6 +2487,44 @@ def test_oauth_header_builder_uses_the_same_subscription_client_profile(
     assert result["authorization"] == f"Bearer {FAKE_OAUTH_TOKEN}"
 
 
+@pytest.fixture(params=["bundled", "remote-missing", "remote-null"])
+def subscription_beta_config(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    from typing import Final
+
+    import respx
+
+    import litellm
+    from litellm import anthropic_beta_headers_manager as beta_manager
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_BETA_HEADER
+    from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
+
+    monkeypatch.setattr(beta_manager, "_BETA_HEADERS_CONFIG", None)
+    required: Final = (ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER)
+    bundled: Final = beta_manager.GetAnthropicBetaHeadersConfig.load_local_beta_headers_config()
+    supported_feature: Final = next(
+        name for name, target in bundled["anthropic"].items() if name == target and name not in required
+    )
+    if request.param == "bundled":
+        monkeypatch.setenv("LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS", "True")
+        return supported_feature
+
+    remote: Final = {
+        **bundled,
+        "anthropic": {
+            **{name: value for name, value in bundled["anthropic"].items() if name not in required},
+            **({name: None for name in required} if request.param == "remote-null" else {}),
+        },
+    }
+    url: Final = "https://beta-config.invalid/headers.json"
+    monkeypatch.setattr(litellm, "anthropic_beta_headers_url", url)
+    monkeypatch.setenv("LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS", "False")
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
+        route: Final = transport.get(url).respond(200, json=remote)
+        assert beta_manager.reload_beta_headers_config() == remote
+        assert route.call_count == 1
+    return supported_feature
+
+
 @pytest.fixture
 async def drain_subscription_header_logging(isolate_litellm_state):
     import asyncio
@@ -2506,7 +2544,7 @@ async def drain_subscription_header_logging(isolate_litellm_state):
 @pytest.mark.parametrize("oauth", [False, True])
 async def test_subscription_client_profile_reaches_final_inference_request(
     surface: str, synchronous: bool, stream: bool, oauth: bool, subscription_client_headers: dict[str, str],
-    drain_subscription_header_logging, monkeypatch: pytest.MonkeyPatch,
+    subscription_beta_config: str, drain_subscription_header_logging, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
     from typing import Final
@@ -2515,7 +2553,9 @@ async def test_subscription_client_profile_reaches_final_inference_request(
     import respx
 
     import litellm
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_BETA_HEADER
     from litellm.models.credentials import CredentialItem
+    from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 
     requests: Final[list[httpx.Request]] = []
     response: Final = {
@@ -2552,6 +2592,7 @@ async def test_subscription_client_profile_reaches_final_inference_request(
         "extra_headers": {
             "User-Agent": "caller-client/1.0", "X-Stainless-Lang": "python",
             "X-Stainless-Runtime": "CPython", "x-profile-test": "preserved",
+            "anthropic-beta": f"{subscription_beta_config},litellm-test-unknown-beta",
         },
     }
     with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
@@ -2580,6 +2621,11 @@ async def test_subscription_client_profile_reaches_final_inference_request(
     assert len(requests) == 1
     headers: Final = requests[0].headers
     assert headers["x-profile-test"] == "preserved"
+    expected_betas: Final = (
+        subscription_beta_config,
+        *((ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER) if oauth else ()),
+    )
+    assert sorted(headers.get_list("anthropic-beta", split_commas=True)) == sorted(expected_betas)
     if oauth:
         actual: Final = [
             (name, value) for name, value in headers.multi_items()
@@ -2598,7 +2644,8 @@ async def test_subscription_client_profile_reaches_final_inference_request(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oauth", [False, True])
 async def test_subscription_client_profile_reaches_final_count_tokens_request(
-    oauth: bool, subscription_client_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+    oauth: bool, subscription_client_headers: dict[str, str], subscription_beta_config: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from typing import Final
 
@@ -2606,7 +2653,10 @@ async def test_subscription_client_profile_reaches_final_count_tokens_request(
     import respx
 
     import litellm
+    from litellm.constants import ANTHROPIC_TOKEN_COUNTING_BETA_VERSION
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_BETA_HEADER
     from litellm.llms.anthropic.count_tokens.handler import AnthropicCountTokensHandler
+    from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
@@ -2620,6 +2670,11 @@ async def test_subscription_client_profile_reaches_final_count_tokens_request(
     assert result == {"input_tokens": 7}
     assert route.call_count == 1
     headers: Final = route.calls[0].request.headers
+    expected_betas: Final = (
+        ANTHROPIC_TOKEN_COUNTING_BETA_VERSION,
+        *((ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER) if oauth else ()),
+    )
+    assert sorted(headers.get_list("anthropic-beta", split_commas=True)) == sorted(expected_betas)
     if oauth:
         actual: Final = [
             (name, value) for name, value in headers.multi_items()

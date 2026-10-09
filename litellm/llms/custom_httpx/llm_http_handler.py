@@ -2327,6 +2327,7 @@ class BaseLLMHTTPHandler:
         from litellm.litellm_core_utils.get_provider_specific_headers import (
             ProviderSpecificHeaderUtils,
         )
+        from litellm.llms.anthropic.common_utils import is_anthropic_oauth_key, optionally_handle_anthropic_oauth
 
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(llm_provider=litellm.LlmProviders.ANTHROPIC)
@@ -2370,6 +2371,8 @@ class BaseLLMHTTPHandler:
 
         if anthropic_messages_provider_config.should_filter_anthropic_beta_headers():
             headers = update_headers_with_filtered_beta(headers=headers, provider=custom_llm_provider)
+        if custom_llm_provider == "anthropic" and is_anthropic_oauth_key(api_key):
+            headers, _ = optionally_handle_anthropic_oauth(headers, api_key)
 
         from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 

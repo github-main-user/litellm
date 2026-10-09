@@ -56,7 +56,12 @@ from litellm.types.utils import (
 )
 
 from ...base import BaseLLM
-from ..common_utils import AnthropicError, process_anthropic_headers
+from ..common_utils import (
+    AnthropicError,
+    is_anthropic_oauth_key,
+    optionally_handle_anthropic_oauth,
+    process_anthropic_headers,
+)
 from .transformation import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, AnthropicConfig
 
 if TYPE_CHECKING:
@@ -459,17 +464,22 @@ class AnthropicChatCompletion(BaseLLM):
                 request_data=request_data,
                 provider=custom_llm_provider,
             )
+            final_headers: Final = (
+                optionally_handle_anthropic_oauth(request_headers, api_key)[0]
+                if custom_llm_provider == "anthropic" and is_anthropic_oauth_key(api_key)
+                else request_headers
+            )
             logging_obj.pre_call(
                 input=messages,
                 api_key=api_key,
                 additional_args={
                     "complete_input_dict": data,
                     "api_base": api_base,
-                    "headers": request_headers,
+                    "headers": final_headers,
                 },
             )
             print_verbose(f"_is_function_call: {_is_function_call}")
-            return request_headers, data
+            return final_headers, data
 
         async def acompletion_dispatch() -> "ModelResponse | CustomStreamWrapper":
             """Translate then send, so the provider config can inline remote media off the event loop."""

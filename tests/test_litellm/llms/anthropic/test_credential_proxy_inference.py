@@ -392,8 +392,10 @@ async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, su
     import httpx
 
     from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_BETA_HEADER
     from litellm.llms.anthropic.oauth_client import AnthropicOAuthTokens, ManagedAnthropicOAuthToken
     from litellm.llms.custom_httpx import http_handler
+    from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 
     captured = []
     closed = []
@@ -494,6 +496,9 @@ async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, su
     assert recovered == [("subscription", "sk-ant-oat-rejected")]
     assert len(captured) == (2 if recovery in ("unchanged", "rejected") else 1)
     assert closed == [True] * (2 if recovery == "rejected" else 1)
+    assert [sorted(headers["anthropic-beta"].split(",")) for headers, _ in captured] == [
+        sorted((ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER))
+    ] * len(captured)
     outgoing_identity = json.loads(captured[0][1]["metadata"]["user_id"])
     assert outgoing_identity["device_id"] == "a" * 64
     assert outgoing_identity["account_uuid"] == "account"

@@ -119,6 +119,19 @@ class TestAnthropicBetaHeadersFiltering:
                 unknown not in filtered
             ), f"Unknown header '{unknown}' should be filtered out for {provider}"
 
+    @pytest.mark.parametrize(
+        "provider", ["anthropic", "azure_ai", "bedrock", "bedrock_converse", "vertex_ai", "databricks"],
+    )
+    def test_subscription_beta_is_supported_only_for_direct_anthropic(self, provider: str) -> None:
+        from typing import Final
+
+        from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_BETA_HEADER
+
+        filtered: Final = filter_and_transform_beta_headers(
+            beta_headers=[ANTHROPIC_SUBSCRIPTION_BETA_HEADER, "litellm-test-unknown-beta"], provider=provider,
+        )
+        assert filtered == ([ANTHROPIC_SUBSCRIPTION_BETA_HEADER] if provider == "anthropic" else [])
+
     def test_update_request_with_filtered_beta_vertex_ai(self):
         """Test combined filtering for both HTTP headers and request body betas."""
         headers = {
