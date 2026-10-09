@@ -1999,7 +1999,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         # Separate system prompt from rest of message
         translated_system_message_list: Final = self.translate_system_message(messages=messages)
         anthropic_system_message_list: Final = (
-            prepare_anthropic_subscription_system(translated_system_message_list)
+            prepare_anthropic_subscription_system(translated_system_message_list, messages=messages)
             if subscription_request
             else translated_system_message_list
         )

@@ -1,0 +1,248 @@
+{
+  "source": "https://downloads.claude.ai/claude-code-releases/2.1.283/linux-x64/claude",
+  "sha256": "1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2",
+  "verified_at": "2026-10-09",
+  "method": "Unicorn emulation of native CCH code at VA 0x36355ae..0x3635a6b, with native XXH64 update/digest. Only memory/search library calls stubbed. No CLI or provider calls.",
+  "cases": [
+    {
+      "name": "Key order 0",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Key order 1",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Key order 2",
+      "body": "{\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16}",
+      "cch": "ac48d"
+    },
+    {
+      "name": "Key order 3",
+      "body": "{\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "ac48d"
+    },
+    {
+      "name": "Key order 4",
+      "body": "{\"model\":\"claude-sonnet-5\",\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Key order 5",
+      "body": "{\"model\":\"claude-sonnet-5\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "ac48d"
+    },
+    {
+      "name": "Key order 6",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16}",
+      "cch": "4001c"
+    },
+    {
+      "name": "Key order 7",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "4001c"
+    },
+    {
+      "name": "Key order 8",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\",\"max_tokens\":16}",
+      "cch": "90c5c"
+    },
+    {
+      "name": "Key order 9",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"model\":\"claude-sonnet-5\"}",
+      "cch": "90c5c"
+    },
+    {
+      "name": "Key order 10",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16,\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "4001c"
+    },
+    {
+      "name": "Key order 11",
+      "body": "{\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\"}",
+      "cch": "90c5c"
+    },
+    {
+      "name": "Key order 12",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16}",
+      "cch": "7cfb7"
+    },
+    {
+      "name": "Key order 13",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\",\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "7cfb7"
+    },
+    {
+      "name": "Key order 14",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\",\"max_tokens\":16}",
+      "cch": "188b3"
+    },
+    {
+      "name": "Key order 15",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16,\"model\":\"claude-sonnet-5\"}",
+      "cch": "188b3"
+    },
+    {
+      "name": "Key order 16",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "7cfb7"
+    },
+    {
+      "name": "Key order 17",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\"}",
+      "cch": "188b3"
+    },
+    {
+      "name": "Key order 18",
+      "body": "{\"max_tokens\":16,\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Key order 19",
+      "body": "{\"max_tokens\":16,\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "ac48d"
+    },
+    {
+      "name": "Key order 20",
+      "body": "{\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+      "cch": "4001c"
+    },
+    {
+      "name": "Key order 21",
+      "body": "{\"max_tokens\":16,\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\"}",
+      "cch": "90c5c"
+    },
+    {
+      "name": "Key order 22",
+      "body": "{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}]}",
+      "cch": "7cfb7"
+    },
+    {
+      "name": "Key order 23",
+      "body": "{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"model\":\"claude-sonnet-5\"}",
+      "cch": "188b3"
+    },
+    {
+      "name": "Changed model and limit",
+      "body": "{\"model\":\"model-b\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":8192}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Changed text",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello!\"}],\"max_tokens\":16}",
+      "cch": "cf8a9"
+    },
+    {
+      "name": "Unicode",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"привет🦊言語\\\\\\\"[]\"}],\"max_tokens\":16}",
+      "cch": "1626c"
+    },
+    {
+      "name": "Stream",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"stream\":true}",
+      "cch": "84329"
+    },
+    {
+      "name": "Fallbacks",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallbacks\":[\"one\",[\"two\"],{\"model\":\"other\",\"max_tokens\":7}]}",
+      "cch": "b9292"
+    },
+    {
+      "name": "Escaped fallbacks",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallbacks\":[\"escaped\\\"[]\\\\\",\"one\"]}",
+      "cch": "b9292"
+    },
+    {
+      "name": "Empty fallbacks",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallbacks\":[]}",
+      "cch": "b9292"
+    },
+    {
+      "name": "Credit token",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallback_credit_token\":\"synthetic-credit\"}",
+      "cch": "b9292"
+    },
+    {
+      "name": "Escaped credit token",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallback_credit_token\":\"escaped\\\"credit\"}",
+      "cch": "71dd6"
+    },
+    {
+      "name": "Escaped model",
+      "body": "{\"model\":\"escaped\\\"model\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16}",
+      "cch": "86fd8"
+    },
+    {
+      "name": "Nested names",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"tools\":[{\"input_schema\":{\"model\":\"nested-model\",\"max_tokens\":3,\"fallbacks\":[\"a\"]}}]}",
+      "cch": "43fc3"
+    },
+    {
+      "name": "Decoys",
+      "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"cch=00000 \\\"model\\\":\\\"literal\\\" \\\"max_tokens\\\":25\"}],\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"max_tokens\":16}",
+      "cch": "249ca"
+    },
+    {
+      "name": "Adjacent exclusions",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"fallback_credit_token\":\"synthetic\",\"fallbacks\":[\"one\"]}",
+      "cch": "b9292"
+    },
+    {
+      "name": "Leading exclusions",
+      "body": "{\"fallbacks\":[\"one\"],\"fallback_credit_token\":\"synthetic\",\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16}",
+      "cch": "604d9"
+    },
+    {
+      "name": "Decimal limit",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":12.5}",
+      "cch": "d4303"
+    },
+    {
+      "name": "Negative limit",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":-1}",
+      "cch": "8a75f"
+    },
+    {
+      "name": "Body length boundary 0",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"\"}],\"max_tokens\":16}",
+      "cch": "71384"
+    },
+    {
+      "name": "Body length boundary 1",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":16}",
+      "cch": "6ce3c"
+    },
+    {
+      "name": "Body length boundary 31",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "66cfa"
+    },
+    {
+      "name": "Body length boundary 32",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "d6df9"
+    },
+    {
+      "name": "Body length boundary 33",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "90d72"
+    },
+    {
+      "name": "Body length boundary 255",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "bd81f"
+    },
+    {
+      "name": "Body length boundary 256",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "62487"
+    },
+    {
+      "name": "Body length boundary 4096",
+      "body": "{\"model\":\"claude-sonnet-5\",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.283.79f; cc_entrypoint=cli; cch=00000;\"}],\"messages\":[{\"role\":\"user\",\"content\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}],\"max_tokens\":16}",
+      "cch": "6bf5a"
+    }
+  ]
+}

@@ -6491,7 +6491,7 @@ def test_eager_input_streaming_reaches_anthropic_request_tools():
 def test_subscription_transform_preserves_tool_exchange_without_mutating_input(stream):
     from copy import deepcopy
 
-    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+    from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
 
     config = AnthropicConfig()
     messages = [
@@ -6534,7 +6534,7 @@ def test_subscription_transform_preserves_tool_exchange_without_mutating_input(s
         headers={"authorization": "Bearer sk-ant-oat01-test"},
     )
 
-    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["system"] == prepare_anthropic_subscription_system(None, messages=original)
     assert result["messages"][0]["content"][:3] == [
         {"type": "text", "text": "<system-reminder>"},
         original[0]["content"][0],
@@ -6567,7 +6567,7 @@ def test_api_key_transform_does_not_add_subscription_identity():
 
 
 def test_native_messages_subscription_transform_moves_client_system_to_user_reminder():
-    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+    from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
 
     original_system = [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
     original_params = {"max_tokens": 100, "system": original_system}
@@ -6579,7 +6579,9 @@ def test_native_messages_subscription_transform_moves_client_system_to_user_remi
         headers={"authorization": "Bearer sk-ant-oat01-test"},
     )
 
-    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["system"] == prepare_anthropic_subscription_system(
+        None, messages=[{"role": "user", "content": "Hi"}],
+    )
     assert result["messages"][0]["content"] == [
         {"type": "text", "text": "<system-reminder>"},
         original_system[0],

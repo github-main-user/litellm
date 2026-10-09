@@ -1,6 +1,6 @@
 import copy
 
-from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT
+from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
 )
@@ -112,7 +112,7 @@ def test_subscription_transform_canonicalizes_identity_and_tools_without_mutatin
         subscription_request=True,
     )
 
-    assert result["system"] == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert result["system"] == prepare_anthropic_subscription_system(None, messages=messages)
     assert result["messages"][0] == {
         "role": "user",
         "content": [

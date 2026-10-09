@@ -62,6 +62,7 @@ from ..common_utils import (
     optionally_handle_anthropic_oauth,
     process_anthropic_headers,
 )
+from ..subscription_billing import serialize_anthropic_subscription_request
 from .transformation import ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY, AnthropicConfig
 
 if TYPE_CHECKING:
@@ -277,6 +278,7 @@ class AnthropicChatCompletion(BaseLLM):
         litellm_params=None,
         logger_fn=None,
         headers={},
+        subscription_request: bool = False,
     ):
         from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 
@@ -286,7 +288,7 @@ class AnthropicChatCompletion(BaseLLM):
             client=client,
             api_base=api_base,
             headers=headers,
-            data=json.dumps(data),
+            data=serialize_anthropic_subscription_request(data) if subscription_request else json.dumps(data),
             model=model,
             messages=messages,
             logging_obj=logging_obj,
@@ -331,8 +333,10 @@ class AnthropicChatCompletion(BaseLLM):
         logger_fn=None,
         headers={},
         client: AsyncHTTPHandler | None = None,
+        subscription_request: bool = False,
     ) -> Union[ModelResponse, "CustomStreamWrapper"]:
         async_handler: Final = client or get_async_httpx_client(llm_provider=litellm.LlmProviders.ANTHROPIC)
+        signed_body: Final = serialize_anthropic_subscription_request(data) if subscription_request else None
 
         try:
             response = None
@@ -343,7 +347,7 @@ class AnthropicChatCompletion(BaseLLM):
                     response = await async_handler.post(
                         api_base,
                         headers=request_headers,
-                        json=data,
+                        **({"data": signed_body} if signed_body is not None else {"json": data}),
                         timeout=timeout,
                         logging_obj=logging_obj,
                     )
@@ -444,6 +448,7 @@ class AnthropicChatCompletion(BaseLLM):
             api_base=api_base,
         )
 
+        subscription_request: Final = custom_llm_provider == "anthropic" and is_anthropic_oauth_key(api_key)
         config: Final = ProviderConfigManager.get_provider_chat_config(
             model=model,
             provider=LlmProviders(custom_llm_provider),
@@ -517,6 +522,7 @@ class AnthropicChatCompletion(BaseLLM):
                     headers=request_headers,
                     timeout=timeout,
                     client=(client if client is not None and isinstance(client, AsyncHTTPHandler) else None),
+                    subscription_request=subscription_request,
                 )
             return await self.acompletion_function(
                 model=model,
@@ -539,6 +545,7 @@ class AnthropicChatCompletion(BaseLLM):
                 client=client,
                 json_mode=json_mode,
                 timeout=timeout,
+                subscription_request=subscription_request,
             )
 
         if acompletion is True:
@@ -562,7 +569,7 @@ class AnthropicChatCompletion(BaseLLM):
                     client=client,
                     api_base=api_base,
                     headers=headers,
-                    data=json.dumps(data),
+                    data=serialize_anthropic_subscription_request(data) if subscription_request else json.dumps(data),
                     model=model,
                     messages=messages,
                     logging_obj=logging_obj,
@@ -593,7 +600,7 @@ class AnthropicChatCompletion(BaseLLM):
                     response: Final = client.post(
                         api_base,
                         headers=headers,
-                        data=json.dumps(data),
+                        data=serialize_anthropic_subscription_request(data) if subscription_request else json.dumps(data),
                         timeout=timeout,
                         logging_obj=logging_obj,
                     )

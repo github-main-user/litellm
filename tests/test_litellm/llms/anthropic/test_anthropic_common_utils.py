@@ -2284,7 +2284,7 @@ def test_create_anthropic_model_list_response_lists_ids_as_told():
     assert (response["first_id"], response["last_id"]) == ("claude-router-gpt-4o[1m]", "claude-haiku-4-5")
 
 
-def test_prepare_anthropic_subscription_system_is_identity_first_and_idempotent():
+def test_prepare_anthropic_subscription_system_keeps_billing_before_identity_and_is_idempotent():
     from litellm.llms.anthropic.common_utils import (
         ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
         prepare_anthropic_subscription_system,
@@ -2304,12 +2304,13 @@ def test_prepare_anthropic_subscription_system_is_identity_first_and_idempotent(
     prepared = prepare_anthropic_subscription_system(original)
     prepared_again = prepare_anthropic_subscription_system(prepared)
 
-    assert prepared == [cached_identity]
+    assert prepared == [_expected_subscription_billing("000"), cached_identity]
     assert prepared_again == prepared
     assert original[0]["text"] == "Keep this instruction"
     assert len(original) == 3
     assert prepare_anthropic_subscription_system("Original") == [
-        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
+        _expected_subscription_billing("000"),
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
     ]
 
 
@@ -2525,6 +2526,118 @@ def subscription_beta_config(request: pytest.FixtureRequest, monkeypatch: pytest
     return supported_feature
 
 
+def _assert_subscription_cch(wire: bytes) -> str:
+    import re
+
+    from xxhash import xxh64_intdigest
+
+    # native Claude Code 2.1.283, sha256 1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2, 2026-10-09.
+    body = json.loads(wire)
+    text = body["system"][0]["text"]
+    match = re.search(r"(?<=;) cch=([0-9a-f]{5});", text)
+    assert match is not None, text
+    assert len(re.findall(r"\bcch=", text)) == 1
+    value = match.group(1)
+    body["system"][0]["text"] = text[:match.start(1)] + "00000" + text[match.end(1):]
+    placeholder = json.dumps(body, separators=(",", ":")).encode()
+    assert placeholder.replace(b"cch=00000", f"cch={value}".encode(), 1) == wire
+    body["model"] = ""
+    body.pop("max_tokens", None)
+    expected = xxh64_intdigest(json.dumps(body, separators=(",", ":")).encode(), seed=0x4D659218E32A3268)
+    assert value == f"{expected & 0xFFFFF:05x}"
+    return value
+
+
+def _expected_subscription_billing(sampled_text: str, cch: str | None = None) -> dict[str, str]:
+    from hashlib import sha256
+    from typing import Final
+
+    from litellm.llms.anthropic.common_utils import ANTHROPIC_SUBSCRIPTION_USER_AGENT
+
+    # reference: Claude Code 2.1.283, Mbe at binary offset 204220089, inspected 2026-10-09.
+    version: Final = ANTHROPIC_SUBSCRIPTION_USER_AGENT.split("/", 1)[1].split(" ", 1)[0]
+    fingerprint: Final = sha256(f"59cf53e54c78{sampled_text}{version}".encode()).hexdigest()[:3]
+    return {
+        "type": "text",
+        "text": (
+            f"x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli;"
+            + (f" cch={cch};" if cch is not None else "")
+        ),
+    }
+
+
+@pytest.mark.parametrize("content,sampled_text", [
+    ("", "000"),
+    ("hello", "o00"),
+    ("abcdefghijklmnopqrstuvwxyz", "ehu"),
+    ("abcd😀efghijklmnopqrstuvwxyz", "\ufffdfs"),
+    ("abcd\ud83dxx\ude00", "😀0"),
+    ("abcd\ude00xx\ud83d", "\ufffd\ufffd0"),
+    ([{"type": "image", "source": {}}, {"type": "text", "text": "hello"}], "o00"),
+    ([{"type": "text", "text": ""}, {"type": "text", "text": "hello"}], "000"),
+    ([{"type": "tool_result", "tool_use_id": "tool-1", "content": "hello"}], "000"),
+    (None, "000"),
+])
+def test_subscription_billing_fingerprints_first_user_text_using_js_string_indices(
+    content: object, sampled_text: str,
+) -> None:
+    from copy import deepcopy
+    from typing import Final
+
+    from litellm.llms.anthropic.common_utils import (
+        ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+        prepare_anthropic_subscription_system,
+    )
+
+    messages: Final = [
+        {"role": "assistant", "content": "ignored assistant text"},
+        {"role": "user", "content": content},
+        {"role": "user", "content": "ignored later user text"},
+    ]
+    original: Final = deepcopy(messages)
+    assert prepare_anthropic_subscription_system(None, messages=messages) == [
+        _expected_subscription_billing(sampled_text),
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+    ]
+    assert messages == original
+
+
+@pytest.mark.parametrize("messages", [[], [{"role": "assistant", "content": "hello"}]])
+def test_subscription_billing_uses_empty_sample_when_no_user_message_exists(messages: list[object]) -> None:
+    from litellm.llms.anthropic.common_utils import (
+        ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+        prepare_anthropic_subscription_system,
+    )
+
+    assert prepare_anthropic_subscription_system(None, messages=messages) == [
+        _expected_subscription_billing("000"),
+        {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT},
+    ]
+
+
+def test_subscription_billing_preserves_caller_attribution_without_duplication() -> None:
+    from copy import deepcopy
+    from typing import Final
+
+    from litellm.llms.anthropic.common_utils import (
+        ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT,
+        prepare_anthropic_subscription_system,
+    )
+
+    billing: Final = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=caller; cc_entrypoint=sdk-cli; cch=12345; cc_is_subagent=true;",
+        "cache_control": {"type": "ephemeral"},
+    }
+    original: Final = [billing, {"type": "text", "text": "Keep this instruction"}]
+    snapshot: Final = deepcopy(original)
+    messages: Final = [{"role": "user", "content": "hello"}]
+    prepared: Final = prepare_anthropic_subscription_system(original, messages=messages)
+    assert prepared == [billing, {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert prepare_anthropic_subscription_system(prepared, messages=messages) == prepared
+    assert original == snapshot
+
+
 @pytest.fixture
 async def drain_subscription_header_logging(isolate_litellm_state):
     import asyncio
@@ -2542,9 +2655,11 @@ async def drain_subscription_header_logging(isolate_litellm_state):
 ])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("oauth", [False, True])
+@pytest.mark.parametrize("with_system", [False, True])
 async def test_subscription_client_profile_reaches_final_inference_request(
-    surface: str, synchronous: bool, stream: bool, oauth: bool, subscription_client_headers: dict[str, str],
-    subscription_beta_config: str, drain_subscription_header_logging, monkeypatch: pytest.MonkeyPatch,
+    surface: str, synchronous: bool, stream: bool, oauth: bool, with_system: bool,
+    subscription_client_headers: dict[str, str], subscription_beta_config: str,
+    drain_subscription_header_logging, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
     from typing import Final
@@ -2595,23 +2710,29 @@ async def test_subscription_client_profile_reaches_final_inference_request(
             "anthropic-beta": f"{subscription_beta_config},litellm-test-unknown-beta",
         },
     }
+    user_messages: Final = [{"role": "user", "content": "hello"}]
+    system_messages: Final = [{"role": "system", "content": "Keep this context"}] if with_system else []
+    instructions: Final = {"instructions": "Keep this context"} if with_system else {}
+    native_system: Final = {"system": "Keep this context"} if with_system else {}
     with respx.mock(assert_all_called=True, assert_all_mocked=True) as transport:
         transport.post(host="api.anthropic.com", path="/v1/messages").mock(side_effect=upstream)
         if surface == "chat" and synchronous:
             result = await asyncio.to_thread(
-                litellm.completion, **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+                litellm.completion, **params, messages=[*system_messages, *user_messages], max_tokens=8,
             )
         elif surface == "chat":
             result = await litellm.acompletion(
-                **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+                **params, messages=[*system_messages, *user_messages], max_tokens=8,
             )
         elif surface == "responses" and synchronous:
-            result = await asyncio.to_thread(litellm.responses, **params, input="hello", max_output_tokens=8)
+            result = await asyncio.to_thread(
+                litellm.responses, **params, **instructions, input="hello", max_output_tokens=8,
+            )
         elif surface == "responses":
-            result = await litellm.aresponses(**params, input="hello", max_output_tokens=8)
+            result = await litellm.aresponses(**params, **instructions, input="hello", max_output_tokens=8)
         else:
             result = await litellm.anthropic_messages(
-                **params, messages=[{"role": "user", "content": "hello"}], max_tokens=8,
+                **params, **native_system, messages=user_messages, max_tokens=8,
             )
         if stream and synchronous:
             assert await asyncio.to_thread(list, result)
@@ -2620,6 +2741,17 @@ async def test_subscription_client_profile_reaches_final_inference_request(
 
     assert len(requests) == 1
     headers: Final = requests[0].headers
+    body: Final = json.loads(requests[0].content)
+    system: Final = body.get("system", [])
+    system_blocks: Final = [{"type": "text", "text": system}] if isinstance(system, str) else system
+    billing_blocks: Final = [
+        block for block in system_blocks
+        if block.get("type") == "text" and block.get("text", "").startswith("x-anthropic-billing-header:")
+    ]
+    cch = _assert_subscription_cch(requests[0].content) if oauth else None
+    expected_billing = _expected_subscription_billing("o00", cch)
+    assert billing_blocks == ([expected_billing] if oauth else [])
+    assert "x-anthropic-billing-header" not in headers
     assert headers["x-profile-test"] == "preserved"
     expected_betas: Final = (
         subscription_beta_config,
@@ -2627,6 +2759,7 @@ async def test_subscription_client_profile_reaches_final_inference_request(
     )
     assert sorted(headers.get_list("anthropic-beta", split_commas=True)) == sorted(expected_betas)
     if oauth:
+        assert body["system"][0] == expected_billing
         actual: Final = [
             (name, value) for name, value in headers.multi_items()
             if name in subscription_client_headers or name.startswith("x-stainless-")
@@ -2643,8 +2776,9 @@ async def test_subscription_client_profile_reaches_final_inference_request(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oauth", [False, True])
+@pytest.mark.parametrize("with_system", [False, True])
 async def test_subscription_client_profile_reaches_final_count_tokens_request(
-    oauth: bool, subscription_client_headers: dict[str, str], subscription_beta_config: str,
+    oauth: bool, with_system: bool, subscription_client_headers: dict[str, str], subscription_beta_config: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from typing import Final
@@ -2666,16 +2800,29 @@ async def test_subscription_client_profile_reaches_final_count_tokens_request(
         result: Final = await AnthropicCountTokensHandler().handle_count_tokens_request(
             model="claude-sonnet-5", messages=[{"role": "user", "content": "hello"}],
             api_key=FAKE_OAUTH_TOKEN if oauth else FAKE_REGULAR_KEY,
+            system="Keep this context" if with_system else None,
         )
     assert result == {"input_tokens": 7}
     assert route.call_count == 1
     headers: Final = route.calls[0].request.headers
+    body: Final = json.loads(route.calls[0].request.content)
+    system: Final = body.get("system", [])
+    system_blocks: Final = [{"type": "text", "text": system}] if isinstance(system, str) else system
+    billing_blocks: Final = [
+        block for block in system_blocks
+        if block.get("type") == "text" and block.get("text", "").startswith("x-anthropic-billing-header:")
+    ]
+    cch = _assert_subscription_cch(route.calls[0].request.content) if oauth else None
+    expected_billing = _expected_subscription_billing("o00", cch)
+    assert billing_blocks == ([expected_billing] if oauth else [])
+    assert "x-anthropic-billing-header" not in headers
     expected_betas: Final = (
         ANTHROPIC_TOKEN_COUNTING_BETA_VERSION,
         *((ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER) if oauth else ()),
     )
     assert sorted(headers.get_list("anthropic-beta", split_commas=True)) == sorted(expected_betas)
     if oauth:
+        assert body["system"][0] == expected_billing
         actual: Final = [
             (name, value) for name, value in headers.multi_items()
             if name in subscription_client_headers or name.startswith("x-stainless-")

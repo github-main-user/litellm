@@ -3,6 +3,7 @@ This file contains common utils for anthropic calls.
 """
 
 import copy
+import hashlib
 import re
 from collections.abc import Mapping, MutableMapping, Sequence
 from datetime import datetime, timezone
@@ -78,7 +79,11 @@ _CLAUDE_CODE_USER_AGENT_PREFIXES: Final = ("claude-cli/", "claude-code/")
 ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 ANTHROPIC_SUBSCRIPTION_APP_HEADER: Final = "cli"
 ANTHROPIC_SUBSCRIPTION_BETA_HEADER: Final = "claude-code-20250219"
-ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = "claude-cli/2.1.283 (external, cli)"
+ANTHROPIC_SUBSCRIPTION_CLIENT_VERSION: Final = "2.1.283"
+ANTHROPIC_SUBSCRIPTION_ENTRYPOINT: Final = "cli"
+ANTHROPIC_SUBSCRIPTION_USER_AGENT: Final = (
+    f"claude-cli/{ANTHROPIC_SUBSCRIPTION_CLIENT_VERSION} (external, {ANTHROPIC_SUBSCRIPTION_ENTRYPOINT})"
+)
 # compatibility profile: Claude Code 2.1.283 Linux x64, inspected 2026-10-09, not the Python transport.
 # binary sha256: 1859583ce32920595c61ef868bee52e1b1594f7486db209935e01f1e5e804ae2
 ANTHROPIC_SUBSCRIPTION_CLIENT_HEADERS: Final = MappingProxyType(
@@ -296,9 +301,54 @@ def _anthropic_subscription_system_parts(system: object) -> tuple[list[object], 
     return billing_blocks, identity_blocks[0] if identity_blocks else identity, instructions
 
 
-def prepare_anthropic_subscription_system(system: object) -> list[object]:
+def _anthropic_subscription_user_text(messages: Sequence[object]) -> str:
+    user: Final = next(
+        (
+            message for value in messages
+            if (message := _validated_claude_code_mapping(value)) is not None and message.get("role") == "user"
+        ),
+        None,
+    )
+    if user is None:
+        return ""
+    content: Final = user.get("content")
+    if isinstance(content, str):
+        return content
+    blocks: Final = _validated_claude_code_list(content)
+    if blocks is None:
+        return ""
+    first_text: Final = next(
+        (
+            block for value in blocks
+            if (block := _validated_claude_code_mapping(value)) is not None and block.get("type") == "text"
+        ),
+        None,
+    )
+    text: Final = first_text.get("text") if first_text is not None else None
+    return text if isinstance(text, str) else ""
+
+
+def _anthropic_subscription_billing_text(messages: Sequence[object]) -> str:
+    # reference: Claude Code 2.1.283 Mbe, binary offset 204220089, inspected 2026-10-09.
+    # JS selects UTF-16 units before UTF-8 encoding, including replacement of unpaired surrogates.
+    utf16_prefix: Final = _anthropic_subscription_user_text(messages)[:21].encode("utf-16-le", "surrogatepass")
+    sampled_text: Final = b"".join(
+        utf16_prefix[index * 2:index * 2 + 2] or b"0\x00" for index in (4, 7, 20)
+    ).decode("utf-16-le", "replace")
+    fingerprint: Final = hashlib.sha256(
+        f"59cf53e54c78{sampled_text}{ANTHROPIC_SUBSCRIPTION_CLIENT_VERSION}".encode()
+    ).hexdigest()[:3]
+    return (
+        f"{_CLAUDE_CODE_BILLING_HEADER_PREFIX} "
+        f"cc_version={ANTHROPIC_SUBSCRIPTION_CLIENT_VERSION}.{fingerprint}; "
+        f"cc_entrypoint={ANTHROPIC_SUBSCRIPTION_ENTRYPOINT};"
+    )
+
+
+def prepare_anthropic_subscription_system(system: object, *, messages: Sequence[object] = ()) -> list[object]:
     billing_blocks, identity, _ = _anthropic_subscription_system_parts(system)
-    return [*billing_blocks, identity]
+    attribution: Final = billing_blocks or [{"type": "text", "text": _anthropic_subscription_billing_text(messages)}]
+    return [*attribution, identity]
 
 
 def prepare_anthropic_subscription_messages(messages: Sequence[object], system: object) -> list[object]:

@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Final, cast
 
 import httpx
+from pydantic import JsonValue
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -30,6 +31,7 @@ from ...common_utils import (
     strip_advisor_blocks_from_messages,
     strip_encrypted_reasoning_blocks_from_anthropic_messages,
 )
+from ...subscription_billing import serialize_anthropic_subscription_request
 from ...subscription_identity import get_subscription_identity, prepare_subscription_identity
 from ...subscription_tools import (
     ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY,
@@ -70,6 +72,21 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
     @property
     def _resolved_provider(self) -> str:
         return self.custom_llm_provider or "anthropic"
+
+    def sign_request(
+        self,
+        headers: dict[str, str],
+        optional_params: Mapping[str, object],
+        request_data: dict[str, JsonValue],
+        api_base: str,
+        api_key: str | None = None,
+        model: str | None = None,
+        stream: bool | None = None,
+        fake_stream: bool | None = None,
+    ) -> tuple[dict[str, str], bytes | None]:
+        if self.custom_llm_provider == "anthropic" and is_anthropic_subscription_request(headers):
+            return headers, serialize_anthropic_subscription_request(request_data).encode()
+        return headers, None
 
     def get_supported_anthropic_messages_params(self, model: str) -> list:
         return [
@@ -501,7 +518,9 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         litellm_params[ANTHROPIC_TOOL_NAME_REVERSE_MAP_KEY] = {}
         if subscription_request:
             client_system: Final = anthropic_messages_optional_request_params.get("system")
-            anthropic_messages_optional_request_params["system"] = prepare_anthropic_subscription_system(client_system)
+            anthropic_messages_optional_request_params["system"] = prepare_anthropic_subscription_system(
+                client_system, messages=messages
+            )
             messages = cast(list[dict], prepare_anthropic_subscription_messages(messages, client_system))
         if max_tokens is None:
             raise AnthropicError(

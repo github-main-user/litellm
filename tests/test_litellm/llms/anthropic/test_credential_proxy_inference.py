@@ -398,6 +398,7 @@ async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, su
     from litellm.types.llms.anthropic import ANTHROPIC_OAUTH_BETA_HEADER
 
     captured = []
+    wires = []
     closed = []
     recovered = []
     proxy_url = "http://proxy.invalid:8080"
@@ -424,6 +425,7 @@ async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, su
             closed.append(True)
 
     def upstream(request):
+        wires.append(request.content)
         captured.append((dict(request.headers), json.loads(request.content)))
         if len(captured) == 1 or recovery == "rejected":
             return httpx.Response(401, stream=TrackedBody())
@@ -499,6 +501,11 @@ async def test_public_anthropic_oauth_replay_validates_transport(monkeypatch, su
     assert [sorted(headers["anthropic-beta"].split(",")) for headers, _ in captured] == [
         sorted((ANTHROPIC_SUBSCRIPTION_BETA_HEADER, ANTHROPIC_OAUTH_BETA_HEADER))
     ] * len(captured)
+    from litellm.llms.anthropic.subscription_billing import serialize_anthropic_subscription_request
+
+    for wire in wires:
+        assert b"cch=" in wire
+        assert serialize_anthropic_subscription_request(json.loads(wire)).encode() == wire
     outgoing_identity = json.loads(captured[0][1]["metadata"]["user_id"])
     assert outgoing_identity["device_id"] == "a" * 64
     assert outgoing_identity["account_uuid"] == "account"

@@ -202,7 +202,7 @@ def test_existing_billing_attribution_is_preserved_and_client_system_becomes_a_r
     ]
     assert prepare_anthropic_subscription_system(prepared) == prepared
     assert original == [instruction, billing]
-    assert prepare_anthropic_subscription_system(None) == [
+    assert prepare_anthropic_subscription_system(None)[1:] == [
         {"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}
     ]
 
@@ -214,7 +214,7 @@ def test_coding_agent_signature_moves_from_system_to_user_reminder():
     )
     system = prepare_anthropic_subscription_system(signature)
     messages = prepare_anthropic_subscription_messages([{"role": "user", "content": "Hello"}], signature)
-    assert system == [{"type": "text", "text": ANTHROPIC_SUBSCRIPTION_SYSTEM_PROMPT}]
+    assert system == prepare_anthropic_subscription_system(None)
     assert signature not in json.dumps(system)
     assert signature in json.dumps(messages)
 
@@ -410,13 +410,16 @@ async def test_public_api_identity_isolates_gateway_users_without_changing_provi
         assert bodies[0] == bodies[1]
         assert "metadata" not in bodies[0]
         return
+    from litellm.llms.anthropic.subscription_billing import serialize_anthropic_subscription_request
+
     assert sessions[0] == sessions[2]
     assert sessions[0] != sessions[1]
+    assert bodies[0]["system"] != bodies[1]["system"]
     for body, session in zip(bodies, sessions, strict=True):
         assert body["metadata"] == {"user_id": json.dumps({
             "device_id": tokens.device_id, "account_uuid": tokens.account_id, "session_id": session,
         }, separators=(",", ":"))}
-        assert body == {**bodies[0], "metadata": body["metadata"]}
+        assert body == json.loads(serialize_anthropic_subscription_request({**bodies[0], "metadata": body["metadata"]}))
 
 
 @pytest.mark.asyncio

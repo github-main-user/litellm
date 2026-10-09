@@ -74,7 +74,7 @@ class AnthropicCountTokensConfig:
         request_with_identity: Final = {
             **request,
             "messages": prepare_anthropic_subscription_messages(request["messages"], request.get("system")),
-            "system": prepare_anthropic_subscription_system(request.get("system")),
+            "system": prepare_anthropic_subscription_system(request.get("system"), messages=request["messages"]),
         }
         subscription_body, _ = prepare_subscription_tools(request_with_identity)
         return _COUNT_REQUEST.validate_python(subscription_body)

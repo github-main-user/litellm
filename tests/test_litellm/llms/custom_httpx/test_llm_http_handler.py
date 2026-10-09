@@ -2614,6 +2614,64 @@ async def test_anthropic_invalid_thinking_signature_retry_resigns_bedrock_reques
     assert retry_authorization != first_attempt_headers["Authorization"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_subscription_cch_is_recomputed_after_thinking_signature_retry(stream):
+    from litellm.llms.anthropic.common_utils import prepare_anthropic_subscription_system
+    from litellm.llms.anthropic.experimental_pass_through.messages.transformation import AnthropicMessagesConfig
+    from litellm.llms.anthropic.oauth_client import ManagedAnthropicOAuthToken
+    from litellm.llms.anthropic.subscription_billing import serialize_anthropic_subscription_request
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    token = ManagedAnthropicOAuthToken("sk-ant-oat-signing-test")
+    config = AnthropicMessagesConfig()
+    url = "https://api.anthropic.com/v1/messages"
+    request = {
+        "model": "claude-sonnet-5", "max_tokens": 100, "stream": stream,
+        "system": prepare_anthropic_subscription_system(None, messages=[{"role": "user", "content": "hello"}]),
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "synthetic", "signature": "invalid"},
+                {"type": "text", "text": "ok"},
+            ]},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    headers, signed = config.sign_request(
+        headers={"authorization": f"Bearer {token}", "content-type": "application/json"},
+        optional_params={}, request_data=request, api_base=url, api_key=token,
+    )
+    wires = []
+
+    def upstream(http_request):
+        wires.append(http_request.content)
+        if len(wires) == 1:
+            return httpx.Response(400, json={"message": "messages.1.content.0: Invalid `signature` in `thinking` block"})
+        return httpx.Response(200, json={"id": "msg_cch"})
+
+    client = AsyncHTTPHandler()
+    await client.client.aclose()
+    logging_obj = Mock(baseline_cache_context=None)
+    logging_obj.model_call_details = {}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw:
+        client.client = raw
+        response = await BaseLLMHTTPHandler()._async_post_anthropic_messages_with_http_error_retry(
+            async_httpx_client=client, request_url=url, headers=headers, signed_json_body=signed,
+            request_body=request, stream=stream, logging_obj=logging_obj, provider_config=config,
+            litellm_params=GenericLiteLLMParams(), api_key=token, model="claude-sonnet-5",
+        )
+        assert response.status_code == 200
+        await response.aclose()
+    assert len(wires) == 2
+    first, second = (json.loads(wire) for wire in wires)
+    assert first["system"][0]["text"] != second["system"][0]["text"]
+    assert second["messages"][1]["content"] == [{"type": "text", "text": "ok"}]
+    for wire in wires:
+        assert b"cch=" in wire
+        assert serialize_anthropic_subscription_request(json.loads(wire)).encode() == wire
+
+
 def test_aws_signing_overrides_only_fills_missing_credentials():
     from litellm.llms.custom_httpx.llm_http_handler import _aws_signing_overrides
 

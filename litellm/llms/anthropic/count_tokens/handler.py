@@ -16,6 +16,7 @@ from litellm.llms.anthropic.common_utils import AnthropicError, is_anthropic_oau
 from litellm.llms.anthropic.count_tokens.transformation import (
     AnthropicCountTokensConfig,
 )
+from litellm.llms.anthropic.subscription_billing import serialize_anthropic_subscription_request
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 
 
@@ -101,7 +102,11 @@ class AnthropicCountTokensHandler(AnthropicCountTokensConfig):
                 response: Final = await async_client.post(
                     endpoint_url,
                     headers=headers,
-                    json=request_body,
+                    **(
+                        {"data": serialize_anthropic_subscription_request(request_body)}
+                        if is_anthropic_oauth_key(api_key)
+                        else {"json": request_body}
+                    ),
                     timeout=request_timeout,
                 )
             finally:
