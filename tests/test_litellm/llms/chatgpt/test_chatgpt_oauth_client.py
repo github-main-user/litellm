@@ -184,3 +184,87 @@ def test_token_bundle_round_trip() -> None:
     )
 
     assert ChatGPTTokens.from_json(tokens.to_json()) == tokens
+
+
+@pytest.mark.asyncio
+async def test_refresh_without_id_token_preserves_identity_and_rotates_refresh_token() -> None:
+    previous = ChatGPTTokens("access-old", "refresh-old", "id-old", 1, "account-old")
+    access = _jwt({"exp": int(time.time()) + 3600})
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"access_token": access, "refresh_token": "rotated"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        tokens = await ChatGPTOAuthClient(async_http_client=transport).async_refresh(previous)
+
+    assert tokens == ChatGPTTokens(access, "rotated", previous.id_token, ChatGPTOAuthClient.get_expires_at(access), "account-old")
+    assert requests[0]["refresh_token"] == previous.refresh_token
+
+
+@pytest.mark.parametrize("status,payload,reason", [
+    (400, {"error": "invalid_grant"}, "invalid_grant"),
+    (401, {"error": {"code": "refresh_token_reused", "message": "secret"}}, "credential_revoked"),
+    (403, {"error": {"type": "refresh_token_revoked"}}, "credential_revoked"),
+    (400, {"error": "invalid_request", "error_description": "invalid_grant secret"}, None),
+    (401, {"error": "unauthorized"}, None),
+    (429, {"error": "invalid_grant"}, None),
+    (503, {"error": "invalid_grant"}, None),
+    (400, ["invalid_grant"], None),
+])
+def test_refresh_failure_classification_uses_only_explicit_oauth_error_codes(status, payload, reason) -> None:
+    from litellm.llms.chatgpt.oauth_client import ChatGPTRefreshError
+
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status, json=payload))) as transport:
+        with pytest.raises(ChatGPTRefreshError) as caught:
+            ChatGPTOAuthClient(transport).refresh("refresh-secret")
+
+    assert caught.value.status_code == status
+    assert caught.value.reason == reason
+    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_async_refresh_total_deadline_bounds_multiple_http_waits(monkeypatch) -> None:
+    import asyncio
+
+    from litellm.llms.chatgpt import oauth_client
+
+    stopped = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        try:
+            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.03)
+            return httpx.Response(200, json={"access_token": "too-late"})
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(oauth_client, "CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS", 0.05)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        with pytest.raises(oauth_client.ChatGPTRefreshError) as caught:
+            await ChatGPTOAuthClient(async_http_client=transport).async_refresh(
+                ChatGPTTokens("access", "refresh", "id", 1, "account")
+            )
+
+    assert caught.value.status_code == 504
+    assert caught.value.reason is None
+    assert stopped.is_set()
+
+
+def test_sync_refresh_can_retain_previous_id_and_refresh_token() -> None:
+    previous = ChatGPTTokens("old-access", "old-refresh", "old-id", 1, "account")
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"access_token": "new-access"}))) as transport:
+        refreshed = ChatGPTOAuthClient(transport).refresh(previous)
+    assert refreshed == ChatGPTTokens("new-access", previous.refresh_token, previous.id_token, None, previous.account_id)
+
+
+def test_sync_refresh_without_previous_id_preserves_rotated_bundle_round_trip() -> None:
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
+        200, json={"access_token": "new-access", "refresh_token": "rotated-refresh"}
+    ))) as transport:
+        refreshed = ChatGPTOAuthClient(transport).refresh("old-refresh")
+    assert refreshed.refresh_token == "rotated-refresh"
+    assert ChatGPTTokens.from_json(refreshed.to_json()) == refreshed

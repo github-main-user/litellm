@@ -3,6 +3,9 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Mapping
+from datetime import timedelta
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,8 +24,11 @@ from litellm.llms.chatgpt.common_utils import (
     ChatGPTAuthError,
 )
 from litellm.llms.chatgpt.oauth_client import (
+    CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS,
     ChatGPTDeviceCode,
     ChatGPTOAuthClient,
+    ChatGPTRefreshClient,
+    ChatGPTRefreshError,
     ChatGPTTokens,
     ManagedChatGPTAccessToken,
 )
@@ -45,6 +51,12 @@ CREDENTIAL_PROXY_VALUE_KEY: Final = "litellm_internal_proxy_url"
 CHATGPT_CREDENTIAL_PROVIDER: Final = "chatgpt"
 CHATGPT_CREDENTIAL_AUTH_TYPE: Final = "oauth"
 CHATGPT_TOKEN_EXPIRY_SKEW_SECONDS: Final = 60
+CHATGPT_REFRESH_LOCK_WAIT_SECONDS: Final = 15
+CHATGPT_REFRESH_TRANSACTION_TIMEOUT: Final = timedelta(
+    seconds=CHATGPT_REFRESH_LOCK_WAIT_SECONDS + CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS + 45
+)
+CHATGPT_REAUTH_REQUIRED_TOKEN_KEY: Final = "chatgpt_reauth_required_token"
+CHATGPT_REAUTH_REQUIRED_REASON_KEY: Final = "chatgpt_reauth_required_reason"
 CHATGPT_DEVICE_CODE_LIFETIME_SECONDS: Final = 15 * 60
 _CREDENTIAL_NAME_PATTERN: Final = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
@@ -183,6 +195,33 @@ def _decrypt_credential(credential: CredentialItem) -> CredentialItem:
     )
 
 
+def _clear_refresh_block(info: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType({
+        key: value for key, value in info.items()
+        if key not in (CHATGPT_REAUTH_REQUIRED_TOKEN_KEY, CHATGPT_REAUTH_REQUIRED_REASON_KEY)
+    })
+
+
+async def _attempt_refresh(
+    client: ChatGPTRefreshClient, previous: ChatGPTTokens
+) -> ChatGPTTokens | ChatGPTRefreshError:
+    try:
+        return await client.async_refresh(previous)
+    except ChatGPTRefreshError as error:
+        if error.reason is None:
+            raise
+        return error
+
+
+def _check_refresh_block(credential: CredentialItem, tokens: ChatGPTTokens) -> None:
+    if credential.credential_info.get(CHATGPT_REAUTH_REQUIRED_TOKEN_KEY) == hashlib.sha256(
+        tokens.refresh_token.encode()
+    ).hexdigest():
+        raise ChatGPTRefreshError(
+            message="ChatGPT credential requires reconnection", status_code=401, reason="invalid_grant"
+        )
+
+
 def _find_credential(credential_name: str) -> CredentialItem | None:
     return next(
         (credential for credential in litellm.credential_list if credential.credential_name == credential_name),
@@ -242,7 +281,10 @@ async def _store_tokens(
     lock_key: Final = int.from_bytes(
         hashlib.blake2b(credential_name.encode(), digest_size=8).digest(), "big", signed=True
     )
-    async with prisma_client.db.tx() as transaction:
+    async with prisma_client.db.tx(timeout=CHATGPT_REFRESH_TRANSACTION_TIMEOUT) as transaction:
+        await transaction.execute_raw(
+            f"SET LOCAL lock_timeout = '{CHATGPT_REFRESH_LOCK_WAIT_SECONDS * 1000}ms'"
+        )
         await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
         row: Final = await transaction.litellm_credentialstable.find_unique(
             where={"credential_name": credential_name}
@@ -282,7 +324,7 @@ async def _store_tokens(
             plaintext = _DatabaseChatGPTCredential(
                 credential_name=credential_name,
                 credential_info={
-                    **(row.credential_info or {}),
+                    **_clear_refresh_block(row.credential_info or {}),
                     **plaintext.credential_info,
                 },
                 credential_values=plaintext.credential_values,
@@ -386,10 +428,12 @@ async def poll_chatgpt_oauth(
 
 
 class ChatGPTOAuthCredentialHook(CustomLogger):
-    def __init__(self, oauth_client: ChatGPTOAuthClient | None = None) -> None:
+    def __init__(self, oauth_client: ChatGPTRefreshClient | None = None) -> None:
         super().__init__()
         self._oauth_client = oauth_client or ChatGPTOAuthClient()
-        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._refresh_tasks: dict[
+            tuple[asyncio.AbstractEventLoop, str, str | None], asyncio.Task[ChatGPTTokens]
+        ] = {}
 
     async def async_pre_call_deployment_hook(
         self,
@@ -422,7 +466,9 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
             ) from error
         return {
             **kwargs,
-            "api_key": ManagedChatGPTAccessToken(tokens.access_token),
+            "api_key": ManagedChatGPTAccessToken(
+                tokens.access_token, account_id=tokens.account_id, credential_name=credential_name
+            ),
             "chatgpt_auth_account_id": tokens.account_id,
         }
 
@@ -451,16 +497,54 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         CredentialAccessor.upsert_credentials([credential])
         return credential
 
+    async def recover_after_unauthorized(
+        self, credential_name: str, rejected_access_token: str
+    ) -> ChatGPTTokens | None:
+        if not credential_name or not rejected_access_token:
+            return None
+        try:
+            recovered: Final = await self._run_refresh(credential_name, rejected_access_token)
+        except ChatGPTRefreshError as error:
+            if error.reason is not None:
+                return None
+            raise
+        return recovered if recovered.access_token != rejected_access_token else None
+
     async def _get_tokens(self, credential_name: str) -> ChatGPTTokens:
         cached: Final = self._read_cached_tokens(credential_name)
         if self._is_fresh(cached):
             return cached
-        lock: Final = self._refresh_locks.setdefault(credential_name, asyncio.Lock())
-        async with lock:
-            rechecked: Final = self._read_cached_tokens(credential_name)
-            if self._is_fresh(rechecked):
-                return rechecked
-            return await self._refresh_tokens(credential_name)
+        return await self._run_refresh(credential_name)
+
+    async def _run_refresh(
+        self, credential_name: str, rejected_access_token: str | None = None
+    ) -> ChatGPTTokens:
+        key: Final = (asyncio.get_running_loop(), credential_name, rejected_access_token)
+        existing: Final = self._refresh_tasks.get(key)
+        if existing is not None:
+            return await asyncio.shield(existing)
+        task: Final = asyncio.create_task(self._refresh_if_needed(credential_name, rejected_access_token))
+        self._refresh_tasks[key] = task
+        task.add_done_callback(lambda finished: self._refresh_done(key, finished))
+        return await asyncio.shield(task)
+
+    def _refresh_done(
+        self,
+        key: tuple[asyncio.AbstractEventLoop, str, str | None],
+        task: asyncio.Task[ChatGPTTokens],
+    ) -> None:
+        self._refresh_tasks.pop(key, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _refresh_if_needed(
+        self, credential_name: str, rejected_access_token: str | None
+    ) -> ChatGPTTokens:
+        if rejected_access_token is None:
+            cached: Final = self._read_cached_tokens(credential_name)
+            if self._is_fresh(cached):
+                return cached
+        return await self._refresh_tokens(credential_name, rejected_access_token=rejected_access_token)
 
     def _read_cached_tokens(self, credential_name: str) -> ChatGPTTokens:
         credential: Final = _find_credential(credential_name)
@@ -469,99 +553,103 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
         tokens: Final = _tokens_from_credential(credential)
         if tokens is None:
             raise ValueError("Credential does not contain ChatGPT OAuth tokens")
+        _check_refresh_block(credential, tokens)
         return tokens
 
     @staticmethod
     def _is_fresh(tokens: ChatGPTTokens) -> bool:
         return tokens.expires_at is not None and time.time() < tokens.expires_at - CHATGPT_TOKEN_EXPIRY_SKEW_SECONDS
 
-    async def _refresh_tokens(self, credential_name: str) -> ChatGPTTokens:
+    async def _refresh_tokens(
+        self, credential_name: str, *, rejected_access_token: str | None = None
+    ) -> ChatGPTTokens:
         from litellm.proxy.proxy_server import prisma_client
 
         if prisma_client is None:
             raise RuntimeError("Database not connected")
         lock_key: Final = int.from_bytes(
-            hashlib.blake2b(credential_name.encode(), digest_size=8).digest(),
-            "big",
-            signed=True,
+            hashlib.blake2b(credential_name.encode(), digest_size=8).digest(), "big", signed=True
         )
-        refreshed: ChatGPTTokens
-        credential_info: dict[str, Any]
-        async with prisma_client.db.tx() as transaction:
+        async with prisma_client.db.tx(timeout=CHATGPT_REFRESH_TRANSACTION_TIMEOUT) as transaction:
+            await transaction.execute_raw(
+                f"SET LOCAL lock_timeout = '{CHATGPT_REFRESH_LOCK_WAIT_SECONDS * 1000}ms'"
+            )
             await transaction.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
-            row = await transaction.litellm_credentialstable.find_unique(
+            row: Final = await transaction.litellm_credentialstable.find_unique(
                 where={"credential_name": credential_name}
             )
-            if row is None:
-                raise ValueError("Credential not found")
-            encrypted_value: Final = row.credential_values.get(CHATGPT_CREDENTIAL_VALUE_KEY)
-            decrypted_value: Final = (
-                decrypt_value_helper(encrypted_value, CHATGPT_CREDENTIAL_VALUE_KEY)
-                if isinstance(encrypted_value, str)
-                else None
+            if row is None or not _is_chatgpt_oauth_credential(row):
+                raise ValueError("Credential is not a managed ChatGPT OAuth credential")
+            stored: Final = _tokens_from_encrypted_credential(row)
+            if stored is None:
+                raise ValueError("Credential token bundle cannot be decrypted")
+            _check_refresh_block(row, stored)
+            proxy_url: Final = _proxy_from_row(row)
+            should_refresh: Final = (
+                stored.access_token == rejected_access_token if rejected_access_token is not None
+                else not self._is_fresh(stored)
             )
-            if not isinstance(decrypted_value, str):
-                raise TypeError("Credential token bundle cannot be decrypted")
-            stored: Final = ChatGPTTokens.from_json(decrypted_value)
-            proxy_url = _proxy_from_row(row)
-            if self._is_fresh(stored):
-                refreshed = stored
-            else:
-                refresh_client: Final = (
-                    ChatGPTOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
-                )
-                refreshed = await asyncio.to_thread(refresh_client.refresh, stored.refresh_token)
-                latest_row: Final = await transaction.litellm_credentialstable.find_unique(
-                    where={"credential_name": credential_name}
-                )
-                if latest_row is None:
-                    raise ValueError("Credential was removed during refresh")
-                row = latest_row
-                proxy_url = _proxy_from_row(row)
-                encrypted_bundle: Final = encrypt_value_helper(refreshed.to_json())
-                if not isinstance(encrypted_bundle, str):
-                    raise ValueError("Credential token bundle cannot be encrypted")
-                await transaction.litellm_credentialstable.update(
-                    where={"credential_name": credential_name},
-                    data=jsonify_object({
-                        "credential_values": {
-                            **row.credential_values,
-                            CHATGPT_CREDENTIAL_VALUE_KEY: encrypted_bundle,
-                        },
-                        "credential_info": {
-                            **(row.credential_info or {}),
-                            "provider": CHATGPT_CREDENTIAL_PROVIDER,
-                            "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
-                            "proxy_configured": proxy_url is not None,
-                        },
-                        "updated_by": "litellm-chatgpt-oauth",
-                    }),
-                )
-            credential_info = {
-                **(row.credential_info or {}),
+            if not should_refresh:
+                CredentialAccessor.upsert_credentials([_decrypt_credential(row)])
+                return stored
+            refresh_client: Final = (
+                ChatGPTOAuthClient(proxy_url=proxy_url) if proxy_url is not None else self._oauth_client
+            )
+            attempt: Final = await _attempt_refresh(refresh_client, stored)
+            refresh_failure: Final = attempt if isinstance(attempt, ChatGPTRefreshError) else None
+            candidate: Final = stored if isinstance(attempt, ChatGPTRefreshError) else attempt
+            latest_row: Final = await transaction.litellm_credentialstable.find_unique(
+                where={"credential_name": credential_name}
+            )
+            if latest_row is None or not _is_chatgpt_oauth_credential(latest_row):
+                raise ValueError("Credential changed during refresh")
+            latest_tokens: Final = _tokens_from_encrypted_credential(latest_row)
+            if latest_tokens is None:
+                raise ValueError("Credential token bundle cannot be decrypted")
+            latest_proxy: Final = _proxy_from_row(latest_row)
+            if latest_tokens != stored:
+                _check_refresh_block(latest_row, latest_tokens)
+                CredentialAccessor.upsert_credentials([_decrypt_credential(latest_row)])
+                return latest_tokens
+            if stored.account_id is not None and candidate.account_id != stored.account_id:
+                raise ValueError("ChatGPT account identity changed during refresh")
+            info: Final = {
+                **_clear_refresh_block(latest_row.credential_info or {}),
                 "provider": CHATGPT_CREDENTIAL_PROVIDER,
                 "auth_type": CHATGPT_CREDENTIAL_AUTH_TYPE,
+                "proxy_configured": latest_proxy is not None,
+                **({
+                    CHATGPT_REAUTH_REQUIRED_TOKEN_KEY: hashlib.sha256(stored.refresh_token.encode()).hexdigest(),
+                    CHATGPT_REAUTH_REQUIRED_REASON_KEY: refresh_failure.reason,
+                } if refresh_failure is not None else {}),
             }
-            plaintext_proxy: Final = _proxy_from_row(row)
-            credential_info["proxy_configured"] = bool(plaintext_proxy)
-        await publish_config_change_for_object_type("litellm_credentialstable")
-        CredentialAccessor.upsert_credentials(
-            [
-                _DatabaseChatGPTCredential(
-                    credential_name=credential_name,
-                    credential_info=credential_info,
-                    credential_values={
-                        CHATGPT_CREDENTIAL_VALUE_KEY: refreshed.to_json(),
-                        **(
-                            {CREDENTIAL_PROXY_VALUE_KEY: plaintext_proxy}
-                            if isinstance(plaintext_proxy, str) and plaintext_proxy
-                            else {}
-                        ),
+            encrypted_bundle: Final = encrypt_value_helper(candidate.to_json())
+            if not isinstance(encrypted_bundle, str):
+                raise ValueError("Credential token bundle cannot be encrypted")
+            await transaction.litellm_credentialstable.update(
+                where={"credential_name": credential_name},
+                data=jsonify_object({
+                    "credential_values": {
+                        **latest_row.credential_values,
+                        CHATGPT_CREDENTIAL_VALUE_KEY: encrypted_bundle,
                     },
-                )
-            ]
-        )
-        return refreshed
+                    "credential_info": info,
+                    "updated_by": "litellm-chatgpt-oauth",
+                }),
+            )
+            plaintext: Final = _DatabaseChatGPTCredential(
+                credential_name=credential_name,
+                credential_info=info,
+                credential_values={
+                    CHATGPT_CREDENTIAL_VALUE_KEY: candidate.to_json(),
+                    **({CREDENTIAL_PROXY_VALUE_KEY: latest_proxy} if latest_proxy is not None else {}),
+                },
+            )
+        CredentialAccessor.upsert_credentials([plaintext])
+        await publish_config_change_for_object_type("litellm_credentialstable")
+        if refresh_failure is not None:
+            raise refresh_failure
+        return candidate
 
 
 def get_chatgpt_oauth_credential_hook() -> ChatGPTOAuthCredentialHook:

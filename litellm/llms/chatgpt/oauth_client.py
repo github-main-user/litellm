@@ -1,11 +1,14 @@
+import asyncio
 import base64
 import binascii
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, Literal, Protocol
 from urllib.parse import urlencode
 
 import httpx
+from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.credential_proxy import validate_proxy_url
@@ -21,6 +24,33 @@ from .common_utils import (
     GetDeviceCodeError,
     RefreshAccessTokenError,
 )
+
+CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS: Final = 30.0
+RefreshFailureReason = Literal["invalid_grant", "credential_revoked"]
+_OBJECT: Final = TypeAdapter(dict[str, object])
+
+
+class ChatGPTRefreshError(RefreshAccessTokenError):
+    def __init__(
+        self,
+        message: str,
+        status_code: int,
+        *,
+        reason: RefreshFailureReason | None = None,
+    ) -> None:
+        super().__init__(message=message, status_code=status_code)
+        self.reason = reason
+
+
+class _ChatGPTRefreshBody(TypedDict):
+    client_id: ReadOnly[str]
+    grant_type: ReadOnly[str]
+    refresh_token: ReadOnly[str]
+    scope: ReadOnly[str]
+
+
+class AsyncRefreshHTTPClient(Protocol):
+    async def post(self, url: str, *, json: _ChatGPTRefreshBody) -> httpx.Response: ...
 
 
 class SyncHTTPClient(Protocol):
@@ -68,7 +98,7 @@ class ChatGPTTokens:
             raise ValueError("ChatGPT access token is missing")
         if not isinstance(refresh_token, str) or not refresh_token:
             raise ValueError("ChatGPT refresh token is missing")
-        if not isinstance(id_token, str) or not id_token:
+        if not isinstance(id_token, str):
             raise ValueError("ChatGPT ID token is missing")
         return cls(
             access_token=access_token,
@@ -86,8 +116,21 @@ class ChatGPTTokens:
         return cls.from_mapping(parsed)
 
 
+class ChatGPTRefreshClient(Protocol):
+    async def async_refresh(self, previous: ChatGPTTokens) -> ChatGPTTokens: ...
+
+
 class ManagedChatGPTAccessToken(str):
-    pass
+    account_id: str | None
+    credential_name: str | None
+
+    def __new__(
+        cls, value: str, *, account_id: str | None = None, credential_name: str | None = None
+    ) -> "ManagedChatGPTAccessToken":
+        token: Final = super().__new__(cls, value)
+        token.account_id = account_id
+        token.credential_name = credential_name
+        return token
 
 
 def require_managed_chatgpt_access_token(model: str, credential_name: object, access_token: str | None) -> str:
@@ -106,9 +149,11 @@ class ChatGPTOAuthClient:
         http_client: SyncHTTPClient | HTTPHandler | None = None,
         *,
         proxy_url: str | None = None,
+        async_http_client: AsyncRefreshHTTPClient | None = None,
     ) -> None:
-        if http_client is not None and proxy_url is not None:
+        if (http_client is not None or async_http_client is not None) and proxy_url is not None:
             raise ValueError("http_client and proxy_url cannot be used together")
+        self._async_http_client = async_http_client
         self._http_client = http_client
         self._proxy_url = validate_proxy_url(proxy_url) if proxy_url is not None else None
 
@@ -218,34 +263,95 @@ class ChatGPTOAuthClient:
             ) from None
         return self._tokens_from_response(data=data, error_type=GetAccessTokenError)
 
-    def refresh(self, refresh_token: str) -> ChatGPTTokens:
+    def refresh(self, refresh_token: str | ChatGPTTokens) -> ChatGPTTokens:
+        previous: Final = refresh_token if isinstance(refresh_token, ChatGPTTokens) else None
+        token: Final = refresh_token.refresh_token if isinstance(refresh_token, ChatGPTTokens) else refresh_token
         try:
-            response: Final = self._post(
-                CHATGPT_OAUTH_TOKEN_URL,
-                json={
-                    "client_id": CHATGPT_CLIENT_ID,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "scope": "openid profile email",
-                },
-            )
-            response.raise_for_status()
-            data: Final = response.json()
+            response: Final = self._post(CHATGPT_OAUTH_TOKEN_URL, json=self._refresh_body(token))
+            return self._refresh_response(response, token, previous)
         except httpx.HTTPStatusError as exc:
-            raise RefreshAccessTokenError(
-                message=f"Refresh token failed: HTTP {exc.response.status_code}",
-                status_code=exc.response.status_code,
-            ) from None
+            raise self._refresh_status_error(exc.response) from None
+        except RefreshAccessTokenError:
+            raise
         except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
-            raise RefreshAccessTokenError(
-                message="Refresh token failed",
-                status_code=400,
-            ) from None
-        return self._tokens_from_response(
-            data=data,
+            raise ChatGPTRefreshError(message="Refresh token failed", status_code=503) from None
+
+    async def async_refresh(self, previous: ChatGPTTokens) -> ChatGPTTokens:
+        try:
+            response: Final = await asyncio.wait_for(
+                self._post_refresh(previous.refresh_token),
+                timeout=CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS,
+            )
+            return self._refresh_response(response, previous.refresh_token, previous)
+        except httpx.HTTPStatusError as exc:
+            raise self._refresh_status_error(exc.response) from None
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            raise ChatGPTRefreshError(message="Refresh token timed out", status_code=504) from None
+        except RefreshAccessTokenError:
+            raise
+        except Exception:  # noqa: BLE001  # OAuth failures must not expose proxy or token details
+            raise ChatGPTRefreshError(message="Refresh token failed", status_code=503) from None
+
+    async def _post_refresh(self, refresh_token: str) -> httpx.Response:
+        body: Final = self._refresh_body(refresh_token)
+        if self._async_http_client is not None:
+            return await self._async_http_client.post(CHATGPT_OAUTH_TOKEN_URL, json=body)
+        async with httpx.AsyncClient(
+            proxy=self._proxy_url,
+            trust_env=False,
+            timeout=CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS,
+        ) as client:
+            return await client.post(CHATGPT_OAUTH_TOKEN_URL, json=body)
+
+    @staticmethod
+    def _refresh_body(refresh_token: str) -> _ChatGPTRefreshBody:
+        return {
+            "client_id": CHATGPT_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        }
+
+    @classmethod
+    def _refresh_response(
+        cls, response: httpx.Response, refresh_token: str, previous: ChatGPTTokens | None
+    ) -> ChatGPTTokens:
+        response.raise_for_status()
+        return cls._tokens_from_response(
+            data=_OBJECT.validate_json(response.content),
             fallback_refresh_token=refresh_token,
-            error_type=RefreshAccessTokenError,
+            fallback_id_token=previous.id_token if previous is not None else "",
+            fallback_account_id=previous.account_id if previous is not None else None,
+            error_type=ChatGPTRefreshError,
         )
+
+    @staticmethod
+    def _refresh_status_error(response: httpx.Response) -> ChatGPTRefreshError:
+        return ChatGPTRefreshError(
+            message=f"Refresh token failed: HTTP {response.status_code}",
+            status_code=response.status_code,
+            reason=ChatGPTOAuthClient._refresh_failure_reason(response),
+        )
+
+    @staticmethod
+    def _refresh_failure_reason(response: httpx.Response) -> RefreshFailureReason | None:
+        if response.status_code not in (400, 401, 403):
+            return None
+        try:
+            payload: Final = _OBJECT.validate_json(response.content)
+            error: Final = payload.get("error")
+            detail: Final = _OBJECT.validate_python(error) if isinstance(error, dict) else {}
+        except ValueError:
+            return None
+        code: Final = (detail.get("code") or detail.get("type")) if isinstance(error, dict) else error
+        if code == "invalid_grant":
+            return "invalid_grant"
+        if code in (
+            "token_revoked", "refresh_token_revoked", "refresh_token_expired",
+            "refresh_token_reused", "refresh_token_invalidated",
+        ):
+            return "credential_revoked"
+        return None
 
     def _post(self, url: str, **kwargs: Any) -> httpx.Response:
         if self._http_client is not None:
@@ -269,25 +375,27 @@ class ChatGPTOAuthClient:
     @classmethod
     def _tokens_from_response(
         cls,
-        data: dict[str, Any],
+        data: dict[str, object],
         error_type: type[GetAccessTokenError] | type[RefreshAccessTokenError],
         fallback_refresh_token: str | None = None,
+        fallback_id_token: str | None = None,
+        fallback_account_id: str | None = None,
     ) -> ChatGPTTokens:
         access_token: Final = data.get("access_token")
         refresh_token: Final = data.get("refresh_token") or fallback_refresh_token
-        id_token: Final = data.get("id_token")
+        id_token: Final = data.get("id_token") or fallback_id_token
         if not isinstance(access_token, str) or not access_token:
             raise error_type(message="Token response missing access token", status_code=400)
         if not isinstance(refresh_token, str) or not refresh_token:
             raise error_type(message="Token response missing refresh token", status_code=400)
-        if not isinstance(id_token, str) or not id_token:
+        if not isinstance(id_token, str) or (not id_token and fallback_id_token is None):
             raise error_type(message="Token response missing ID token", status_code=400)
         return ChatGPTTokens(
             access_token=access_token,
             refresh_token=refresh_token,
             id_token=id_token,
             expires_at=cls.get_expires_at(access_token),
-            account_id=cls.extract_account_id(id_token or access_token),
+            account_id=cls.extract_account_id(id_token or access_token) or fallback_account_id,
         )
 
     @staticmethod

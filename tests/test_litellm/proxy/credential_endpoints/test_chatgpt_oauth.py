@@ -147,7 +147,7 @@ async def test_hook_loads_oauth_credential_from_database_on_cache_miss() -> None
             ),
             patch(
                 "litellm.proxy.credential_endpoints.chatgpt_oauth.decrypt_value_helper",
-                side_effect=lambda value, key: value,
+                side_effect=lambda value, key, **kwargs: value,
             ),
         ):
             resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
@@ -221,7 +221,7 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
     prisma_client = MagicMock()
     prisma_client.db.tx.return_value = transaction_context
     oauth_client = MagicMock()
-    oauth_client.refresh.return_value = fresh
+    oauth_client.async_refresh = AsyncMock(return_value=fresh)
     hook = ChatGPTOAuthCredentialHook(oauth_client=oauth_client)
 
     try:
@@ -229,7 +229,7 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
             patch("litellm.proxy.proxy_server.prisma_client", prisma_client),
             patch(
                 "litellm.proxy.credential_endpoints.chatgpt_oauth.decrypt_value_helper",
-                side_effect=lambda value, key: value,
+                side_effect=lambda value, key, **kwargs: value,
             ),
             patch(
                 "litellm.proxy.credential_endpoints.chatgpt_oauth.encrypt_value_helper",
@@ -245,7 +245,7 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
 
     assert first == fresh
     assert second == fresh
-    oauth_client.refresh.assert_called_once_with("refresh-old")
+    oauth_client.async_refresh.assert_awaited_once_with(expired)
     transaction.litellm_credentialstable.update.assert_awaited_once()
     persisted = transaction.litellm_credentialstable.update.call_args.kwargs["data"]
     assert json.loads(persisted["credential_values"]) == {CHATGPT_CREDENTIAL_VALUE_KEY: fresh.to_json()}
@@ -286,11 +286,11 @@ async def test_start_poll_store_reconnect_uses_override_and_encrypts_until_succe
     class Transaction:
         litellm_credentialstable = Table()
 
-        async def execute_raw(self, query, key):
+        async def execute_raw(self, query, key=None):
             return None
 
     class Database:
-        def tx(self):
+        def tx(self, **kwargs):
             @asynccontextmanager
             async def context():
                 yield Transaction()
@@ -300,7 +300,10 @@ async def test_start_poll_store_reconnect_uses_override_and_encrypts_until_succe
     previous = litellm.credential_list
     with patch.dict("os.environ", {"LITELLM_SALT_KEY": "chatgpt-proxy-lifecycle-key"}):
         row = SimpleNamespace(
-            credential_info={"provider": "chatgpt", "auth_type": "oauth", "custom": "preserved"},
+            credential_info={
+                "provider": "chatgpt", "auth_type": "oauth", "custom": "preserved",
+                "chatgpt_reauth_required_token": "old-block", "chatgpt_reauth_required_reason": "invalid_grant",
+            },
             credential_values={
                 CHATGPT_CREDENTIAL_VALUE_KEY: encrypt_value_helper(old_tokens.to_json()),
                 CREDENTIAL_PROXY_VALUE_KEY: encrypt_value_helper(old_proxy),
@@ -341,6 +344,8 @@ async def test_start_poll_store_reconnect_uses_override_and_encrypts_until_succe
 
     assert connected.status == "connected"
     assert calls == [new_proxy, new_proxy]
+    info = json.loads(updated[0]["credential_info"])
+    assert info == {"provider": "chatgpt", "auth_type": "oauth", "custom": "preserved", "proxy_configured": True}
     values = updated[0]["credential_values"]
     if isinstance(values, str):
         values = json.loads(values)
@@ -482,7 +487,7 @@ async def test_chatgpt_database_required_proxy_fails_closed(monkeypatch, operati
     prisma = MagicMock()
     prisma.db.tx.return_value = context
     client = MagicMock()
-    client.refresh.return_value = tokens
+    client.async_refresh = AsyncMock(return_value=tokens)
     hook = ChatGPTOAuthCredentialHook(oauth_client=client)
     prisma.db.litellm_credentialstable.find_unique = AsyncMock(return_value=vars(row))
     with (
@@ -498,8 +503,279 @@ async def test_chatgpt_database_required_proxy_fails_closed(monkeypatch, operati
             else:
                 await hook._refresh_tokens("subscription")
     if operation != "refresh-latest":
-        client.refresh.assert_not_called()
+        client.async_refresh.assert_not_awaited()
     transaction.litellm_credentialstable.update.assert_not_awaited()
     transaction.litellm_credentialstable.create.assert_not_awaited()
     assert litellm.credential_list == []
     assert row.credential_info["proxy_configured"] is True
+
+
+def _refresh_database(monkeypatch, tokens, info=None):
+    from copy import deepcopy
+
+    monkeypatch.setenv("LITELLM_SALT_KEY", "chatgpt-refresh-regression-key")
+    monkeypatch.setattr(litellm, "credential_list", [_DatabaseChatGPTCredential(
+        credential_name="subscription",
+        credential_info={"provider": "chatgpt", "auth_type": "oauth"},
+        credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: tokens.to_json()},
+    )])
+
+    class Database:
+        def __init__(self):
+            self.row = CredentialItem(
+                credential_name="subscription",
+                credential_info={"provider": "chatgpt", "auth_type": "oauth", **(info or {})},
+                credential_values={CHATGPT_CREDENTIAL_VALUE_KEY: encrypt_value_helper(tokens.to_json()), "other": "untouched"},
+            )
+            self.lock = asyncio.Lock()
+            self.commits = 0
+            self.options = []
+            self.queries = []
+            self.reads = 0
+
+        def tx(self, **kwargs):
+            self.options.append(kwargs)
+
+            @asynccontextmanager
+            async def context():
+                async with self.lock:
+                    database = self
+                    snapshot = deepcopy(self.row)
+                    self.active_row = snapshot
+
+                    class Table:
+                        async def find_unique(self, *, where):
+                            database.reads += 1
+                            return snapshot
+
+                        async def update(self, *, where, data):
+                            for key in ("credential_info", "credential_values"):
+                                if key in data:
+                                    setattr(snapshot, key, json.loads(data[key]))
+
+                    class Transaction:
+                        litellm_credentialstable = Table()
+
+                        async def execute_raw(self, query, *args):
+                            database.queries.append((query, args))
+
+                    yield Transaction()
+                    self.row = snapshot
+                    self.commits += 1
+
+            return context()
+
+    database = Database()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database))
+    monkeypatch.setattr(
+        "litellm.proxy.credential_endpoints.chatgpt_oauth.publish_config_change_for_object_type", AsyncMock()
+    )
+    return database
+
+
+def _persisted_tokens(database):
+    return ChatGPTTokens.from_json(decrypt_value_helper(
+        database.row.credential_values[CHATGPT_CREDENTIAL_VALUE_KEY], CHATGPT_CREDENTIAL_VALUE_KEY
+    ))
+
+
+def test_recovery_singleflight_can_be_reused_across_sync_event_loops(monkeypatch):
+    old = ChatGPTTokens("old-access", "old-refresh", "old-id", 1, "account")
+    fresh = ChatGPTTokens("new-access", "new-refresh", "old-id", int(time.time()) + 3600, "account")
+
+    class OAuthClient:
+        async def async_refresh(self, previous):
+            assert previous == old
+            await asyncio.sleep(0)
+            return fresh
+
+    hook = ChatGPTOAuthCredentialHook(OAuthClient())
+
+    async def wave():
+        database = _refresh_database(monkeypatch, old)
+        recovered = await asyncio.gather(*(
+            hook.recover_after_unauthorized("subscription", old.access_token) for _ in range(3)
+        ))
+        assert recovered == [fresh] * 3
+        assert _persisted_tokens(database) == fresh
+        assert database.commits == 1
+
+    asyncio.run(wave())
+    asyncio.run(wave())
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_recovery_forces_unexpired_refresh_and_singleflights_across_hooks(monkeypatch):
+    import httpx
+
+    from litellm.llms.chatgpt.oauth_client import CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS, ChatGPTOAuthClient
+    from litellm.proxy.credential_endpoints.chatgpt_oauth import CHATGPT_REFRESH_LOCK_WAIT_SECONDS
+
+    old = ChatGPTTokens("old-access", "old-refresh", "old-id", int(time.time()) + 3600, "account")
+    database = _refresh_database(monkeypatch, old)
+    requests = []
+
+    async def handler(request):
+        requests.append(json.loads(request.content))
+        await asyncio.sleep(0)
+        return httpx.Response(200, json={"access_token": "new-access", "refresh_token": "new-refresh"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = ChatGPTOAuthClient(async_http_client=transport)
+        first = ChatGPTOAuthCredentialHook(client)
+        second = ChatGPTOAuthCredentialHook(client)
+        recovered = await asyncio.gather(
+            first.recover_after_unauthorized("subscription", old.access_token),
+            first.recover_after_unauthorized("subscription", old.access_token),
+            second.recover_after_unauthorized("subscription", old.access_token),
+        )
+
+    expected = ChatGPTTokens("new-access", "new-refresh", old.id_token, None, old.account_id)
+    assert recovered == [expected] * 3
+    assert _persisted_tokens(database) == expected
+    assert len(requests) == 1
+    assert requests[0]["refresh_token"] == old.refresh_token
+    assert database.row.credential_values["other"] == "untouched"
+    assert all(
+        option["timeout"].total_seconds() > CHATGPT_REFRESH_HTTP_TIMEOUT_SECONDS + CHATGPT_REFRESH_LOCK_WAIT_SECONDS
+        for option in database.options
+    )
+    assert any("lock_timeout" in query for query, args in database.queries)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,error,permanent", [
+    (400, "invalid_grant", True), (401, "refresh_token_reused", True),
+    (401, "unauthorized", False), (429, "invalid_grant", False), (503, "invalid_grant", False),
+])
+async def test_refresh_rejection_commits_token_scoped_block_but_transient_errors_retry(monkeypatch, status, error, permanent):
+    import hashlib
+
+    import httpx
+
+    from litellm.llms.chatgpt.oauth_client import ChatGPTOAuthClient, ChatGPTRefreshError
+    from litellm.proxy.credential_endpoints.chatgpt_oauth import CHATGPT_REAUTH_REQUIRED_TOKEN_KEY
+
+    old = ChatGPTTokens("old-access", "old-refresh", "old-id", int(time.time()) + 3600, "account")
+    database = _refresh_database(monkeypatch, old)
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json={"error": error, "error_description": "never expose this secret"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = ChatGPTOAuthClient(async_http_client=transport)
+        for _ in range(2):
+            hook = ChatGPTOAuthCredentialHook(client)
+            monkeypatch.setattr(litellm, "credential_list", [])
+            if permanent:
+                assert await hook.recover_after_unauthorized("subscription", old.access_token) is None
+            else:
+                with pytest.raises(ChatGPTRefreshError) as caught:
+                    await hook.recover_after_unauthorized("subscription", old.access_token)
+                assert caught.value.reason is None
+                assert "secret" not in str(caught.value)
+
+        assert len(requests) == (1 if permanent else 2)
+        assert _persisted_tokens(database) == old
+        if permanent:
+            assert database.commits == 1
+            assert database.row.credential_info[CHATGPT_REAUTH_REQUIRED_TOKEN_KEY] == hashlib.sha256(old.refresh_token.encode()).hexdigest()
+            assert "disabled" not in database.row.credential_info
+            new = ChatGPTTokens("other-access", "other-refresh", old.id_token, old.expires_at, old.account_id)
+            database.row.credential_values[CHATGPT_CREDENTIAL_VALUE_KEY] = encrypt_value_helper(new.to_json())
+            assert await ChatGPTOAuthCredentialHook(client).recover_after_unauthorized("subscription", new.access_token) is None
+            assert len(requests) == 2
+        else:
+            assert CHATGPT_REAUTH_REQUIRED_TOKEN_KEY not in database.row.credential_info
+            assert database.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_still_persists_rotated_tokens_before_next_recovery(monkeypatch):
+    import httpx
+
+    from litellm.llms.chatgpt.oauth_client import ChatGPTOAuthClient
+
+    old = ChatGPTTokens("old-access", "old-refresh", "old-id", int(time.time()) + 3600, "account")
+    database = _refresh_database(monkeypatch, old)
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        started.set()
+        await finish.wait()
+        return httpx.Response(200, json={"access_token": "rotated-access", "refresh_token": "rotated-refresh"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        hook = ChatGPTOAuthCredentialHook(ChatGPTOAuthClient(async_http_client=transport))
+        caller = asyncio.create_task(hook.recover_after_unauthorized("subscription", old.access_token))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        finish.set()
+        recovered = await hook.recover_after_unauthorized("subscription", old.access_token)
+
+    assert recovered == ChatGPTTokens("rotated-access", "rotated-refresh", old.id_token, None, old.account_id)
+    assert _persisted_tokens(database) == recovered
+    assert len(requests) == 1
+    assert database.commits == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_rejected", [False, True])
+@pytest.mark.parametrize("concurrent_change", ["reconnect", "proxy-edit", "auth-type"])
+async def test_refresh_preserves_concurrent_reconnect_proxy_and_auth_type_changes(monkeypatch, refresh_rejected, concurrent_change):
+    import httpx
+
+    from litellm.llms.chatgpt.oauth_client import ChatGPTOAuthClient
+    from litellm.proxy.credential_endpoints.chatgpt_oauth import CHATGPT_REAUTH_REQUIRED_TOKEN_KEY
+
+    old = ChatGPTTokens("old-access", "old-refresh", "old-id", 1, "account")
+    newer = ChatGPTTokens("reconnected-access", "reconnected-refresh", "reconnected-id", int(time.time()) + 3600, "account")
+    database = _refresh_database(monkeypatch, old)
+    saved_proxy = "http://saved-proxy.invalid:8080"
+
+    async def handler(request):
+        database.active_row.credential_values["other"] = "concurrent-edit"
+        database.active_row.credential_info["custom"] = "concurrent-edit"
+        if concurrent_change == "reconnect":
+            database.active_row.credential_values[CHATGPT_CREDENTIAL_VALUE_KEY] = encrypt_value_helper(newer.to_json())
+        elif concurrent_change == "proxy-edit":
+            database.active_row.credential_values[CREDENTIAL_PROXY_VALUE_KEY] = encrypt_value_helper(saved_proxy)
+            database.active_row.credential_info["proxy_configured"] = True
+        else:
+            database.active_row.credential_info["auth_type"] = "api_key"
+        return httpx.Response(400, json={"error": "invalid_grant"}) if refresh_rejected else httpx.Response(
+            200, json={"access_token": "refreshed-access", "refresh_token": "refreshed-refresh"}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        hook = ChatGPTOAuthCredentialHook(ChatGPTOAuthClient(async_http_client=transport))
+        if concurrent_change == "auth-type":
+            with pytest.raises(ValueError, match="Credential changed"):
+                await hook.recover_after_unauthorized("subscription", old.access_token)
+            assert database.commits == 0
+            assert _persisted_tokens(database) == old
+            return
+        recovered = await hook.recover_after_unauthorized("subscription", old.access_token)
+
+    assert database.row.credential_values["other"] == "concurrent-edit"
+    assert database.row.credential_info["custom"] == "concurrent-edit"
+    if concurrent_change == "reconnect":
+        assert recovered == newer
+        assert _persisted_tokens(database) == newer
+        assert CHATGPT_REAUTH_REQUIRED_TOKEN_KEY not in database.row.credential_info
+    else:
+        assert decrypt_value_helper(database.row.credential_values[CREDENTIAL_PROXY_VALUE_KEY], CREDENTIAL_PROXY_VALUE_KEY) == saved_proxy
+        assert database.row.credential_info["proxy_configured"] is True
+        if refresh_rejected:
+            assert recovered is None
+            assert CHATGPT_REAUTH_REQUIRED_TOKEN_KEY in database.row.credential_info
+        else:
+            assert recovered == ChatGPTTokens("refreshed-access", "refreshed-refresh", old.id_token, None, old.account_id)
+            assert _persisted_tokens(database) == recovered
