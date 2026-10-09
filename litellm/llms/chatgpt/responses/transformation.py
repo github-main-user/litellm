@@ -24,6 +24,8 @@ from ..common_utils import (
     get_chatgpt_api_base,
     get_chatgpt_default_headers,
     get_chatgpt_default_instructions,
+    get_managed_chatgpt_account_id,
+    merge_chatgpt_headers,
 )
 from ..oauth_client import require_managed_chatgpt_access_token
 
@@ -38,26 +40,22 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
     def validate_environment(
         self,
-        headers: dict,
+        headers: dict[str, str],
         model: str,
         litellm_params: GenericLiteLLMParams | None,
-    ) -> dict:
+    ) -> dict[str, str]:
         access_token: Final = require_managed_chatgpt_access_token(
             model,
-            litellm_params.get("litellm_credential_name") if litellm_params is not None else None,
+            litellm_params.litellm_credential_name if litellm_params is not None else None,
             litellm_params.api_key if litellm_params is not None else None,
         )
         session_id: Final = ensure_chatgpt_session_id(litellm_params)
-        account_id: Final = litellm_params.get("chatgpt_auth_account_id") if litellm_params is not None else None
+        account_id: Final = get_managed_chatgpt_account_id(
+            litellm_params.litellm_credential_name if litellm_params is not None else None,
+            access_token,
+        )
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
-        return {
-            **default_headers,
-            **{
-                name: value
-                for name, value in headers.items()
-                if name.lower() not in {"authorization", "chatgpt-account-id"}
-            },
-        }
+        return merge_chatgpt_headers(headers, default_headers)
 
     def transform_responses_api_request(
         self,

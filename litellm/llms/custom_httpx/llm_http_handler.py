@@ -96,6 +96,7 @@ from litellm.llms.base_llm.vector_store_files.transformation import (
 )
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
 from litellm.llms.bedrock.base_aws_llm import SignsRequestsWithAWS, run_aws_signing, sign_request_off_loop_if_aws
+from litellm.llms.chatgpt.common_utils import merge_chatgpt_headers
 from litellm.llms.custom_httpx.container_handler import raise_for_error_status
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
@@ -2790,7 +2791,11 @@ class BaseLLMHTTPHandler:
         )
 
         if extra_headers:
-            headers.update(extra_headers)
+            headers = (
+                merge_chatgpt_headers(extra_headers, headers)
+                if custom_llm_provider == "chatgpt"
+                else {**headers, **extra_headers}
+            )
 
         # Check if streaming is requested
         stream = response_api_optional_request_params.get("stream", False)
@@ -2978,7 +2983,11 @@ class BaseLLMHTTPHandler:
         )
 
         if extra_headers:
-            headers.update(extra_headers)
+            headers = (
+                merge_chatgpt_headers(extra_headers, headers)
+                if custom_llm_provider == "chatgpt"
+                else {**headers, **extra_headers}
+            )
 
         # Check if streaming is requested
         stream = response_api_optional_request_params.get("stream", False)

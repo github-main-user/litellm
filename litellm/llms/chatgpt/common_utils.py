@@ -2,17 +2,20 @@
 Constants and helpers for ChatGPT subscription OAuth.
 """
 
+import json
 import math
 import os
 import platform
 import time
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Final
+from typing import Final, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 
 # OAuth + API constants (derived from openai/codex)
@@ -28,6 +31,7 @@ DEFAULT_ORIGINATOR: Final = "codex_cli_rs"
 CODEX_CLI_VERSION: Final = "0.155.1"
 DEFAULT_USER_AGENT: Final = f"{DEFAULT_ORIGINATOR}/{CODEX_CLI_VERSION} (Unknown 0; unknown) unknown"
 CHATGPT_DEFAULT_INSTRUCTIONS: Final = "You are a helpful assistant."
+_OBJECT: Final = TypeAdapter(dict[str, object])
 
 
 def get_chatgpt_api_base() -> str:
@@ -192,7 +196,7 @@ def get_chatgpt_default_headers(
     access_token: str,
     account_id: str | None,
     session_id: str | None = None,
-) -> dict:
+) -> dict[str, str]:
     originator: Final = get_chatgpt_originator()
     user_agent: Final = get_chatgpt_user_agent(originator)
     headers: Final = {
@@ -202,46 +206,42 @@ def get_chatgpt_default_headers(
         "originator": originator,
         "user-agent": user_agent,
     }
-    if session_id:
-        headers["session_id"] = session_id
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-    return headers
+    return {
+        **headers,
+        **({"session_id": session_id} if session_id else {}),
+        **({"ChatGPT-Account-Id": account_id} if account_id else {}),
+    }
 
 
 def get_chatgpt_default_instructions() -> str:
     return os.getenv("CHATGPT_DEFAULT_INSTRUCTIONS") or CHATGPT_DEFAULT_INSTRUCTIONS
 
 
-def _normalize_litellm_params(litellm_params: Any | None) -> dict:
-    if litellm_params is None:
+def _object(value: object) -> dict[str, object]:
+    try:
+        return _OBJECT.validate_python(value, strict=True)
+    except ValidationError:
         return {}
-    if isinstance(litellm_params, dict):
-        return litellm_params
-    if hasattr(litellm_params, "model_dump"):
-        try:
-            return litellm_params.model_dump()
-        except Exception:
-            return {}
-    if hasattr(litellm_params, "dict"):
-        try:
-            return litellm_params.dict()
-        except Exception:
-            return {}
-    return {}
 
 
-def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
+def _normalize_litellm_params(litellm_params: object) -> Mapping[str, object]:
+    if isinstance(litellm_params, BaseModel):
+        return _object({**vars(litellm_params), **(litellm_params.model_extra or {})})
+    return _object(litellm_params)
+
+
+def get_chatgpt_session_id(litellm_params: object) -> str | None:
     params: Final = _normalize_litellm_params(litellm_params)
     for key in ("litellm_session_id", "session_id"):
         value = params.get(key)
         if value:
             return str(value)
-    metadata: Final = params.get("metadata")
-    if isinstance(metadata, dict):
-        value = metadata.get("session_id")
-        if value:
-            return str(value)
+    metadata_session: Final = next(
+        (value for slot in ("litellm_metadata", "metadata") if (value := _object(params.get(slot)).get("session_id"))),
+        None,
+    )
+    if metadata_session:
+        return str(metadata_session)
     prompt_cache_key: Final = params.get("prompt_cache_key")
     if isinstance(prompt_cache_key, str) and prompt_cache_key:
         return str(uuid5(NAMESPACE_URL, f"litellm:prompt-cache:{prompt_cache_key}"))
@@ -252,5 +252,68 @@ def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
     return None
 
 
-def ensure_chatgpt_session_id(litellm_params: Any | None) -> str:
-    return get_chatgpt_session_id(litellm_params) or str(uuid4())
+def get_managed_chatgpt_account_id(credential_name: object, access_token: object = None) -> str | None:
+    if not isinstance(credential_name, str) or not credential_name:
+        return None
+    from .oauth_client import ChatGPTTokens, ManagedChatGPTAccessToken
+
+    if isinstance(access_token, ManagedChatGPTAccessToken) and access_token.credential_name == credential_name:
+        return access_token.account_id
+    credential: Final = CredentialAccessor.find_credential(credential_name)
+    if credential is None:
+        return None
+    info: Final = _object(cast(object, credential.credential_info))
+    if info.get("provider") != "chatgpt" or info.get("auth_type") != "oauth":
+        return None
+    encoded: Final = _object(cast(object, credential.credential_values)).get("litellm_internal_chatgpt_auth_token")
+    if not isinstance(encoded, str):
+        return None
+    return ChatGPTTokens.from_json(encoded).account_id
+
+
+def _chatgpt_authenticated_owner(params: Mapping[str, object]) -> tuple[str | None, ...] | None:
+    candidates: Final = tuple(
+        auth
+        for slot in ("litellm_metadata", "metadata")
+        if (auth := _object(params.get(slot)).get("user_api_key_auth")) is not None
+        and not isinstance(auth, (dict, list, str, int, float, bool))
+    )
+    if not candidates:
+        return None
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    return next(
+        (
+            (auth.user_id, auth.team_id, auth.org_id, auth.project_id, auth.api_key)
+            for auth in candidates
+            if isinstance(auth, UserAPIKeyAuth)
+        ),
+        None,
+    )
+
+
+def ensure_chatgpt_session_id(litellm_params: object) -> str:
+    params: Final = _normalize_litellm_params(litellm_params)
+    original: Final = get_chatgpt_session_id(params) or str(uuid4())
+    credential_name: Final = params.get("litellm_credential_name")
+    if not isinstance(credential_name, str) or not credential_name:
+        return original
+    scope: Final = json.dumps(
+        [
+            "litellm-chatgpt",
+            credential_name,
+            get_managed_chatgpt_account_id(credential_name, params.get("api_key")),
+            _chatgpt_authenticated_owner(params),
+            original,
+        ],
+        separators=(",", ":"),
+    )
+    return str(uuid5(NAMESPACE_URL, scope))
+
+
+def merge_chatgpt_headers(headers: Mapping[str, str], canonical: Mapping[str, str]) -> dict[str, str]:
+    protected: Final = frozenset({"authorization", "chatgpt-account-id", "originator", "user-agent", "session_id"})
+    return {
+        **{("User-Agent" if name.lower() == "user-agent" else name): value for name, value in canonical.items()},
+        **{name: value for name, value in headers.items() if name.lower() not in protected},
+    }

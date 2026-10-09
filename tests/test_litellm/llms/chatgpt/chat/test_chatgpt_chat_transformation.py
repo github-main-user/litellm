@@ -10,6 +10,7 @@ from litellm.exceptions import AuthenticationError
 from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
 from litellm.llms.chatgpt.oauth_client import ChatGPTTokens, ManagedChatGPTAccessToken
 from litellm.models.credentials import CredentialItem
+from litellm.proxy._types import UserAPIKeyAuth
 
 
 @pytest.mark.parametrize("access_token", [None, "unmanaged-token"])
@@ -84,6 +85,8 @@ async def test_managed_credentials_reach_legacy_chat_transport(
         ],
     )
     monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    monkeypatch.setenv("CHATGPT_ORIGINATOR", "managed-origin")
+    monkeypatch.setenv("CHATGPT_USER_AGENT", "managed-client/1")
     upstream: Final = respx_mock.post("https://chatgpt.test/chat/completions").mock(
         return_value=httpx.Response(
             200,
@@ -99,16 +102,38 @@ async def test_managed_credentials_reach_legacy_chat_transport(
     params: Final = {
         "model": "chatgpt/unregistered-model",
         "api_key": ManagedChatGPTAccessToken(tokens.access_token),
-        "chatgpt_auth_account_id": tokens.account_id,
+        "chatgpt_auth_account_id": "spoofed-account",
         "api_base": "https://chatgpt.test",
         "litellm_credential_name": "subscription-a",
         "messages": [{"role": "user", "content": "hello"}],
         "num_retries": 0,
+        "extra_headers": {
+            **{name: "spoofed" for name in (
+                "Authorization", "AUTHORIZATION", "chatgpt-account-id", "ChatGPT-Account-Id",
+                "originator", "ORIGINATOR", "user-agent", "User-Agent", "session_id", "SESSION_ID"
+            )},
+            "X-Custom": "preserved",
+        },
     }
-    response: Final = await litellm.acompletion(**params) if asynchronous else litellm.completion(**params)
-    assert response.choices[0].message.content == "ok"
-    assert upstream.calls.last.request.headers["authorization"] == "Bearer access-a"
-    assert upstream.calls.last.request.headers["chatgpt-account-id"] == "account-a"
+    for owner, key in (("owner-a", "key-a"), ("owner-a", "key-a"), ("owner-b", "key-a"), ("owner-a", "key-b")):
+        metadata: Final = {"session_id": "original", "user_api_key_auth": UserAPIKeyAuth(user_id=owner, api_key=key)}
+        request_params: Final = {**params, "metadata": metadata}
+        response: Final = (
+            await litellm.acompletion(**request_params) if asynchronous else litellm.completion(**request_params)
+        )
+        assert response.choices[0].message.content == "ok"
+        assert metadata["session_id"] == "original"
+    sessions: Final = tuple(call.request.headers["session_id"] for call in upstream.calls)
+    assert len(sessions) == 4
+    assert sessions[0] == sessions[1]
+    assert len(set((sessions[0], sessions[2], sessions[3]))) == 3
+    for call in upstream.calls:
+        for name, value in (
+            ("authorization", "Bearer access-a"), ("chatgpt-account-id", "account-a"),
+            ("originator", "managed-origin"), ("user-agent", "managed-client/1"),
+        ):
+            assert call.request.headers.get_list(name) == [value]
+        assert call.request.headers["x-custom"] == "preserved"
 
 
 @pytest.mark.parametrize("access_token", ["access-a", "unmanaged-token"])

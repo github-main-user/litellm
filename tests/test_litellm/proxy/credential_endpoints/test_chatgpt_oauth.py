@@ -117,18 +117,29 @@ async def test_hook_rejects_configured_oauth_tokens_without_database(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_inflight_auth_survives_cache_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("replacement", ["rotated", "removed", "different-account"])
+async def test_inflight_auth_survives_cache_replacement(monkeypatch: pytest.MonkeyPatch, replacement: str) -> None:
     monkeypatch.setattr(litellm, "credential_list", [_credential("subscription-a", "account-a", "access-a")])
     resolved = await ChatGPTOAuthCredentialHook().async_pre_call_deployment_hook(
         {"model": "chatgpt/test-model", "litellm_credential_name": "subscription-a"}, None
     )
     assert resolved is not None
-    monkeypatch.setattr(litellm, "credential_list", [_credential("subscription-a", "account-a", "access-new")])
+    initial_headers = ChatGPTResponsesAPIConfig().validate_environment(
+        headers={}, model="test-model", litellm_params=GenericLiteLLMParams(**resolved, session_id="stable-session")
+    )
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [] if replacement == "removed" else [
+            _credential("subscription-a", "account-b" if replacement == "different-account" else "account-a", "access-new")
+        ],
+    )
     headers = ChatGPTResponsesAPIConfig().validate_environment(
-        headers={}, model="test-model", litellm_params=GenericLiteLLMParams(**resolved)
+        headers={}, model="test-model", litellm_params=GenericLiteLLMParams(**resolved, session_id="stable-session")
     )
     assert headers["Authorization"] == "Bearer access-a"
     assert headers["ChatGPT-Account-Id"] == "account-a"
+    assert headers["session_id"] == initial_headers["session_id"]
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Final, Literal
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.main import responses_api_bridge_check
 from litellm.models.credentials import CredentialItem
+from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
@@ -263,24 +265,40 @@ class TestChatGPTResponsesAPITransformation:
         )
         assert url_with_slash == "https://chatgpt.example.com/responses"
 
-    def test_validate_environment_headers(self, managed_credential: str):
-        config = ChatGPTResponsesAPIConfig()
-        litellm_params = GenericLiteLLMParams(
-            litellm_session_id="session-123", api_key=ManagedChatGPTAccessToken("managed-token"),
-            litellm_credential_name=managed_credential, chatgpt_auth_account_id="managed-account"
+    def test_validate_environment_protects_canonical_headers_on_retry(
+        self, managed_credential: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CHATGPT_ORIGINATOR", "managed-origin")
+        monkeypatch.setenv("CHATGPT_USER_AGENT", "managed-client/1")
+        config: Final = ChatGPTResponsesAPIConfig()
+        metadata: Final = {"session_id": "session-123", "custom": "preserved"}
+        litellm_params: Final = GenericLiteLLMParams(
+            metadata=metadata, api_key=ManagedChatGPTAccessToken("managed-token"),
+            litellm_credential_name=managed_credential, chatgpt_auth_account_id="spoofed-account"
         )
-        headers = config.validate_environment(
-            headers={"originator": "custom-origin"},
-            model="gpt-5.2",
-            litellm_params=litellm_params,
-        )
-
-        assert headers["Authorization"] == "Bearer managed-token"
-        assert headers["ChatGPT-Account-Id"] == "managed-account"
-        assert headers["originator"] == "custom-origin"
-        assert headers["content-type"] == "application/json"
-        assert headers["accept"] == "text/event-stream"
-        assert headers["session_id"] == "session-123"
+        incoming: Final = {
+            **{name: "spoofed" for name in (
+                "Authorization", "AUTHORIZATION", "chatgpt-account-id", "ChatGPT-Account-Id",
+                "originator", "ORIGINATOR", "user-agent", "User-Agent", "session_id", "SESSION_ID"
+            )},
+            "X-Custom": "preserved",
+        }
+        headers: Final = config.validate_environment(incoming, "test-model", litellm_params)
+        assert headers == {
+            "Authorization": "Bearer managed-token",
+            "ChatGPT-Account-Id": "managed-account",
+            "originator": "managed-origin",
+            "User-Agent": "managed-client/1",
+            "session_id": headers["session_id"],
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "X-Custom": "preserved",
+        }
+        assert str(UUID(headers["session_id"])) == headers["session_id"]
+        assert headers["session_id"] != "session-123"
+        assert config.validate_environment(headers, "test-model", litellm_params) == headers
+        assert litellm_params.metadata == metadata
+        assert incoming["SESSION_ID"] == "spoofed"
 
     def test_validate_environment_uses_deployment_credentials(self, managed_credential: str):
         config = ChatGPTResponsesAPIConfig()
@@ -656,3 +674,80 @@ def test_chatgpt_completed_recovery_prefers_full_text_over_deltas(source):
     assert response.output_text == "Full text"
     assert len(response.output) == 1
     assert error is None
+
+
+@pytest.mark.parametrize("api", ["responses", "chat"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("spoof_headers", [False, True], ids=["canonical", "spoofed"])
+async def test_public_managed_sessions_isolate_owners_and_keys_with_protected_headers(
+    api: str,
+    asynchronous: bool,
+    spoof_headers: bool,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    local_model_cost_map: None,
+    managed_credential: str,
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    monkeypatch.setenv("CHATGPT_ORIGINATOR", "managed-origin")
+    monkeypatch.setenv("CHATGPT_USER_AGENT", "managed-client/1")
+    payload: Final = {
+        "id": "resp_session", "object": "response", "created_at": 1, "status": "completed", "model": "gpt-5.6-luna",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+    }
+    upstream: Final = respx_mock.post("https://chatgpt.test/backend-api/codex/responses").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps({'type': 'response.completed', 'response': payload})}\n\ndata: [DONE]\n\n",
+        )
+    )
+    supplied_headers: Final = {
+        **{name: "spoofed" for name in (
+            "Authorization", "AUTHORIZATION", "chatgpt-account-id", "ChatGPT-Account-Id",
+            "originator", "ORIGINATOR", "user-agent", "User-Agent", "session_id", "SESSION_ID"
+        )},
+        "X-Custom": "preserved",
+    }
+    owners: Final = (("owner-a", "key-a"), ("owner-a", "key-a"), ("owner-b", "key-a"), ("owner-a", "key-b"))
+    for attempt, (owner, key) in enumerate(owners):
+        metadata: Final = {
+            "session_id": "shared-original-session",
+            "user_api_key_auth": UserAPIKeyAuth(user_id=owner, api_key=key),
+            "custom": "untouched",
+        }
+        params: Final = {
+            "model": "chatgpt/gpt-5.6-luna", "api_key": ManagedChatGPTAccessToken("managed-token"),
+            "api_base": "https://chatgpt.test/backend-api/codex", "litellm_credential_name": managed_credential,
+            "chatgpt_auth_account_id": "spoofed-account", "litellm_metadata": metadata,
+            "litellm_trace_id": f"attempt-{attempt}",
+            "extra_headers": supplied_headers if spoof_headers else {"X-Custom": "preserved"}, "num_retries": 0,
+        }
+        if api == "responses":
+            response: Final = (
+                await litellm.aresponses(input="Hello", stream=False, **params)
+                if asynchronous else litellm.responses(input="Hello", stream=False, **params)
+            )
+            assert response.output_text == "ok"
+        else:
+            completion: Final = (
+                await litellm.acompletion(messages=[{"role": "user", "content": "Hello"}], **params)
+                if asynchronous else litellm.completion(messages=[{"role": "user", "content": "Hello"}], **params)
+            )
+            assert completion.choices[0].message.content == "ok"
+        assert metadata["session_id"] == "shared-original-session"
+        assert metadata["custom"] == "untouched"
+
+    sessions: Final = tuple(call.request.headers["session_id"] for call in upstream.calls)
+    assert len(sessions) == 4
+    assert sessions[0] == sessions[1]
+    assert len(set((sessions[0], sessions[2], sessions[3]))) == 3
+    for call in upstream.calls:
+        headers: Final = call.request.headers
+        assert str(UUID(headers["session_id"])) == headers["session_id"]
+        assert headers["session_id"] != "shared-original-session"
+        assert headers["x-custom"] == "preserved"
+        for name, value in (
+            ("authorization", "Bearer managed-token"), ("chatgpt-account-id", "managed-account"),
+            ("originator", "managed-origin"), ("user-agent", "managed-client/1"), ("session_id", headers["session_id"]),
+        ):
+            assert headers.get_list(name) == [value]
