@@ -16,6 +16,7 @@ from litellm.proxy.credential_endpoints.subscription_usage import (
     SubscriptionUsageAuth,
     SubscriptionUsageService,
     get_credential_subscription_usage,
+    parse_anthropic_extra_usage,
     parse_anthropic_usage,
     parse_chatgpt_reset_credits,
     parse_chatgpt_usage,
@@ -29,6 +30,39 @@ def _oauth_credential(provider: str = "anthropic") -> CredentialItem:
         credential_info={"provider": provider, "auth_type": "oauth"},
         credential_values={},
     )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_extra_usage_preserves_amounts_and_does_not_become_a_window(enabled) -> None:
+    extra = {"is_enabled": enabled, "monthly_limit": 10000, "used_credits": 12500.5,
+             "utilization": 125.005, "currency": "USD"}
+    payload = {"extra_usage": {**extra, "private_field": "discard"}}
+    assert parse_anthropic_extra_usage(payload).model_dump() == extra
+    assert parse_anthropic_usage(payload) == ()
+
+
+@pytest.mark.parametrize("value", [None, {}, [], "invalid", {"is_enabled": "true"}, {"is_enabled": 1}])
+def test_extra_usage_rejects_missing_or_invalid_enabled_state(value) -> None:
+    assert parse_anthropic_extra_usage({"extra_usage": value}) is None
+
+
+@pytest.mark.parametrize("value", [None, -1, True, "10", float("nan"), float("inf")])
+def test_extra_usage_invalid_numbers_are_unknown_not_zero(value) -> None:
+    assert parse_anthropic_extra_usage({"extra_usage": {
+        "is_enabled": True, "monthly_limit": value, "used_credits": value,
+        "utilization": value, "currency": "invalid",
+    }}).model_dump() == {
+        "is_enabled": True, "monthly_limit": None, "used_credits": None,
+        "utilization": None, "currency": None,
+    }
+
+
+def test_extra_usage_zeroes_and_currency_normalization() -> None:
+    assert parse_anthropic_extra_usage({"extra_usage": {
+        "is_enabled": False, "monthly_limit": 0, "used_credits": 0, "utilization": 0, "currency": "usd",
+    }}).model_dump() == {
+        "is_enabled": False, "monthly_limit": 0, "used_credits": 0, "utilization": 0, "currency": "USD",
+    }
 
 
 def test_anthropic_parser_prefers_modern_limits_and_validates_percentages() -> None:
@@ -125,7 +159,9 @@ async def test_service_coalesces_requests_caches_results_and_passes_proxy() -> N
         calls.append((proxy, account))
         started.set()
         await release.wait()
-        return {"five_hour": {"utilization": 10}}
+        return {"five_hour": {"utilization": 10}, "extra_usage": {
+            "is_enabled": True, "monthly_limit": 1000, "used_credits": 200, "utilization": 20,
+        }}
 
     service = SubscriptionUsageService(request, find_credential, resolve_auth)
     first = asyncio.create_task(service.get("subscription"))
@@ -138,6 +174,10 @@ async def test_service_coalesces_requests_caches_results_and_passes_proxy() -> N
     assert calls == [("http://proxy.example:8080", "account-a")]
     assert first_response == second_response == cached_response
     assert first_response.status == "ok"
+    assert first_response.windows[0].used_percent == 10
+    assert first_response.extra_usage.model_dump() == {
+        "is_enabled": True, "monthly_limit": 1000, "used_credits": 200, "utilization": 20, "currency": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -162,6 +202,7 @@ async def test_service_returns_sanitized_unavailable_without_fake_windows() -> N
         "windows": [],
         "error": "Usage provider request failed",
         "reset_credits_available": None,
+        "extra_usage": None,
     }
 
 
@@ -184,6 +225,28 @@ async def test_service_distinguishes_missing_and_non_oauth_credentials() -> None
 
     assert missing_error.value.status_code == 404
     assert unsupported_error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "chatgpt"])
+async def test_extra_usage_only_response_is_anthropic_scoped(provider) -> None:
+    async def find(name):
+        return _oauth_credential(provider)
+
+    async def auth(provider, name):
+        return SubscriptionUsageAuth(provider, "synthetic", None, None)
+
+    async def request(*args):
+        return {"extra_usage": {"is_enabled": False}}
+
+    result = await SubscriptionUsageService(request, find, auth).get("subscription")
+    assert result.windows == ()
+    if provider == "anthropic":
+        assert result.status == "ok"
+        assert result.extra_usage.is_enabled is False
+    else:
+        assert result.status == "unavailable"
+        assert result.extra_usage is None
 
 
 @pytest.mark.asyncio

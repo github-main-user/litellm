@@ -45,6 +45,16 @@ class SubscriptionUsageWindow(BaseModel):
     resets_at: datetime | None
 
 
+class SubscriptionExtraUsage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    is_enabled: bool
+    monthly_limit: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    used_credits: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    utilization: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+
 class SubscriptionUsageResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -56,6 +66,7 @@ class SubscriptionUsageResponse(BaseModel):
     windows: tuple[SubscriptionUsageWindow, ...]
     error: str | None
     reset_credits_available: int | None = None
+    extra_usage: SubscriptionExtraUsage | None = None
 
 
 class SubscriptionResetResponse(BaseModel):
@@ -206,6 +217,24 @@ def parse_anthropic_usage(payload: Mapping[str, object]) -> tuple[SubscriptionUs
         if label is not None and percent is not None
     )
     return tuple(sorted(legacy, key=lambda window: (len(window.label), window.label)))
+
+
+def parse_anthropic_extra_usage(payload: Mapping[str, object]) -> SubscriptionExtraUsage | None:
+    extra: Final = _mapping(payload.get("extra_usage"))
+    if extra is None or not isinstance(extra.get("is_enabled"), bool):
+        return None
+    currency: Final = extra.get("currency")
+    return SubscriptionExtraUsage(
+        is_enabled=cast(bool, extra["is_enabled"]),
+        monthly_limit=_finite_number(extra.get("monthly_limit")),
+        used_credits=_finite_number(extra.get("used_credits")),
+        utilization=_finite_number(extra.get("utilization")),
+        currency=(
+            currency.upper()
+            if isinstance(currency, str) and len(currency) == 3 and currency.isascii() and currency.isalpha()
+            else None
+        ),
+    )
 
 
 def _chatgpt_window(
@@ -429,7 +458,8 @@ class SubscriptionUsageService:
             plan, windows = (
                 (None, parse_anthropic_usage(payload)) if auth.provider == "anthropic" else parse_chatgpt_usage(payload)
             )
-            if not windows:
+            extra_usage: Final = parse_anthropic_extra_usage(payload) if auth.provider == "anthropic" else None
+            if not windows and extra_usage is None:
                 raise _UsageFetchError("Usage provider returned an invalid response")
             return SubscriptionUsageResponse(
                 credential_name=credential_name,
@@ -439,6 +469,7 @@ class SubscriptionUsageService:
                 plan_type=plan,
                 windows=windows,
                 error=None,
+                extra_usage=extra_usage,
                 reset_credits_available=(
                     parse_chatgpt_reset_credits(payload) if auth.provider == "chatgpt" else None
                 ),
