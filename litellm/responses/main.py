@@ -1,10 +1,11 @@
 import asyncio
 import contextvars
 import json
-from collections.abc import Coroutine, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from inspect import isawaitable
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Optional, TypeAlias, cast
 
@@ -62,6 +63,7 @@ from litellm.types.utils import all_litellm_params
 from litellm.utils import (
     ProviderConfigManager,
     client,
+    load_credentials_from_list,
 )
 
 if TYPE_CHECKING:
@@ -1593,6 +1595,45 @@ async def adelete_responses(
         )
 
 
+def _run_responses_operation[T](
+    operation: Callable[..., T],
+    proxy_url: str | None,
+    credential_name: object,
+    **params: object,
+) -> T:
+    from litellm.litellm_core_utils.credential_proxy import (
+        require_proxy_provider_support,
+        validate_credential_proxy_route,
+    )
+
+    validate_credential_proxy_route(proxy_url, credential_name)
+    if proxy_url is not None:
+        provider: Final = params.get("custom_llm_provider")
+        require_proxy_provider_support(provider if isinstance(provider, str) else None)
+
+    async def run_async() -> object:
+        validate_credential_proxy_route(proxy_url, credential_name)
+        if proxy_url is None:
+            result = operation(**params)
+            return await result if isawaitable(result) else result
+        handler: Final = AsyncHTTPHandler(proxy_url=proxy_url)
+        try:
+            result = operation(**{**params, "client": handler, "shared_session": None})
+            return await result if isawaitable(result) else result
+        finally:
+            await handler.close()
+
+    if params.get("_is_async") and (proxy_url is not None or credential_name):
+        return cast(T, run_async())
+    if proxy_url is None:
+        return operation(**params)
+    handler: Final = HTTPHandler(proxy_url=proxy_url)
+    try:
+        return operation(**{**params, "client": handler, "shared_session": None})
+    finally:
+        handler.close()
+
+
 @client
 def delete_responses(
     response_id: str,
@@ -1617,6 +1658,8 @@ def delete_responses(
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
         litellm_call_id: Final[str | None] = kwargs.get("litellm_call_id", None)
         _is_async: Final = kwargs.pop("adelete_responses", False) is True
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        load_credentials_from_list(kwargs)
 
         # get llm provider logic
         litellm_params: Final = GenericLiteLLMParams(**kwargs)
@@ -1659,7 +1702,10 @@ def delete_responses(
         )
 
         # Call the handler with _is_async flag instead of directly calling the async handler
-        response: Final = base_llm_http_handler.delete_response_api_handler(
+        response: Final = _run_responses_operation(
+            base_llm_http_handler.delete_response_api_handler,
+            proxy_url,
+            kwargs.get("litellm_credential_name"),
             response_id=response_id,
             custom_llm_provider=custom_llm_provider,
             responses_api_provider_config=responses_api_provider_config,
@@ -1789,6 +1835,8 @@ def get_responses(
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
         litellm_call_id: Final[str | None] = kwargs.get("litellm_call_id", None)
         _is_async: Final = kwargs.pop("aget_responses", False) is True
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        load_credentials_from_list(kwargs)
 
         # get llm provider logic
         litellm_params: Final = GenericLiteLLMParams(**kwargs)
@@ -1831,7 +1879,10 @@ def get_responses(
         )
 
         # Call the handler with _is_async flag instead of directly calling the async handler
-        response = base_llm_http_handler.get_responses(
+        response = _run_responses_operation(
+            base_llm_http_handler.get_responses,
+            proxy_url,
+            kwargs.get("litellm_credential_name"),
             response_id=response_id,
             custom_llm_provider=custom_llm_provider,
             responses_api_provider_config=responses_api_provider_config,
@@ -1939,6 +1990,8 @@ def list_input_items(
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
         litellm_call_id: Final[str | None] = kwargs.get("litellm_call_id", None)
         _is_async: Final = kwargs.pop("alist_input_items", False) is True
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        load_credentials_from_list(kwargs)
 
         litellm_params: Final = GenericLiteLLMParams(**kwargs)
 
@@ -1970,7 +2023,10 @@ def list_input_items(
             custom_llm_provider=custom_llm_provider,
         )
 
-        response: Final = base_llm_http_handler.list_responses_input_items(
+        response: Final = _run_responses_operation(
+            base_llm_http_handler.list_responses_input_items,
+            proxy_url,
+            kwargs.get("litellm_credential_name"),
             response_id=response_id,
             custom_llm_provider=custom_llm_provider,
             responses_api_provider_config=responses_api_provider_config,
@@ -2084,6 +2140,8 @@ def cancel_responses(
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
         litellm_call_id: Final[str | None] = kwargs.get("litellm_call_id", None)
         _is_async: Final = kwargs.pop("acancel_responses", False) is True
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        load_credentials_from_list(kwargs)
 
         # get llm provider logic
         litellm_params: Final = GenericLiteLLMParams(**kwargs)
@@ -2126,7 +2184,10 @@ def cancel_responses(
         )
 
         # Call the handler with _is_async flag instead of directly calling the async handler
-        response: Final = base_llm_http_handler.cancel_response_api_handler(
+        response: Final = _run_responses_operation(
+            base_llm_http_handler.cancel_response_api_handler,
+            proxy_url,
+            kwargs.get("litellm_credential_name"),
             response_id=response_id,
             custom_llm_provider=custom_llm_provider,
             responses_api_provider_config=responses_api_provider_config,
@@ -2257,6 +2318,8 @@ def compact_responses(
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
         litellm_call_id: Final[str | None] = kwargs.get("litellm_call_id", None)
         _is_async: Final = kwargs.pop("acompact_responses", False) is True
+        proxy_url: Final = _credential_proxy_url(kwargs)
+        load_credentials_from_list(kwargs)
 
         # get llm provider logic
         litellm_params: Final = GenericLiteLLMParams(**kwargs)
@@ -2318,7 +2381,10 @@ def compact_responses(
         input = ResponsesAPIRequestUtils._restore_encrypted_content_item_ids_in_input(input)
 
         # Call the handler with _is_async flag instead of directly calling the async handler
-        response = base_llm_http_handler.compact_response_api_handler(
+        response = _run_responses_operation(
+            base_llm_http_handler.compact_response_api_handler,
+            proxy_url,
+            kwargs.get("litellm_credential_name"),
             model=model,
             input=input,
             responses_api_provider_config=responses_api_provider_config,

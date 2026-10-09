@@ -955,3 +955,132 @@ async def test_responses_router_bookkeeping_never_reaches_http_body(model):
     assert bodies[1]["tools"][0].get("parameters", bodies[1]["tools"][0].get("input_schema")) == schema
     assert internal_params["_encrypted_content_affinity_pinned"] is True
     assert internal_params["_retry_skipped_deployment_ids"] == ["skipped"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get_responses", "delete_responses", "list_input_items", "cancel_responses", "compact_responses"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("route", ["proxy", "direct", "missing", "invalid", "absent", "upstream-error", "unsupported"])
+async def test_responses_followup_operations_enforce_credential_proxy(monkeypatch, operation, asynchronous, route):
+    import asyncio
+
+    from litellm.llms.custom_httpx import http_handler
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+    from litellm.models.credentials import CredentialItem
+
+    seen = []
+    transports = []
+    closed = []
+
+    def upstream(request):
+        seen.append(request)
+        if route == "upstream-error":
+            return httpx.Response(403, json={"error": {"message": "Denied", "type": "permission_error"}})
+        if operation == "delete_responses":
+            return httpx.Response(200, json={"id": "resp_test", "object": "response", "deleted": True})
+        if operation == "list_input_items":
+            return httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+        return httpx.Response(200, json=_minimal_responses_api_payload("resp_test", "gpt-test"))
+
+    class Transport(httpx.MockTransport):
+        def close(self):
+            closed.append(True)
+            super().close()
+
+        async def aclose(self):
+            closed.append(True)
+            await super().aclose()
+
+    def transport(**kwargs):
+        transports.append(kwargs)
+        return Transport(upstream)
+
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "credential_list", [] if route == "absent" else [CredentialItem(
+        credential_name="followup", credential_info={"provider": "openai", "proxy_configured": route != "direct"},
+        credential_values={
+            "api_key": "synthetic-followup-key", "api_base": "https://upstream.invalid/v1",
+            **({"litellm_internal_proxy_url": "http://proxy.invalid:8080"} if route in ("proxy", "upstream-error", "unsupported") else {}),
+            **({"litellm_internal_proxy_url": "not-a-proxy"} if route == "invalid" else {}),
+        },
+    )])
+    client = AsyncHTTPHandler() if asynchronous else HTTPHandler()
+    if asynchronous:
+        await client.client.aclose()
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    else:
+        client.client.close()
+        client.client = httpx.Client(transport=httpx.MockTransport(upstream))
+    monkeypatch.setattr(http_handler, "HTTPTransport", transport)
+    monkeypatch.setattr(http_handler, "AsyncHTTPTransport", transport)
+    transports.clear()
+    closed.clear()
+    params = {
+        "litellm_credential_name": "followup", "custom_llm_provider": "vertex_ai" if route == "unsupported" else "openai", "client": client,
+        **({"model": "openai/gpt-test", "input": "hello"} if operation == "compact_responses" else {"response_id": "resp_test"}),
+    }
+
+    async def invoke():
+        if asynchronous:
+            return await getattr(litellm, "a" + operation)(**params)
+        return await asyncio.to_thread(getattr(litellm, operation), **params)
+
+    try:
+        if route in ("missing", "invalid", "absent", "unsupported"):
+            with pytest.raises(Exception):
+                await invoke()
+            assert seen == []
+            assert transports == []
+        else:
+            if route == "upstream-error":
+                with pytest.raises(litellm.APIError, match="Denied"):
+                    await invoke()
+            else:
+                await invoke()
+            assert len(seen) == 1
+            assert seen[0].url.host == "upstream.invalid"
+            assert seen[0].headers["authorization"] == "Bearer synthetic-followup-key"
+            assert not client.client.is_closed
+            if route in ("proxy", "upstream-error"):
+                assert len(transports) == 1
+                assert str(transports[0]["proxy"]) == "http://proxy.invalid:8080"
+                assert closed == [True]
+            else:
+                assert transports == []
+    finally:
+        if asynchronous:
+            await client.close()
+        else:
+            client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", [None, "http://proxy.invalid:8080"])
+@pytest.mark.parametrize("changed", [None, "http://changed.invalid:8080", "missing"])
+async def test_responses_followup_revalidates_route_before_deferred_transport(monkeypatch, initial, changed):
+    from unittest.mock import Mock
+
+    from litellm.models.credentials import CredentialItem
+    from litellm.responses.main import _run_responses_operation
+
+    credential = CredentialItem(
+        credential_name="deferred",
+        credential_info={"provider": "openai"},
+        credential_values={"litellm_internal_proxy_url": initial} if initial else {},
+    )
+    monkeypatch.setattr(litellm, "credential_list", [credential])
+    operation = Mock(return_value="unchanged")
+    pending = _run_responses_operation(
+        operation, initial, "deferred", _is_async=True, custom_llm_provider="openai"
+    )
+    if changed == "missing":
+        monkeypatch.setattr(litellm, "credential_list", [])
+    else:
+        credential.credential_values = {"litellm_internal_proxy_url": changed} if changed else {}
+    if initial == changed:
+        assert await pending == "unchanged"
+        operation.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="Credential proxy routing validation failed"):
+            await pending
+        operation.assert_not_called()
