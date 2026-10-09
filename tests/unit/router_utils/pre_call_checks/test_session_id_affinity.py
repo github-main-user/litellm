@@ -177,6 +177,29 @@ async def test_async_session_id_affinity_priority_over_user_key():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exclusion", ["_excluded_deployment_ids", "_retry_skipped_deployment_ids"])
+async def test_session_affinity_does_not_hide_alternatives_after_failed_attempt(exclusion):
+    callback = DeploymentAffinityCheck(
+        cache=DualCache(), ttl_seconds=123, enable_user_key_affinity=False,
+        enable_responses_api_affinity=False, enable_session_id_affinity=True,
+    )
+    deployments = [
+        {"model_name": "group", "litellm_params": {"model": "openai/test"}, "model_info": {"id": name}}
+        for name in ("failed", "available")
+    ]
+    await callback.cache.async_set_cache(
+        callback.get_session_affinity_cache_key("group", "session", user_key="user"),
+        {"model_id": "failed"},
+    )
+    filtered = await callback.async_filter_deployments(
+        model="group", healthy_deployments=deployments, messages=[],
+        request_kwargs={"metadata": {"session_id": "session", "user_api_key_hash": "user"}, exclusion: ["failed"]},
+    )
+    eligible = litellm.utils.get_excluded_filtered_deployments(filtered, excluded_deployment_ids=["failed"])
+    assert [deployment["model_info"]["id"] for deployment in eligible] == ["available"]
+
+
+@pytest.mark.asyncio
 async def test_proxy_generated_session_id_does_not_pin_a_deployment():
     """A session id the proxy generated for a request that had none is per request, so a
     pin stored under it must be ignored and none must be written."""

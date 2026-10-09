@@ -399,6 +399,15 @@ class DeploymentAffinityCheck(CustomLogger):
             else None
         )
 
+        excluded_ids: Final = frozenset(
+            deployment_id
+            for key in ("_excluded_deployment_ids", "_retry_skipped_deployment_ids")
+            for values in (request_kwargs.get(key),)
+            if isinstance(values, (list, tuple, set, frozenset))
+            for deployment_id in values
+            if isinstance(deployment_id, str)
+        )
+
         # 2) Session-id -> deployment affinity
         if session_affinity_active:
             session_id: Final = self._get_session_id_from_request_kwargs(request_kwargs=request_kwargs)
@@ -414,6 +423,8 @@ class DeploymentAffinityCheck(CustomLogger):
                 elif isinstance(session_cache_result, str):
                     session_model_id = session_cache_result
 
+                if session_model_id in excluded_ids:
+                    return typed_healthy_deployments
                 if session_model_id:
                     session_deployment: Final = self._find_deployment_by_model_id(
                         healthy_deployments=typed_healthy_deployments,
@@ -449,7 +460,7 @@ class DeploymentAffinityCheck(CustomLogger):
             # Backwards / safety: allow raw string values.
             model_id = cache_result
 
-        if not model_id:
+        if not model_id or model_id in excluded_ids:
             return typed_healthy_deployments
 
         deployment = self._find_deployment_by_model_id(

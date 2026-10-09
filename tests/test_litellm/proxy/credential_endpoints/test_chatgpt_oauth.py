@@ -247,6 +247,11 @@ async def test_concurrent_expired_requests_share_one_refresh() -> None:
     assert second == fresh
     oauth_client.refresh.assert_called_once_with("refresh-old")
     transaction.litellm_credentialstable.update.assert_awaited_once()
+    persisted = transaction.litellm_credentialstable.update.call_args.kwargs["data"]
+    assert json.loads(persisted["credential_values"]) == {CHATGPT_CREDENTIAL_VALUE_KEY: fresh.to_json()}
+    assert json.loads(persisted["credential_info"]) == {
+        "provider": "chatgpt", "auth_type": "oauth", "proxy_configured": False,
+    }
 
 
 @pytest.mark.asyncio

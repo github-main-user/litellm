@@ -523,7 +523,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                     raise ValueError("Credential token bundle cannot be encrypted")
                 await transaction.litellm_credentialstable.update(
                     where={"credential_name": credential_name},
-                    data={
+                    data=jsonify_object({
                         "credential_values": {
                             **row.credential_values,
                             CHATGPT_CREDENTIAL_VALUE_KEY: encrypted_bundle,
@@ -535,7 +535,7 @@ class ChatGPTOAuthCredentialHook(CustomLogger):
                             "proxy_configured": proxy_url is not None,
                         },
                         "updated_by": "litellm-chatgpt-oauth",
-                    },
+                    }),
                 )
             credential_info = {
                 **(row.credential_info or {}),
