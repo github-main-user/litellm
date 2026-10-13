@@ -519,6 +519,30 @@ def test_get_transcription_model_falls_back_to_session_model(monkeypatch):
     assert model_info["cache_read_input_token_cost"] == 0.0000006
 
 
+@pytest.mark.parametrize("input_rate,output_rate", [(1.62e-6, 8.1e-6), (3e-6, 12e-6)])
+def test_image_generation_uses_configured_token_prices(input_rate, output_rate):
+    from litellm.types.utils import ImageResponse
+
+    model = "image-token-pricing-regression"
+    litellm.register_model(model_cost={model: {
+        "input_cost_per_token": input_rate,
+        "output_cost_per_token": output_rate,
+        "litellm_provider": "chatgpt",
+        "mode": "responses",
+    }})
+    response = ImageResponse(data=[{"b64_json": "AA=="}], usage={
+        "input_tokens": 132, "output_tokens": 829, "total_tokens": 961,
+        "input_tokens_details": {"text_tokens": 132, "image_tokens": 0},
+        "output_tokens_details": {"text_tokens": 0, "image_tokens": 829},
+    })
+    cost = litellm.completion_cost(
+        model="chatgpt/gpt-6-astra", completion_response=response,
+        call_type="aimage_generation", custom_llm_provider="chatgpt",
+        custom_pricing=True, router_model_id=model,
+    )
+    assert cost == pytest.approx(132 * input_rate + 829 * output_rate)
+
+
 def test_custom_pricing_cost_calc_uses_router_model_id_from_litellm_metadata():
     """When custom pricing is in litellm_metadata.model_info,
     use_custom_pricing_for_model should return True and

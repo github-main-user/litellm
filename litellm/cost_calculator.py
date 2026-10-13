@@ -1493,6 +1493,34 @@ def completion_cost(
                 if CostCalculatorUtils._call_type_has_image_response(call_type) and isinstance(
                     completion_response, ImageResponse
                 ):
+                    image_pricing: Final = litellm.model_cost.get(
+                        router_model_id or model, litellm.model_cost.get(model, {})
+                    )
+                    if (
+                        custom_pricing
+                        and (prompt_tokens or completion_tokens)
+                        and (
+                            custom_cost_per_token is not None
+                            or (
+                                image_pricing.get("input_cost_per_token") is not None
+                                and image_pricing.get("output_cost_per_token") is not None
+                                and image_pricing.get("input_cost_per_image") is None
+                                and image_pricing.get("input_cost_per_pixel") is None
+                                and image_pricing.get("output_cost_per_image") is None
+                            )
+                        )
+                    ):
+                        input_cost, output_cost = cost_per_token(
+                            model=model,
+                            prompt_tokens=prompt_tokens or 0,
+                            completion_tokens=completion_tokens or 0,
+                            custom_llm_provider=custom_llm_provider,
+                            custom_cost_per_token=custom_cost_per_token,
+                            cache_creation_input_tokens=cache_creation_input_tokens,
+                            cache_read_input_tokens=cache_read_input_tokens,
+                            service_tier=service_tier,
+                        )
+                        return input_cost + output_cost
                     ### IMAGE GENERATION COST CALCULATION ###
                     return CostCalculatorUtils.route_image_generation_cost_calculator(
                         model=model,
