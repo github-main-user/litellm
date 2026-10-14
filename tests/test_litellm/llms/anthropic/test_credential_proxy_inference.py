@@ -3,6 +3,8 @@ import json
 import socketserver
 import threading
 from contextlib import contextmanager
+from itertools import takewhile
+from typing import Final
 
 import pytest
 
@@ -24,9 +26,12 @@ async def flush_request_logging(isolate_litellm_state):
 class _Proxy(socketserver.StreamRequestHandler):
     def handle(self):
         request_line = self.rfile.readline().decode("ascii")
-        while self.rfile.readline() not in (b"\r\n", b""):
-            pass
+        headers: Final = tuple(takewhile(lambda line: line != b"\r\n", iter(self.rfile.readline, b"")))
+        content_length: Final = next(
+            (int(header.split(b":", 1)[1]) for header in headers if header.lower().startswith(b"content-length:")), 0
+        )
         self.server.seen.append(request_line)
+        self.server.bodies.append(self.rfile.read(content_length))
         body = self.server.body
         self.wfile.write(
             f"HTTP/1.1 {self.server.status_code}\r\nContent-Type: ".encode()
@@ -46,6 +51,7 @@ def _proxy(body: bytes, content_type: bytes = b"application/json", status_code: 
     server.content_type = content_type
     server.status_code = status_code
     server.seen = []
+    server.bodies = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -154,6 +160,222 @@ async def test_chatgpt_responses_and_native_messages_use_named_proxy(monkeypatch
         "POST http://responses-upstream.invalid/backend-api/codex/responses HTTP/1.1\r\n"
     ] * 2
     assert messages_proxy.seen == ["POST http://messages-upstream.invalid/v1/messages HTTP/1.1\r\n"]
+
+
+def _hosted_search_stream(provider: str, text: str) -> bytes:
+    url: Final = f"https://example.com/{text}"
+    query: Final = f"Search the web for {text}"
+    if provider == "anthropic":
+        events: Final = (
+            {"type": "message_start", "message": {
+                "id": "msg_search", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "server_tool_use", "id": "srvtoolu_search", "name": "web_search", "input": {},
+            }},
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": json.dumps({"query": query}),
+            }},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {
+                "type": "web_search_tool_result", "tool_use_id": "srvtoolu_search", "content": [{
+                    "type": "web_search_result", "url": url, "title": text,
+                    "encrypted_content": "encrypted-search-result", "page_age": "1 day ago",
+                }],
+            }},
+            {"type": "content_block_stop", "index": 1},
+            {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 2},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        )
+        return "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+    search: Final = {
+        "id": "ws_search", "type": "web_search_call", "status": "completed",
+        "action": {"type": "search", "query": query, "sources": [{"type": "url", "url": url}]},
+    }
+    content: Final = {"type": "output_text", "text": text, "annotations": []}
+    message: Final = {
+        "id": "msg_search", "type": "message", "role": "assistant", "status": "completed", "content": [content],
+    }
+    response: Final = {
+        "id": "resp_search", "object": "response", "created_at": 1, "status": "completed", "model": "gpt-5.5",
+        "output": [search, message], "parallel_tool_calls": True, "tools": [{"type": "web_search"}],
+        "tool_choice": "auto", "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+    response_events: Final = (
+        {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {**search, "status": "in_progress", "action": None}},
+        *({"type": f"response.web_search_call.{status}", "output_index": 0, "item_id": search["id"]}
+          for status in ("in_progress", "searching", "completed")),
+        {"type": "response.output_item.done", "output_index": 0, "item": search},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {**message, "status": "in_progress", "content": []}},
+        {"type": "response.content_part.added", "output_index": 1, "item_id": message["id"],
+         "content_index": 0, "part": {**content, "text": ""}},
+        {"type": "response.output_text.delta", "output_index": 1, "item_id": message["id"],
+         "content_index": 0, "delta": text},
+        {"type": "response.output_text.done", "output_index": 1, "item_id": message["id"],
+         "content_index": 0, "text": text},
+        {"type": "response.content_part.done", "output_index": 1, "item_id": message["id"],
+         "content_index": 0, "part": content},
+        {"type": "response.output_item.done", "output_index": 1, "item": message},
+        {"type": "response.completed", "response": response},
+    )
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps({**event, 'sequence_number': index})}\n\n"
+        for index, event in enumerate(response_events)
+    ).encode()
+
+
+def _hosted_search_response(provider: str, text: str, stream: bool = False) -> bytes:
+    if stream:
+        return _hosted_search_stream(provider, text)
+    message: Final = {
+        "id": "msg_search", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+        "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    if provider == "anthropic":
+        return json.dumps(message).encode()
+    response: Final = {
+        "id": "resp_search", "object": "response", "created_at": 1, "status": "completed", "model": "gpt-5.5",
+        "output": [{
+            "id": "msg_search", "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+        "parallel_tool_calls": True, "tools": [{"type": "web_search"}], "tool_choice": "auto",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+    return (
+        "event: response.completed\ndata: "
+        + json.dumps({"type": "response.completed", "sequence_number": 1, "response": response})
+        + "\n\n"
+    ).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["chatgpt", "anthropic"])
+@pytest.mark.parametrize("proxy_fails", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_hosted_search_responses_stays_on_each_account_proxy(monkeypatch, provider, proxy_fails, stream):
+    from unittest.mock import AsyncMock
+
+    from litellm.llms.anthropic.oauth_client import AnthropicOAuthTokens, ManagedAnthropicOAuthToken
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    content_type: Final = b"text/event-stream" if stream or provider == "chatgpt" else b"application/json"
+    function_tool: Final = {
+        "type": "function", "name": "webfetch", "description": "Fetch a URL",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    }
+    with (
+        _proxy(_hosted_search_response(provider, "direct", stream), content_type) as direct,
+        _proxy(
+            b'{"error":{"type":"api_error","message":"Account proxy unavailable"}}'
+            if proxy_fails else _hosted_search_response(provider, "first", stream),
+            b"application/json" if proxy_fails else content_type,
+            status_code=503 if proxy_fails else 200,
+        ) as first,
+        _proxy(_hosted_search_response(provider, "second", stream), content_type) as second,
+    ):
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setenv("no_proxy", "*")
+        monkeypatch.setattr(litellm, "credential_list", [
+            CredentialItem(
+                credential_name=name,
+                credential_info={"provider": provider, "auth_type": "oauth"},
+                credential_values={
+                    **_credential(name, proxy).credential_values,
+                    **({
+                        "litellm_internal_chatgpt_auth_token": ChatGPTTokens(
+                            "access-token", "refresh", "id", 9999999999, name,
+                        ).to_json(),
+                    } if provider == "chatgpt" else {
+                        "litellm_internal_anthropic_auth_token": AnthropicOAuthTokens(
+                            "sk-ant-oat-test", "refresh", 9999999999, name, "a" * 64,
+                        ).to_json(),
+                    }),
+                },
+            ) for name, proxy in (("first", first), ("second", second))
+        ])
+        direct_request: Final = AsyncMock()
+        direct_client: Final = AsyncHTTPHandler(event_hooks={"request": [direct_request]})
+        path: Final = "/backend-api/codex" if provider == "chatgpt" else "/v1/messages"
+        api_base: Final = f"http://127.0.0.1:{direct.server_address[1]}{path}"
+
+        async def search(account: str):
+            result: Final = await litellm.aresponses(
+                model="chatgpt/gpt-5.5" if provider == "chatgpt" else "anthropic/claude-sonnet-5",
+                input=f"Search the web for {account}", tools=[{"type": "web_search"}, function_tool], stream=stream,
+                include=["web_search_call.action.sources"],
+                api_key=ManagedChatGPTAccessToken("access-token") if provider == "chatgpt"
+                else ManagedAnthropicOAuthToken("sk-ant-oat-test"),
+                api_base=api_base, litellm_credential_name=account, client=direct_client,
+                max_retries=0, num_retries=0, max_output_tokens=100,
+                **({"chatgpt_auth_account_id": account} if provider == "chatgpt" else {}),
+            )
+            if not stream:
+                return result.output[0].content[0].text
+            events: Final = tuple([event async for event in result])
+            assert [event.type for event in events if event.type.startswith("response.web_search_call.")] == [
+                "response.web_search_call.in_progress", "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ]
+            assert "".join(event.delta for event in events if event.type == "response.output_text.delta") == account
+            search_items: Final = tuple(
+                event.item for event in events
+                if event.type == "response.output_item.done" and event.item.type == "web_search_call"
+            )
+            assert len(search_items) == 1
+            assert search_items[0].status == "completed"
+            action: Final = search_items[0].model_dump()["action"]
+            assert action["query"] == f"Search the web for {account}"
+            assert action["sources"] == [{"type": "url", "url": f"https://example.com/{account}"}]
+            completed: Final = tuple(event.response for event in events if event.type == "response.completed")
+            assert len(completed) == 1
+            assert completed[0].status == "completed"
+            assert not any(item.type == "function_call" for item in completed[0].output)
+            return "".join(
+                content.text for item in completed[0].output if item.type == "message" for content in item.content
+                if content.type == "output_text"
+            )
+
+        try:
+            if proxy_fails:
+                with pytest.raises(litellm.ServiceUnavailableError):
+                    await search("first")
+                assert second.seen == []
+            else:
+                first_response: Final = await search("first")
+                assert first_response == "first"
+            second_response: Final = await search("second")
+            assert second_response == "second"
+        finally:
+            await direct_client.close()
+
+        direct_request.assert_not_called()
+        assert direct.seen == []
+        expected_url: Final = api_base + ("/responses" if provider == "chatgpt" else "")
+        assert first.seen == second.seen == [f"POST {expected_url} HTTP/1.1\r\n"]
+        for proxy in (first, second):
+            payload: Final = json.loads(proxy.bodies[0])
+            assert payload.get("stream", False) is (stream or provider == "chatgpt")
+            if provider == "chatgpt":
+                assert payload["tools"] == [{"type": "web_search"}, function_tool]
+                assert "web_search_call.action.sources" in payload["include"]
+            else:
+                assert len(payload["tools"]) == 2
+                tools_by_name: Final = {tool["name"]: tool for tool in payload["tools"]}
+                assert tools_by_name["web_search"]["type"].startswith("web_search_")
+                assert tools_by_name["WebFetch"] == {
+                    "type": "custom", "name": "WebFetch", "description": function_tool["description"],
+                    "input_schema": function_tool["parameters"],
+                }
 
 
 class _CredentialHook:
