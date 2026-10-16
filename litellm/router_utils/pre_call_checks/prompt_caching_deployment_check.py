@@ -217,7 +217,22 @@ class PromptCachingDeploymentCheck(CustomLogger):
             return
 
         model: Final = standard_logging_object["model"]
-        logged_messages: Final = standard_logging_object["messages"]
+        callback_kwargs: Final = cast(Mapping[str, object], kwargs)
+        logged_payload: Final = cast(Mapping[str, object], standard_logging_object)
+        logged_messages: Final = (
+            _routing_prompt_caching_messages(
+                None,
+                {
+                    **callback_kwargs,
+                    **cast(Mapping[str, object], callback_kwargs.get("optional_params") or {}),
+                    **cast(Mapping[str, object], logged_payload.get("model_parameters") or {}),
+                    "input": logged_payload["messages"],
+                },
+                (cast(str, model),),
+            )
+            if call_type in (CallTypes.responses.value, CallTypes.aresponses.value)
+            else standard_logging_object["messages"]
+        )
         model_id: Final = standard_logging_object["model_id"]
         request_key: Final = next(
             (

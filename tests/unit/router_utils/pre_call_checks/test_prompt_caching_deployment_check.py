@@ -355,6 +355,43 @@ async def test_responses_auto_cached_prefix_reuses_completion_affinity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["responses", "aresponses"])
+@pytest.mark.parametrize("structured_input", [False, True])
+@pytest.mark.parametrize("params_location", ["optional_params", "model_parameters"])
+@pytest.mark.parametrize("previous_response_id", [None, "resp_previous"])
+async def test_responses_success_normalizes_input_and_preserves_prefix_parameters(
+    call_type, structured_input, params_location, previous_response_id
+):
+    check: Final = PromptCachingDeploymentCheck(cache=DualCache())
+    deployments: Final = _deployments(AUTO_CACHING_MODEL, AUTO_CACHING_MODEL)
+    response_input: Final = (
+        [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}] if structured_input else "hello"
+    )
+    params: Final = {"instructions": "word " * 3000, "previous_response_id": previous_response_id}
+    logged: Final = {
+        "call_type": call_type,
+        "model": AUTO_CACHING_MODEL,
+        "model_id": "dep-2",
+        "messages": response_input,
+        **({"model_parameters": params} if params_location == "model_parameters" else {}),
+    }
+    kwargs: Final = {
+        "standard_logging_object": logged,
+        **({"optional_params": params} if params_location == "optional_params" else {}),
+    }
+    original: Final = copy.deepcopy(kwargs)
+    await check.async_log_success_event(kwargs, None, None, None)
+    filtered: Final = await check.async_filter_deployments(
+        model=MODEL_GROUP_ALIAS,
+        healthy_deployments=deployments,
+        messages=None,
+        request_kwargs={"input": response_input, "instructions": params["instructions"]},
+    )
+    assert filtered == (deployments if previous_response_id else [deployments[1]])
+    assert kwargs == original
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("async_cache", [False, True])
 @pytest.mark.parametrize("block_markers", [False, True])
 async def test_cache_reuses_stable_boundaries_but_prefers_the_longest_prefix(async_cache, block_markers):
