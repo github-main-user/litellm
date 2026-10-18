@@ -1,0 +1,55 @@
+name: void-litellm
+
+services:
+  litellm:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${LITELLM_IMAGE:-void-litellm}
+    networks:
+      default:
+      inference:
+        aliases:
+          - litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_PUBLIC_API_BRAND: "VoidAPI"
+      DATABASE_URL: postgresql://${LITELLM_POSTGRES_USER:?Set LITELLM_POSTGRES_USER}:${LITELLM_POSTGRES_PASSWORD:?Set LITELLM_POSTGRES_PASSWORD}@litellm-db:5432/${LITELLM_POSTGRES_DB:?Set LITELLM_POSTGRES_DB}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?Set LITELLM_SALT_KEY}
+      LENGTH_OF_LITELLM_GENERATED_KEY: "32"
+      STORE_MODEL_IN_DB: "True"
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+
+  litellm-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${LITELLM_POSTGRES_DB:?Set LITELLM_POSTGRES_DB}
+      POSTGRES_USER: ${LITELLM_POSTGRES_USER:?Set LITELLM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${LITELLM_POSTGRES_PASSWORD:?Set LITELLM_POSTGRES_PASSWORD}
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+networks:
+  default:
+  inference:
+    external: true
+    name: ${LITELLM_API_NETWORK:-void-inference}
+
+volumes:
+  litellm_postgres_data:

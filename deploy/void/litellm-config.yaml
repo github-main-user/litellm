@@ -1,0 +1,14 @@
+litellm_settings:
+  block_requests_for_models_without_pricing: true
+
+general_settings:
+  fail_closed_budget_enforcement: true
+
+router_settings:
+  routing_strategy: simple-shuffle
+  enable_weighted_failover: true
+  optional_pre_call_checks:
+    - responses_api_deployment_check
+    - encrypted_content_affinity
+    - session_affinity
+    - prompt_caching

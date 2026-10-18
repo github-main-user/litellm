@@ -1,0 +1,9 @@
+name: void-litellm-dev
+
+services:
+  litellm:
+    image: ${LITELLM_IMAGE:-void-litellm-dev}
+
+networks:
+  inference:
+    name: ${LITELLM_API_NETWORK:-void-inference-dev}

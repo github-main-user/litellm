@@ -1,0 +1,10 @@
+services:
+  litellm:
+    restart: unless-stopped
+  litellm-db:
+    restart: unless-stopped
+
+volumes:
+  litellm_postgres_data:
+    external: true
+    name: ${LITELLM_POSTGRES_VOLUME:?Set LITELLM_POSTGRES_VOLUME to the existing PostgreSQL 16 volume}
