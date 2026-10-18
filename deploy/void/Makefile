@@ -32,7 +32,8 @@ prod-check-volume:
 	volume="$$($(PROD_COMPOSE) config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["volumes"]["litellm_postgres_data"]["name"])')"; \
 	docker volume inspect "$$volume" >/dev/null; \
 	current="$$($(PROD_COMPOSE) ps -q litellm-db)"; \
-	for container in $$(docker ps -q --no-trunc --filter "volume=$$volume"); do \
+	containers="$$(docker ps -q --no-trunc --filter "volume=$$volume")"; \
+	for container in $$containers; do \
 		test "$$container" = "$$current" || { printf 'Stop container %s before handing off volume %s\n' "$$container" "$$volume" >&2; exit 1; }; \
 	done; \
 	if test -z "$$current"; then \
