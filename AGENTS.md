@@ -116,6 +116,12 @@ Before implementing:
 - If a simpler approach exists, say so. Push back when warranted
 - If something is unclear, stop. Name what's confusing. Ask
 
+## Void Deployment
+
+Pushes and merges to `main` in `github-main-user/litellm` run the dedicated Void CI workflow; production deployment follows only successful checks. Monitor that workflow rather than deploying manually. Do not bypass failed checks
+
+Manual deployment is reserved for exceptional recovery: on `ssh dima`, hold `/var/lock/void-deploy.lock` with `flock`, pull `/root/litellm` using `git pull --ff-only`, then run `make -C deploy/void prod-up UP_FLAGS="--wait --wait-timeout 180"` and verify health. Use `make -C deploy/void prod-ps` for status. Preserve the standalone environment, existing external PostgreSQL volume, encryption keys, and shared internal API network. Never run the Void application stack from this repository
+
 ## Data Migration
 
 Prefer proper migrations or a verified one-time manual transfer over legacy compatibility bridges, startup import gates, or environment flags claiming data was transferred. Verify transferred data before dropping source tables, and make cross-database transfers safe to retry after partial completion

@@ -1,0 +1,115 @@
+name: Void LiteLLM CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: "3.13"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_CLI_DISABLE_KEYRING: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: Resolve explicit gate base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+            BASE_SHA=$(git rev-parse HEAD^)
+          fi
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$BASE_SHA^{commit}" || git fetch --no-tags origin "$BASE_SHA"
+          echo "BASE_REF=$(git merge-base "$BASE_SHA" HEAD)" >> "$GITHUB_ENV"
+      - name: Install locked dependencies and Rust extension
+        run: |
+          rustup show active-toolchain
+          uv lock --check
+          uv sync --frozen --extra proxy --group proxy-dev --group ci
+          uv run --no-sync python -c 'import litellm.rust_bridge._native'
+          uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
+          uv run --no-sync python -c 'import tiktoken; [tiktoken.get_encoding(name) for name in ("cl100k_base", "o200k_base", "p50k_base", "r50k_base")]'
+      - name: Check lint and type budgets
+        run: |
+          make LINT_DEP_INSTALL= lint-format-check-changed
+          uv run --no-sync ruff check \
+            litellm/litellm_core_utils/credential_proxy.py \
+            litellm/llms/anthropic/oauth_client.py \
+            litellm/llms/chatgpt/oauth_client.py \
+            litellm/proxy/credential_endpoints \
+            litellm/router_utils/pre_call_checks/prompt_caching_deployment_check.py \
+            litellm/proxy/spend_tracking/budget_reservation.py
+          uv run --no-sync python scripts/ruff_strict_gate.py --base "$BASE_REF"
+          uv run --no-sync python scripts/type_discipline_gate.py --base "$BASE_REF"
+          uv run --no-sync python scripts/type_check_gate.py --base "$BASE_REF"
+      - name: Run offline fork regressions
+        run: |
+          uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/test_litellm/llms/anthropic/test_anthropic_oauth_client.py \
+            tests/test_litellm/llms/chatgpt/test_chatgpt_oauth_client.py \
+            tests/test_litellm/llms/anthropic/test_credential_proxy_inference.py
+          uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/test_litellm/proxy/credential_endpoints/test_anthropic_oauth.py \
+            tests/test_litellm/proxy/credential_endpoints/test_chatgpt_oauth.py \
+            tests/test_litellm/proxy/credential_endpoints/test_subscription_usage.py \
+            tests/test_litellm/proxy/test_budget_reservation.py
+          uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/unit/litellm_core_utils/test_credential_proxy.py \
+            tests/unit/router_utils/pre_call_checks/test_prompt_caching_deployment_check.py::test_responses_auto_cached_prefix_reuses_completion_affinity \
+            tests/unit/router_utils/pre_call_checks/test_prompt_caching_deployment_check.py::test_responses_success_normalizes_input_and_preserves_prefix_parameters \
+            tests/unit/router_utils/pre_call_checks/test_session_id_affinity.py
+      - name: Validate deployment script
+        run: |
+          bash -n deploy/void/ci-deploy.sh
+          shellcheck deploy/void/ci-deploy.sh
+
+  deploy:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'github-main-user/litellm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: void-litellm-production
+      cancel-in-progress: false
+    steps:
+      - name: Deploy checked commit
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DEPLOY_HOST" && "$DEPLOY_PORT" =~ ^[0-9]+$ ]]
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          umask 077
+          directory=$(mktemp -d)
+          trap 'rm -rf "$directory"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$directory/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$directory/known_hosts"
+          ssh -F /dev/null -T -i "$directory/key" -p "$DEPLOY_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$directory/known_hosts" \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            "root@$DEPLOY_HOST" "litellm-deploy $DEPLOY_SHA"
