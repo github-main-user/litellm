@@ -17,6 +17,7 @@ from typing_extensions import ReadOnly, TypedDict
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.constants import EMPTY_MAPPING
 from litellm.exceptions import UnsupportedParamsError
 from litellm.router_utils.reasoning_effort_capability import declared_reasoning_efforts_for_model
 from litellm.types.llms.openai import AllMessageValues
@@ -236,6 +237,16 @@ class TogetherAIChatConfig(OpenAIGPTConfig):
         mapped_openai_params: Final = super().map_openai_params(non_default_params, optional_params, model, drop_params)
         for param in _tool_params_to_drop(mapped_openai_params, model, drop_params):
             mapped_openai_params.pop(param)
+        response_format: Final = mapped_openai_params.get("response_format")
+        if (
+            isinstance(response_format, dict)
+            and response_format.get("json_schema", EMPTY_MAPPING).get("strict") is True
+            and _response_schema_verdict(model) is False
+        ):
+            raise UnsupportedParamsError(
+                status_code=400,
+                message=f"Together model {model} cannot provide strict JSON schema output; response_format cannot be dropped.",
+            )
         if _drop_response_format(mapped_openai_params, model, drop_params):
             mapped_openai_params.pop("response_format")
         effort: Final = mapped_openai_params.get("reasoning_effort")

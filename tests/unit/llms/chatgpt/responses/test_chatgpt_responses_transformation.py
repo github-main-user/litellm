@@ -751,3 +751,383 @@ async def test_public_managed_sessions_isolate_owners_and_keys_with_protected_he
             ("originator", "managed-origin"), ("user-agent", "managed-client/1"), ("session_id", headers["session_id"]),
         ):
             assert headers.get_list(name) == [value]
+
+
+import copy
+import jsonschema
+
+@pytest.fixture(autouse=True)
+def offline_transport(monkeypatch):
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["answer", "keywords"],
+    "additionalProperties": False,
+}
+URL = "https://chatgpt.test/backend-api/codex/responses"
+OUTPUT = '{"answer":"ok","keywords":["schema"]}'
+
+
+def text_format(strict):
+    return {"format": {"type": "json_schema", "name": "Answer", "strict": strict, "schema": copy.deepcopy(SCHEMA)}}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+def test_schema_provider_boundary(stream, strict):
+    optional = {"text": text_format(strict), "stream": stream}
+    original = copy.deepcopy(optional)
+    body = ChatGPTResponsesAPIConfig().transform_responses_api_request(
+        model="gpt-6.1-sol",
+        input="Explain structured output in one sentence",
+        response_api_optional_request_params=optional,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert body["text"] == original["text"]
+    assert body["text"]["format"]["strict"] is strict
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert body["include"] == ["reasoning.encrypted_content"]
+    assert optional == original
+
+
+def event_body(output=OUTPUT, kind="completed"):
+    content = (
+        {"type": "refusal", "refusal": "Cannot help."}
+        if kind == "refusal"
+        else {"type": "output_text", "text": output, "annotations": []}
+    )
+    item = {"type": "message", "id": "msg_schema", "role": "assistant", "status": "completed", "content": [content]}
+    response = {
+        "id": "resp_schema",
+        "object": "response",
+        "created_at": 1700000000,
+        "status": "incomplete" if kind == "incomplete" else "completed",
+        "model": "gpt-6.1-sol",
+        "output": [item],
+    }
+    if kind == "incomplete":
+        response["incomplete_details"] = {"reason": "max_output_tokens"}
+    empty = {**response, "status": "in_progress", "output": []}
+    events = [
+        {"type": "response.created", "response": empty},
+        {"type": "response.output_item.added", "output_index": 0, "item": {**item, "content": []}},
+        {
+            "type": "response.content_part.added",
+            "item_id": "msg_schema",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {**content, **({"text": ""} if kind != "refusal" else {"refusal": ""})},
+        },
+    ]
+    if kind != "refusal":
+        events.append(
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_schema",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": output,
+            }
+        )
+    else:
+        events.append(
+            {
+                "type": "response.refusal.delta",
+                "item_id": "msg_schema",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Cannot help.",
+            }
+        )
+    events.extend(
+        [
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.incomplete" if kind == "incomplete" else "response.completed", "response": response},
+        ]
+    )
+    return "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+
+
+async def invoke(api, asynchronous, stream, strict, credential, invalid=False):
+    params = {
+        "model": "chatgpt/gpt-6.1-sol",
+        "api_key": ManagedChatGPTAccessToken("managed-token"),
+        "api_base": "https://chatgpt.test/backend-api/codex",
+        "chatgpt_auth_account_id": "managed-account",
+        "litellm_credential_name": credential,
+        "num_retries": 0,
+        "stream": stream,
+    }
+    if strict is not None:
+        fmt = text_format(strict)
+        if invalid:
+            fmt["format"]["schema"]["required"] = ["answer"]
+        params.update(
+            {"text": fmt}
+            if api == "responses"
+            else {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {k: v for k, v in fmt["format"].items() if k != "type"},
+                }
+            }
+        )
+    original = copy.deepcopy(params)
+    if api == "responses":
+        result = (
+            await litellm.aresponses(input="Explain structured output in one sentence", **params)
+            if asynchronous
+            else litellm.responses(input="Explain structured output in one sentence", **params)
+        )
+    else:
+        messages = [{"role": "user", "content": "Explain structured output in one sentence"}]
+        result = (
+            await litellm.acompletion(messages=messages, **params)
+            if asynchronous
+            else litellm.completion(messages=messages, **params)
+        )
+    assert params == original
+    return result
+
+
+async def consume(result, api, asynchronous, stream):
+    if not stream:
+        return result.output_text if api == "responses" else result.choices[0].message.content
+    chunks = []
+    if asynchronous:
+        async for chunk in result:
+            chunks.append(chunk)
+    else:
+        chunks = list(result)
+    if api == "responses":
+        return "".join(chunk.delta for chunk in chunks if chunk.type == "response.output_text.delta")
+    return "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("strict", [False, True, None], ids=["strict-false", "strict-true", "plain"])
+async def test_schema_public_wire(
+    api, asynchronous, stream, strict, respx_mock, local_model_cost_map, managed_credential
+):
+    output = OUTPUT if strict is not None else "Hello!"
+    route = respx_mock.post(URL).respond(200, headers={"content-type": "text/event-stream"}, text=event_body(output))
+    result = await invoke(api, asynchronous, stream, strict, managed_credential)
+    assert await consume(result, api, asynchronous, stream) == output
+    assert route.call_count == 1
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == "gpt-6.1-sol"
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert body["include"] == ["reasoning.encrypted_content"]
+    assert "response_format" not in body
+    assert "json_schema" not in body
+    if strict is None:
+        assert "text" not in body
+    else:
+        assert body["text"] == text_format(strict)
+        assert body["text"]["format"]["strict"] is strict
+        jsonschema.validate(json.loads(output), SCHEMA)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_schema_invalid_upstream_stays_error(
+    api, asynchronous, stream, respx_mock, local_model_cost_map, managed_credential
+):
+    error = {
+        "message": "Invalid schema for response_format 'Answer': Missing 'keywords'.",
+        "type": "invalid_request_error",
+        "param": "text.format.schema",
+        "code": "invalid_json_schema",
+    }
+    route = respx_mock.post(URL).respond(400, json={"error": error})
+    with pytest.raises(litellm.BadRequestError, match="invalid_json_schema") as exc:
+        await invoke_and_consume(api, asynchronous, stream, managed_credential, invalid=True)
+    assert exc.value.status_code == 400
+    assert "text.format.schema" in str(exc.value)
+    assert route.call_count == 1
+    expected = text_format(True)
+    expected["format"]["schema"]["required"] = ["answer"]
+    assert json.loads(route.calls[0].request.content)["text"] == expected
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("kind", ["refusal", "incomplete"])
+@pytest.mark.parametrize("api", ["chat", "responses"])
+async def test_schema_non_success_semantics(
+    kind, api, asynchronous, respx_mock, local_model_cost_map, managed_credential
+):
+    route = respx_mock.post(URL).respond(
+        200, headers={"content-type": "text/event-stream"}, text=event_body("partial", kind)
+    )
+    if kind == "incomplete":
+        with pytest.raises(litellm.APIError, match=r"response\.incomplete"):
+            await invoke(api, asynchronous, False, True, managed_credential)
+        assert route.call_count == 1
+        assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
+        return
+    result = await invoke(api, asynchronous, False, True, managed_credential)
+    if api == "chat":
+        assert not result.choices[0].message.content
+        assert result.choices[0].message.refusal == "Cannot help."
+        assert result.choices[0].finish_reason == "stop"
+        return
+    assert result.output[0].content[0].refusal == "Cannot help."
+    assert not result.output_text
+    assert route.call_count == 1
+    assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("event_type", ["error", "response.failed"])
+async def test_schema_sse_rejection_never_succeeds(
+    api, stream, event_type, asynchronous, respx_mock, local_model_cost_map, managed_credential
+):
+    error = {
+        "message": "invalid_json_schema: Missing keywords",
+        "type": "invalid_request_error",
+        "code": "invalid_json_schema",
+        "param": "text.format.schema",
+    }
+    event = {
+        "type": event_type,
+        **(
+            {"error": error}
+            if event_type == "error"
+            else {
+                "response": {
+                    "id": "resp_error",
+                    "object": "response",
+                    "created_at": 1,
+                    "model": "gpt-6.1-sol",
+                    "status": "failed",
+                    "output": [],
+                    "error": error,
+                }
+            }
+        ),
+    }
+    route = respx_mock.post(URL).respond(
+        200, headers={"content-type": "text/event-stream"}, text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+    )
+    with pytest.raises(litellm.BadRequestError, match="invalid_json_schema") as exc:
+        await invoke_and_consume(api, asynchronous, stream, managed_credential)
+    assert exc.value.status_code == 400
+    assert "text.format.schema" in (str(exc.value) + str(exc.value.body))
+    assert route.call_count == 1
+    assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("kind", ["refusal", "incomplete"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_schema_stream_non_success(api, kind, asynchronous, respx_mock, local_model_cost_map, managed_credential):
+    route = respx_mock.post(URL).respond(
+        200, headers={"content-type": "text/event-stream"}, text=event_body("partial", kind)
+    )
+    result = await invoke(api, asynchronous, True, True, managed_credential)
+    chunks = [chunk async for chunk in result] if asynchronous else list(result)
+    assert route.call_count == 1
+    assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
+    if api == "responses":
+        if kind == "refusal":
+            assert any(chunk.type == "response.refusal.delta" and chunk.delta == "Cannot help." for chunk in chunks)
+        else:
+            terminal = [chunk for chunk in chunks if chunk.type == "response.incomplete"]
+            assert len(terminal) == 1
+            assert terminal[0].response.status == "incomplete"
+    elif kind == "incomplete":
+        assert chunks[-1].choices[0].finish_reason == "length"
+    else:
+        assert not any(chunk.choices[0].delta.content for chunk in chunks if chunk.choices)
+        assert (
+            "".join(getattr(chunk.choices[0].delta, "refusal", None) or "" for chunk in chunks if chunk.choices)
+            == "Cannot help."
+        )
+        assert [
+            chunk.choices[0].finish_reason for chunk in chunks if chunk.choices and chunk.choices[0].finish_reason
+        ] == ["stop"]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("event_type", ["error", "response.failed"])
+@pytest.mark.parametrize(
+    "error_type,code,exception,status",
+    [
+        ("invalid_request_error", "invalid_json_schema", litellm.BadRequestError, 400),
+        ("server_error", "rate_limit_exceeded", litellm.RateLimitError, 429),
+        ("server_error", "vector_store_timeout", litellm.Timeout, 504),
+        ("server_error", "internal_error", litellm.InternalServerError, 500),
+        (None, "unrecognized_provider_failure", litellm.InternalServerError, 500),
+        (None, "bio_policy", litellm.BadRequestError, 400),
+        (None, "data_residency_mismatch", litellm.BadRequestError, 400),
+    ],
+)
+async def test_nonstream_sse_failure_classification(
+    api,
+    asynchronous,
+    event_type,
+    error_type,
+    code,
+    exception,
+    status,
+    respx_mock,
+    local_model_cost_map,
+    managed_credential,
+):
+    error = {"message": "Provider diagnostic", "type": error_type, "code": code, "param": "text.format.schema"}
+    event = {"type": event_type, **({"error": error} if event_type == "error" else {"response": {"error": error}})}
+    route = respx_mock.post(URL).respond(
+        200, headers={"content-type": "text/event-stream"}, text=f"data: {json.dumps(event)}\n\n"
+    )
+    with pytest.raises(exception) as raised:
+        await invoke(api, asynchronous, False, True, managed_credential)
+    assert raised.value.status_code == status
+    assert code in str(raised.value)
+    assert "Provider diagnostic" in str(raised.value)
+    assert "text.format.schema" in str(raised.value)
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_sol_reasoning_reaches_public_wire(
+    api, asynchronous, respx_mock, local_model_cost_map, managed_credential
+):
+    route = respx_mock.post(URL).respond(200, headers={"content-type": "text/event-stream"}, text=event_body())
+    params = {
+        "model": "chatgpt/gpt-6.1-sol",
+        "api_key": ManagedChatGPTAccessToken("managed-token"),
+        "api_base": "https://chatgpt.test/backend-api/codex",
+        "litellm_credential_name": managed_credential,
+        "num_retries": 0,
+    }
+    if api == "chat":
+        call = litellm.acompletion if asynchronous else litellm.completion
+        result = call(messages=[{"role": "user", "content": "Return JSON"}], reasoning_effort="high", **params)
+    else:
+        call = litellm.aresponses if asynchronous else litellm.responses
+        result = call(input="Return JSON", reasoning={"effort": "high"}, **params)
+    if asynchronous:
+        await result
+    assert route.call_count == 1
+    assert json.loads(route.calls[0].request.content)["reasoning"]["effort"] == "high"
+
+
+async def invoke_and_consume(api, asynchronous, stream, credential, invalid=False):
+    result = await invoke(api, asynchronous, stream, True, credential, invalid=invalid)
+    return await consume(result, api, asynchronous, stream)

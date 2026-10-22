@@ -10,6 +10,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.constants import EMPTY_MAPPING
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.openai.chat.gpt_transformation import (
     OpenAIChatCompletionStreamingHandler,
@@ -227,6 +228,11 @@ class GroqChatConfig(OpenAILikeChatConfig):
             if json_schema is not None:
                 # Check if model supports native response_schema
                 if not litellm.supports_response_schema(model=model, custom_llm_provider="groq"):
+                    if _response_format.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+                        raise litellm.utils.UnsupportedParamsError(
+                            status_code=400,
+                            message=f"Groq model {model} cannot provide native strict JSON schema output.",
+                        )
                     # Check if user is also passing tools - this combination won't work
                     # See: https://console.groq.com/docs/structured-outputs
                     # "Streaming and tool use are not currently supported with Structured Outputs"

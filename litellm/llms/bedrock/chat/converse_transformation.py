@@ -16,6 +16,7 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm.constants import (
     BEDROCK_MIN_THINKING_BUDGET_TOKENS,
+    EMPTY_MAPPING,
     RESPONSE_FORMAT_TOOL_NAME,
 )
 from litellm.litellm_core_utils.core_helpers import (
@@ -1202,6 +1203,11 @@ class AmazonConverseConfig(BaseConfig):
             )
             optional_params["outputConfig"] = output_config
         elif json_schema is not None:
+            if value.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+                raise litellm.utils.UnsupportedParamsError(
+                    status_code=400,
+                    message=f"Bedrock model {model} cannot provide native strict JSON schema output.",
+                )
             # Fallback: translate to a synthetic tool call
             # https://docs.anthropic.com/en/docs/build-with-claude/tool-use#json-mode
             _tool: Final = self._create_json_tool_call_for_response_format(

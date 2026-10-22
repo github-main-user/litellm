@@ -202,3 +202,51 @@ class TestGroqWebSearchUsageSignal:
         model_response = litellm.ModelResponse()
         GroqChatConfig()._add_web_search_usage(model_response=model_response)
         assert getattr(model_response, "usage", None) is None
+
+
+import copy
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize('provider', ['groq'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_preserved_downgrade_guards(provider, strict, monkeypatch):
+    from litellm.llms.groq.chat.transformation import GroqChatConfig
+    value = preserved_response_format(strict)
+    monkeypatch.setattr(litellm, 'supports_response_schema', lambda **kwargs: False)
+    call = lambda: GroqChatConfig().map_openai_params({'response_format': value}, {}, 'llama-3.1-8b-instant', False)
+    if strict:
+        with pytest.raises(litellm.UnsupportedParamsError, match='strict'):
+            call()
+    else:
+        assert call() is not None or provider == 'gemini'

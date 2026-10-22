@@ -2246,3 +2246,72 @@ class TestReasoningFollowsModelSupport:
             drop_params=True,
         )
         assert mapped["reasoning"] == {"effort": "medium"}
+
+
+import copy
+import httpx
+import respx
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize("provider,model", [("openai", "gpt-4o"), ("openrouter", "openai/gpt-4o")])
+@pytest.mark.parametrize("strict", [True, False])
+def test_preserved_openai_compatible_wire(provider, model, strict):
+    value = preserved_response_format(strict)
+    before = copy.deepcopy(value)
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as mock:
+        route = mock.post("https://schema.test/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "{}"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+        )
+        litellm.completion(
+            model=f"{provider}/{model}",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format=value,
+            api_key="synthetic-test-key",
+            api_base="https://schema.test/v1",
+            num_retries=0,
+        )
+        assert json.loads(route.calls[0].request.content)["response_format"] == value
+    assert value == before

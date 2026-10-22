@@ -22,6 +22,7 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_FLASH,
     DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_FLASH_LITE,
     DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_PRO,
+    EMPTY_MAPPING,
 )
 from litellm.exceptions import UnsupportedParamsError
 from litellm.litellm_core_utils.json_fragment_accumulator import JSONFragmentAccumulator
@@ -777,8 +778,9 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
 
     def apply_response_schema_transformation(self, value: dict, optional_params: dict, model: str):
         new_value = deepcopy(value)
-        # remove 'strict' from json schema (not supported by Gemini)
-        new_value = _remove_strict_from_schema(new_value)
+        new_value.pop("strict", None)
+        if isinstance(new_value.get("json_schema"), dict):
+            new_value["json_schema"].pop("strict", None)
 
         # Automatically use responseJsonSchema for Gemini 2.0+ models
         # responseJsonSchema uses standard JSON Schema format and supports additionalProperties
@@ -786,6 +788,11 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         use_json_schema: Final = supports_response_json_schema(model)
 
         if not use_json_schema:
+            if value.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+                raise litellm.utils.UnsupportedParamsError(
+                    status_code=400,
+                    message="Gemini legacy responseSchema cannot preserve strict JSON schema constraints.",
+                )
             # For responseSchema, remove 'additionalProperties' (not supported)
             new_value = _remove_additional_properties(new_value)
 

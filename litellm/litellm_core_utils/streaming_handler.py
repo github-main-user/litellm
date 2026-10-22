@@ -775,7 +775,12 @@ class CustomStreamWrapper:
 
     def is_delta_empty(self, delta: Delta) -> bool:
         is_empty = True
-        if delta.content or delta.tool_calls is not None or delta.function_call is not None:
+        if (
+            delta.content
+            or delta.tool_calls is not None
+            or delta.function_call is not None
+            or getattr(delta, "refusal", None)
+        ):
             is_empty = False
         return is_empty
 
@@ -840,6 +845,7 @@ class CustomStreamWrapper:
                 "reasoning_content" in model_response.choices[0].delta
                 and model_response.choices[0].delta.reasoning_content is not None
             )
+            or getattr(model_response.choices[0].delta, "refusal", None) is not None
             or (model_response.choices[0].delta.provider_specific_fields is not None)
             or (
                 "provider_specific_fields" in model_response

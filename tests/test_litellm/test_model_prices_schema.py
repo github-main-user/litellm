@@ -478,3 +478,35 @@ def test_unregistered_provider_guard_flags_only_labels_nobody_registered():
         "unknown_root-new_family_models",
         "vertex_ai-new_family_models",
     ]
+
+
+@pytest.mark.parametrize(
+    "provider,model", [("chatgpt", "gpt-6.1-sol"), ("anthropic", "claude-opus-5-5"), ("anthropic", "claude-sonnet-5-5")]
+)
+def test_exact_schema_entries_preserve_baseline_reasoning(provider, model, monkeypatch):
+    import litellm
+
+    entry = litellm.model_cost[f"{provider}/{model}"]
+    with monkeypatch.context() as baseline:
+        baseline.delitem(litellm.model_cost, f"{provider}/{model}")
+        litellm.get_model_info.cache_clear()
+        fallback = litellm.supports_reasoning(model, custom_llm_provider=provider)
+    litellm.get_model_info.cache_clear()
+    assert fallback is True
+    assert litellm.supports_reasoning(model, custom_llm_provider=provider) is fallback
+    assert litellm.get_model_info(model, custom_llm_provider=provider)["supports_reasoning"] is fallback
+    monkeypatch.setitem(litellm.model_cost, f"{provider}/{model}", {**entry, "supports_reasoning": False})
+    litellm.get_model_info.cache_clear()
+    try:
+        assert not litellm.supports_reasoning(model, custom_llm_provider=provider)
+    finally:
+        litellm.get_model_info.cache_clear()
+
+
+def test_preserved_proven_sol_alias_routes_to_responses():
+    from litellm.main import responses_api_bridge_check
+
+    info, model = responses_api_bridge_check("gpt-6.1-sol", "chatgpt")
+    assert info["mode"] == "responses"
+    assert model == "gpt-6.1-sol"
+    assert litellm.supports_response_schema("gpt-6.1-sol", custom_llm_provider="chatgpt")

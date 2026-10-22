@@ -2948,6 +2948,9 @@ class LiteLLMCompletionResponsesConfig:
                             "name": format_param.get("name", "response_schema"),
                             "schema": format_param.get("schema", {}),
                             "strict": format_param.get("strict", False),
+                            **MappingProxyType(
+                                {key: format_param[key] for key in ("description",) if key in format_param}
+                            ),
                         },
                     }
                 elif format_type == "json_object":

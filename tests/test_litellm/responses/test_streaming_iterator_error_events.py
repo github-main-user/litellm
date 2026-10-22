@@ -585,3 +585,14 @@ def test_maybe_raise_for_error_event_maps_vector_store_timeout_to_retriable_504(
     with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 504
+
+
+@pytest.mark.parametrize("code", ["bio_policy", "data_residency_mismatch"])
+def test_request_eligibility_errors_are_non_retriable(code):
+    iterator = _make_iterator()
+    chunk = _make_error_chunk("", code, "Provider eligibility rejection")
+    with pytest.raises(litellm.BadRequestError) as error:
+        iterator._maybe_raise_for_error_event(chunk)
+    assert error.value.status_code == 400
+    assert error.value.body["code"] == code
+    assert not isinstance(error.value, MidStreamFallbackError)
