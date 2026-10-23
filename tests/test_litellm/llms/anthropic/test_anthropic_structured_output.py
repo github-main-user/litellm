@@ -338,7 +338,9 @@ def test_preserved_provider_schema_reaches_wire_and_rejection_survives(provider,
 
 @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_exact_claude_reasoning_reaches_public_thinking(model, asynchronous):
+async def test_exact_claude_reasoning_reaches_public_thinking(model, asynchronous, monkeypatch):
+    # RESPX intercepts HTTPX, not the default aiohttp transport.
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     with respx.mock(assert_all_called=True, assert_all_mocked=True) as mock:
         route = mock.post("https://schema.test/v1/messages").respond(
             400, json={"type": "error", "error": {"type": "invalid_request_error", "message": "stop at wire"}}
