@@ -4403,3 +4403,51 @@ def test_raw_sse_recovery_prefers_full_text_over_deltas(source):
         "\n".join(f"data: {json.dumps(event)}" for event in events)
     )
     assert recovered == [item]
+
+
+import copy
+from litellm.responses.litellm_completion_transformation.transformation import LiteLLMCompletionResponsesConfig
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("description", [True, False])
+def test_preserved_bridge_round_trip(strict, description):
+    value = preserved_response_format(strict)
+    if not description:
+        value["json_schema"].pop("description")
+    before = copy.deepcopy(value)
+    text = LiteLLMResponsesTransformationHandler()._transform_response_format_to_text_format(value)
+    assert text == {"format": {"type": "json_schema", **value["json_schema"]}}
+    assert LiteLLMCompletionResponsesConfig._transform_text_format_to_response_format(text) == value
+    assert value == before

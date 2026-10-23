@@ -60238,6 +60238,28 @@
         ],
         "supports_audio_output": true
     },
+    "chatgpt/gpt-6.1-sol": {
+        "litellm_provider": "chatgpt",
+        "mode": "responses",
+        "supports_response_schema": true,
+        "supports_reasoning": true
+    },
+    "anthropic/claude-opus-5-5": {
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+        "supports_response_schema": true,
+        "supports_native_structured_output": true,
+        "source": "https://platform.claude.com/docs/en/build-with-claude/structured-outputs",
+        "supports_reasoning": true
+    },
+    "anthropic/claude-sonnet-5-5": {
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+        "supports_response_schema": true,
+        "supports_native_structured_output": true,
+        "source": "https://platform.claude.com/docs/en/build-with-claude/structured-outputs",
+        "supports_reasoning": true
+    },
     "fallback_generalizations": {
         "rules": [
             {

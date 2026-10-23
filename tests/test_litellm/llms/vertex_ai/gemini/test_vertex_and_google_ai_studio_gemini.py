@@ -173,6 +173,7 @@ def test_vertex_ai_response_schema_defs():
     v = VertexGeminiConfig()
 
     schema = cast(dict, v.get_json_schema_from_pydantic_object(MathReasoning))
+    schema["json_schema"]["strict"] = False
 
     # pydantic conversion by default adds $defs to the schema, make sure this is still the case, otherwise this test isn't really testing anything
     assert "$defs" in schema["json_schema"]["schema"]
@@ -6292,3 +6293,104 @@ def test_gemini_multi_candidate_messages_do_not_share_state():
     assert resp.choices[1].message.tool_calls is None
     assert getattr(resp.choices[1].message, "reasoning_content", None) is None
     assert resp.choices[1].provider_specific_fields["native_finish_reason"] == "STOP"
+
+
+import copy
+import respx
+from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_preserved_gemini_preserves_property_maps(strict):
+    value = preserved_response_format(strict)
+    before = copy.deepcopy(value)
+    params = {}
+    VertexGeminiConfig().apply_response_schema_transformation(value, params, "gemini-2.5-flash")
+    assert params["response_json_schema"] == PRESERVED_SCHEMA
+    assert value == before
+
+
+@pytest.mark.parametrize('provider', ['gemini'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_preserved_downgrade_guards(provider, strict, monkeypatch):
+    value = preserved_response_format(strict)
+    call = lambda: VertexGeminiConfig().apply_response_schema_transformation(value, {}, 'gemini-1.5-pro')
+    if strict:
+        with pytest.raises(litellm.UnsupportedParamsError, match='strict'):
+            call()
+    else:
+        assert call() is not None or provider == 'gemini'
+
+
+@pytest.mark.parametrize("provider", ["gemini"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("strict", [True, False])
+def test_preserved_provider_schema_reaches_wire_and_rejection_survives(provider, stream, strict):
+    value = preserved_response_format(strict)
+    if provider == "anthropic":
+        model = "anthropic/claude-sonnet-4-5-20250929"
+        error = {"type": "error", "error": {"type": "invalid_request_error", "message": "schema rejected"}}
+    else:
+        model = "gemini/gemini-2.5-flash"
+        error = {"error": {"code": 400, "message": "schema rejected", "status": "INVALID_ARGUMENT"}}
+    with respx.mock(assert_all_called=True, assert_all_mocked=True) as mock:
+        route = mock.post(url__regex=r"https://schema.test/.*").mock(return_value=httpx.Response(400, json=error))
+
+        def invoke_provider():
+            result = litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": "Return JSON"}],
+                response_format=value,
+                stream=stream,
+                api_key="synthetic-test-key",
+                api_base="https://schema.test",
+                num_retries=0,
+            )
+            if stream:
+                list(result)
+
+        with pytest.raises(litellm.BadRequestError, match="schema rejected"):
+            invoke_provider()
+        assert route.call_count == 1
+        body = json.loads(route.calls[0].request.content)
+        if provider == "anthropic":
+            expected = (
+                PRESERVED_SCHEMA
+                if strict
+                else AnthropicConfig().map_response_format_to_anthropic_output_format(value)["schema"]
+            )
+            assert body["output_format"]["schema"] == expected
+            assert "tools" not in body
+        else:
+            assert body["generationConfig"]["response_json_schema"] == PRESERVED_SCHEMA

@@ -7537,3 +7537,51 @@ def test_eager_input_streaming_non_boolean_is_a_bad_request():
             "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
             [_eager_openai_tool(eager_input_streaming="true")],
         )
+
+
+import copy
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize('provider', ['bedrock'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_preserved_downgrade_guards(provider, strict, monkeypatch):
+    from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
+    value = preserved_response_format(strict)
+    monkeypatch.setattr(AmazonConverseConfig, '_supports_native_structured_outputs', lambda *args: False)
+    call = lambda: AmazonConverseConfig()._translate_response_format_param(value, 'anthropic.claude-3-haiku-20240307-v1:0', {}, {}, False)
+    if strict:
+        with pytest.raises(litellm.UnsupportedParamsError, match='strict'):
+            call()
+    else:
+        assert call() is not None or provider == 'gemini'

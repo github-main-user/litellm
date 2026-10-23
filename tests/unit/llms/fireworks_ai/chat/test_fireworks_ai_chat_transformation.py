@@ -1801,3 +1801,50 @@ def test_streaming_preserves_selected_model_for_private_accounting():
 )
 def test_get_model_cost_key_resolves_short_names_to_long_keys(model: str, expected: str) -> None:
     assert FireworksAIConfig().get_model_cost_key(model) == expected
+
+
+import copy
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize('provider', ['fireworks'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_preserved_downgrade_guards(provider, strict, monkeypatch):
+    from litellm.llms.fireworks_ai.chat.transformation import FireworksAIConfig
+    value = preserved_response_format(strict)
+    call = lambda: FireworksAIConfig().map_openai_params({'response_format': value, 'tools': [{'type': 'function', 'function': {'name': 'lookup', 'parameters': {'type': 'object', 'properties': {}}}}]}, {}, 'accounts/fireworks/models/llama-v3p1-8b-instruct', False)
+    if strict:
+        with pytest.raises(litellm.UnsupportedParamsError, match='strict'):
+            call()
+    else:
+        assert call() is not None or provider == 'gemini'

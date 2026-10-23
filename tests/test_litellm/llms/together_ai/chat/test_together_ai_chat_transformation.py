@@ -334,7 +334,13 @@ def test_map_openai_params_no_schema_model_drops_response_format_with_warning(
     registry_disables_response_schema, together_warning_log
 ):
     mapped = TogetherAIChatConfig().map_openai_params(
-        non_default_params={"response_format": JSON_SCHEMA_RESPONSE_FORMAT, "temperature": 0.5},
+        non_default_params={
+            "response_format": {
+                **JSON_SCHEMA_RESPONSE_FORMAT,
+                "json_schema": {**JSON_SCHEMA_RESPONSE_FORMAT["json_schema"], "strict": False},
+            },
+            "temperature": 0.5,
+        },
         optional_params={},
         model=NO_SCHEMA_MODEL,
         drop_params=True,
@@ -1157,3 +1163,51 @@ def test_custom_role_wrappers_never_reach_the_request():
     assert request_body["messages"] == messages
     assert "prompt" not in request_body
     assert "roles" not in request_body
+
+
+import copy
+
+PRESERVED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "strict": {"type": "boolean"},
+        "additionalProperties": {"type": "string"},
+        "nested": {"type": "array", "items": {"$ref": "#/$defs/strict"}},
+    },
+    "required": ["strict", "additionalProperties", "nested"],
+    "additionalProperties": False,
+    "$defs": {
+        "strict": {
+            "type": "object",
+            "properties": {"strict": {"type": "string"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def preserved_response_format(strict=True, schema=None):
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "description": "An exact answer",
+            "strict": strict,
+            "schema": copy.deepcopy(schema if schema is not None else PRESERVED_SCHEMA),
+        },
+    }
+
+
+@pytest.mark.parametrize('provider', ['together'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_preserved_downgrade_guards(provider, strict, monkeypatch):
+    from litellm.llms.together_ai.chat.transformation import TogetherAIChatConfig
+    value = preserved_response_format(strict)
+    monkeypatch.setattr('litellm.llms.together_ai.chat.transformation._response_schema_verdict', lambda model: False)
+    call = lambda: TogetherAIChatConfig().map_openai_params({'response_format': value}, {}, 'test-model', True)
+    if strict:
+        with pytest.raises(litellm.UnsupportedParamsError, match='strict'):
+            call()
+    else:
+        assert call() is not None or provider == 'gemini'

@@ -1,3 +1,4 @@
+import json
 from typing import TYPE_CHECKING, Any, Final
 
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -94,6 +95,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "previous_response_id",
             "prompt_cache_key",
             "truncation",
+            "text",
         }
 
         return {k: v for k, v in request.items() if k in allowed_keys}
@@ -116,6 +118,22 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             original_response=raw_response.text,
             additional_args={"complete_input_dict": {}},
         )
+
+        from litellm.responses.streaming_iterator import response_error_status
+
+        for line in body_text.splitlines():
+            parsed = parse_sse_json_chunk(line)
+            if parsed is None or parsed.get("type") not in (
+                ResponsesAPIStreamEvents.ERROR,
+                ResponsesAPIStreamEvents.RESPONSE_FAILED,
+            ):
+                continue
+            raise OpenAIError(
+                message=json.dumps(parsed),
+                status_code=(
+                    raw_response.status_code if raw_response.status_code >= 400 else response_error_status(parsed)
+                ),
+            )
 
         completed_response, error_message = self._extract_completed_response_from_sse(body_text=body_text)
         if completed_response is None:

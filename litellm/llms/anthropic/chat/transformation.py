@@ -21,6 +21,7 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_MEDIUM_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_XHIGH_THINKING_BUDGET,
+    EMPTY_MAPPING,
     RESPONSE_FORMAT_TOOL_NAME,
 )
 from litellm.litellm_core_utils.core_helpers import map_finish_reason
@@ -685,6 +686,11 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         return result
 
     def get_json_schema_from_pydantic_object(self, response_format: Any | dict | None) -> dict | None:
+        if (
+            isinstance(response_format, dict)
+            and response_format.get("json_schema", EMPTY_MAPPING).get("strict") is True
+        ):
+            return response_format
         return type_to_response_format_param(
             response_format, ref_template="/$defs/{model}"
         )  # Relevant issue: https://github.com/BerriAI/litellm/issues/7755
@@ -1370,6 +1376,15 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             unpack_defs,
         )
 
+        if value is not None and value.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+            if self.filter_anthropic_output_schema(json_schema) != json_schema:
+                raise litellm.utils.UnsupportedParamsError(
+                    status_code=400,
+                    message="Anthropic cannot preserve this strict JSON schema without changing constraints. "
+                    "Use a supported schema or explicitly set strict=false.",
+                )
+            return AnthropicOutputSchema(type="json_schema", schema=copy.deepcopy(json_schema))
+
         json_schema = copy.deepcopy(json_schema)
         defs: Final = json_schema.pop("$defs", json_schema.pop("definitions", {}))
         if defs:
@@ -1555,6 +1570,11 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                     if _output_format is not None:
                         optional_params["output_format"] = _output_format
                 else:
+                    if value.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+                        raise litellm.utils.UnsupportedParamsError(
+                            status_code=400,
+                            message=f"Anthropic model {model} has no native strict JSON schema support; tool emulation is disabled for strict=true.",
+                        )
                     _tool = self.map_response_format_to_anthropic_tool(value, optional_params, is_thinking_enabled)
                     if _tool is None:
                         continue

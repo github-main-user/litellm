@@ -336,7 +336,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             for content_item in content_list:
                 if isinstance(content_item, dict):
                     content_type = content_item.get("type")
-                    if content_type == "output_text":
+                    if content_type in ("output_text", "refusal"):
                         response_text = content_item.get("text", "")
                         # Extract annotations from content if present
                         annotations = LiteLLMResponsesTransformationHandler._convert_annotations_to_chat_format(
@@ -346,6 +346,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                             role=item.get("role", "assistant"),
                             content=response_text if response_text else "",
                             annotations=annotations,
+                            refusal=content_item.get("refusal") if content_type == "refusal" else None,
                         )
                         choice = Choices(message=msg, finish_reason="stop", index=index)
                         return choice, index + 1
@@ -717,6 +718,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                     msg = Message(
                         role=item.role,
                         content=response_text if response_text else "",
+                        refusal=getattr(content, "refusal", None),
                         reasoning_content=reasoning_content,
                         annotations=annotations,
                         reasoning_items=cast(
@@ -1258,6 +1260,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                         "name": json_schema.get("name", "response_schema"),
                         "schema": json_schema.get("schema", {}),
                         "strict": json_schema.get("strict", False),
+                        **MappingProxyType({key: json_schema[key] for key in ("description",) if key in json_schema}),
                     }
                 }
             elif format_type == "json_object":
@@ -1539,6 +1542,16 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                     ]
                 )
 
+        elif event_type == "response.refusal.delta":
+            return ModelResponseStream(
+                choices=[  # mutable-ok: public response constructor requires list choices
+                    StreamingChoices(
+                        index=0,
+                        delta=Delta(refusal=parsed_chunk.get("delta")),
+                        finish_reason=None,
+                    )
+                ]
+            )
         elif event_type == "response.output_text.delta":
             # Content part added to output
             content_part = parsed_chunk.get("delta", None)

@@ -172,6 +172,9 @@ def _log_background_task_failure(task: asyncio.Task[object], *, task_name: str) 
 _ERROR_CODE_HTTP_STATUS: Final[Mapping[str, int]] = MappingProxyType(
     {  # mutable-ok: immediately frozen by MappingProxyType
         "server_error": 500,
+        "bio_policy": 400,
+        "data_residency_mismatch": 400,
+        "invalid_json_schema": 400,
         "rate_limit_exceeded": 429,
         "insufficient_quota": 429,
         "vector_store_timeout": 504,
@@ -230,12 +233,29 @@ def _status_code_for_error_fields(error_type: str | None, error_code: str | None
     return next((status for status in map(_status_code_for_error_field, fields) if status is not None), 500)
 
 
+def response_error_status(event: Mapping[str, object]) -> int:
+    response: Final = event.get("response")
+    error: Final = event.get("error") or (response.get("error") if _is_json_object(response) else None)
+    _, error_type, error_code = _error_event_fields(error)
+    return _status_code_for_error_fields(error_type, error_code)
+
+
 def _map_stream_error_to_exception(error_obj: object, model: str, custom_llm_provider: str) -> Exception:
     from litellm.llms.base_llm.chat.transformation import BaseLLMException
 
     error_message, error_type, error_code = _error_event_fields(error_obj)
     status_code: Final = _status_code_for_error_fields(error_type, error_code)
-    error_body: Final = {"message": error_message, "type": error_type, "code": error_code}
+    error_param: Final = error_obj.get("param") if _is_json_object(error_obj) else getattr(error_obj, "param", None)
+    error_body: Final = {  # mutable-ok: BaseLLMException.body requires a JSON dictionary
+        key: value
+        for key, value in (
+            ("message", error_message),
+            ("type", error_type),
+            ("code", error_code),
+            ("param", error_param),
+        )
+        if key != "param" or value is not None
+    }
     provider_exception: Final = BaseLLMException(
         status_code=status_code,
         message=f"Error code: {status_code} - {{'error': {error_body}}}",

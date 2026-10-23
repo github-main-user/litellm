@@ -7,7 +7,7 @@ import httpx
 import litellm
 from litellm._logging import verbose_logger
 from litellm._uuid import uuid
-from litellm.constants import RESPONSE_FORMAT_TOOL_NAME
+from litellm.constants import EMPTY_MAPPING, RESPONSE_FORMAT_TOOL_NAME
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.llm_response_utils.get_headers import (
     get_response_headers,
@@ -327,6 +327,11 @@ class FireworksAIConfig(FireworksAIMixin, OpenAIGPTConfig):
                     optional_params["tool_choice"] = value
             elif param == "response_format":
                 if is_tools_set:  # fireworks ai doesn't support tools and response_format together
+                    if isinstance(value, dict) and value.get("json_schema", EMPTY_MAPPING).get("strict") is True:
+                        raise litellm.utils.UnsupportedParamsError(
+                            status_code=400,
+                            message="Fireworks cannot combine tools with native strict JSON schema output.",
+                        )
                     optional_params = self._add_response_format_to_tools(
                         optional_params=optional_params,
                         value=value,
