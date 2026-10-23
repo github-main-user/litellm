@@ -233,6 +233,13 @@ def _status_code_for_error_fields(error_type: str | None, error_code: str | None
     return next((status for status in map(_status_code_for_error_field, fields) if status is not None), 500)
 
 
+def response_error_status(event: Mapping[str, object]) -> int:
+    response: Final = event.get("response")
+    error: Final = event.get("error") or (response.get("error") if _is_json_object(response) else None)
+    _, error_type, error_code = _error_event_fields(error)
+    return _status_code_for_error_fields(error_type, error_code)
+
+
 def _map_stream_error_to_exception(error_obj: object, model: str, custom_llm_provider: str) -> Exception:
     from litellm.llms.base_llm.chat.transformation import BaseLLMException
 

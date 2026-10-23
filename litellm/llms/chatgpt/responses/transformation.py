@@ -1,7 +1,6 @@
 import json
 from typing import TYPE_CHECKING, Any, Final
 
-from litellm.constants import EMPTY_MAPPING
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
     _safe_convert_created_field,
@@ -120,23 +119,19 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             additional_args={"complete_input_dict": {}},
         )
 
-        from litellm.responses.streaming_iterator import _error_event_fields, _status_code_for_error_fields
+        from litellm.responses.streaming_iterator import response_error_status
 
         for line in body_text.splitlines():
-            parsed: Final = parse_sse_json_chunk(line)
+            parsed = parse_sse_json_chunk(line)
             if parsed is None or parsed.get("type") not in (
                 ResponsesAPIStreamEvents.ERROR,
                 ResponsesAPIStreamEvents.RESPONSE_FAILED,
             ):
                 continue
-            error: Final = parsed.get("error") or (parsed.get("response") or EMPTY_MAPPING).get("error")
-            _, error_type, error_code = _error_event_fields(error)
             raise OpenAIError(
                 message=json.dumps(parsed),
                 status_code=(
-                    raw_response.status_code
-                    if raw_response.status_code >= 400
-                    else _status_code_for_error_fields(error_type, error_code)
+                    raw_response.status_code if raw_response.status_code >= 400 else response_error_status(parsed)
                 ),
             )
 
