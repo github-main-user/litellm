@@ -1278,9 +1278,8 @@ async def test_streamed_tool_id_upgrade_preserves_signature_for_chat_and_respons
     }
     other = PublicInferenceIds(lambda: store, "VoidAPI")
     other.bind(authenticated(user_id="bob"))
-    with pytest.raises(HTTPException) as denied:
-        await other.payload(messages, incoming=True)
-    assert denied.value.status_code == 404
+    assert await other.payload(messages, incoming=True) == messages
+    assert "native-signature" not in json.dumps(await other.payload(messages, incoming=True))
     with pytest.raises(HTTPException) as legacy:
         await continued.identifier("tool", signed, incoming=True)
     assert legacy.value.status_code == 400
@@ -1956,3 +1955,67 @@ async def test_gemini_server_tool_history_is_not_exposed_by_public_boundary(tran
         "unneeded_diagnostic",
     ):
         assert private_value not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_history", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+async def test_external_tool_correlations_survive_owner_lookup_misses(full_history: bool, chat: bool) -> None:
+    store = MemoryIds()
+    issuer = PublicInferenceIds(lambda: store, "VoidAPI")
+    issuer.bind(authenticated())
+    owned = await issuer.identifier("tool", "native__thought__signed", incoming=False)
+    foreign = await store.publish("other-owner", "tool", "private__thought__secret")
+    ids = ("call_2036aaef36ee41f6b0254e52277dc649", foreign, owned, "ordinary-opaque")
+    originals = (ids[0], foreign, "native__thought__signed", ids[3])
+    calls = [
+        {"id": value, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+        if chat
+        else {"type": "function_call", "call_id": value, "name": "lookup", "arguments": "{}"}
+        for value in ids
+    ]
+    results = [
+        {"role": "tool", "tool_call_id": value, "content": "ok"}
+        if chat
+        else {"type": "function_call_output", "call_id": value, "output": "ok"}
+        for value in ids
+    ]
+    history = ([{"role": "assistant", "tool_calls": calls}] if chat else calls) if full_history else []
+    body = {"messages" if chat else "input": history + results}
+    for _ in range(2):
+        context = PublicInferenceIds(lambda: store, "VoidAPI")
+        context.bind(authenticated())
+        restored = await context.payload(body, incoming=True)
+        assert await context.payload(body, incoming=True) == restored
+        entries = restored["messages" if chat else "input"]
+        assert [entry["tool_call_id" if chat else "call_id"] for entry in entries[-4:]] == list(originals)
+        if full_history:
+            restored_calls = entries[0]["tool_calls"] if chat else entries[:4]
+            assert [call["id" if chat else "call_id"] for call in restored_calls] == list(originals)
+        assert "secret" not in json.dumps(restored)
+
+
+@pytest.mark.asyncio
+async def test_opaque_tool_results_do_not_authorize_previous_response_or_hide_store_errors() -> None:
+    store = MemoryIds()
+    context = PublicInferenceIds(lambda: store, "VoidAPI")
+    context.bind(authenticated())
+    public = await context.identifier("response", wrapped_response(), incoming=False)
+    result = {"type": "function_call_output", "call_id": "call_" + "a" * 32, "output": "ok"}
+    for user, previous in ((authenticated("bob"), public), (authenticated(), "resp_" + "b" * 32)):
+        denied, seen = await http_exchange(lambda: store, user, {"input": [result], "previous_response_id": previous})
+        assert denied[0]["status"] == 404 and not seen
+    allowed, seen = await http_exchange(
+        lambda: store, authenticated(), {"model": "public", "input": [result], "previous_response_id": public}
+    )
+    assert allowed[0]["status"] == 200
+    assert (
+        seen["body"]
+        == seen["cached"]
+        == {"model": "public", "input": [result], "previous_response_id": wrapped_response()}
+    )
+    store.unavailable = True
+    fresh = PublicInferenceIds(lambda: store, "VoidAPI")
+    fresh.bind(authenticated())
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await fresh.payload({"input": [result]}, incoming=True)

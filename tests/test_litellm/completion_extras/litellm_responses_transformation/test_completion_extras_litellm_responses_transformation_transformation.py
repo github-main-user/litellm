@@ -321,7 +321,7 @@ def test_chunk_parser_function_call_added_produces_tool_use():
     chunk = {
         "type": ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
         "arguments": '{"key": "value"}',
-        "item": {"type": "function_call", "name": "fn", "call_id": "call-42"},
+        "item": {"type": "function_call", "name": "fn", "call_id": "call-42"}, "output_index": 0,
     }
 
     result = iterator.chunk_parser(chunk)
@@ -4451,3 +4451,130 @@ def test_preserved_bridge_round_trip(strict, description):
     assert text == {"format": {"type": "json_schema", **value["json_schema"]}}
     assert LiteLLMCompletionResponsesConfig._transform_text_format_to_response_format(text) == value
     assert value == before
+
+
+@pytest.mark.parametrize("prefix", ["", '{"name":', '{"name":"alpha"}'])
+@pytest.mark.parametrize("source", ["arguments", "item", "terminal", "added"])
+def test_stream_argument_snapshots_emit_only_missing_suffix(prefix, source):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=iter(()), sync_stream=True)
+    full = '{"name":"alpha"}'
+    item = {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "record_label"}
+    added = {"type": "response.output_item.added", "output_index": 1,
+             "item": {**item, "arguments": full if source == "added" else ""}}
+    events = [added]
+    if prefix and source != "added":
+        events.append({"type": "response.function_call_arguments.delta", "output_index": 1,
+                       "item_id": "fc_a", "delta": prefix})
+    snapshot = {**item, "arguments": full}
+    if source == "arguments":
+        events.extend([{"type": "response.function_call_arguments.done", "item_id": "fc_a",
+                        "arguments": full}] * 2)
+    if source == "item":
+        events.extend([{"type": "response.output_item.done", "output_index": 1, "item": snapshot}] * 2)
+    events.append({"type": "response.completed", "response": {"output": [{"type": "reasoning"}, snapshot]}})
+    chunks = [iterator.chunk_parser(event) for event in events]
+    calls = [call for chunk in chunks for call in (chunk.choices[0].delta.tool_calls or [])]
+    assert "".join(call.function.arguments or "" for call in calls) == full
+    assert {call.index for call in calls} == {0}
+    assert [call.id for call in calls if call.id] == ["call_a"]
+    assert [call.function.name for call in calls if call.function.name] == ["record_label"]
+    assert [chunk.choices[0].finish_reason for chunk in chunks] == [None] * (len(chunks) - 1) + ["tool_calls"]
+
+
+@pytest.mark.parametrize("terminal_only", [False, True])
+def test_stream_argument_snapshots_interleaved_identity_and_terminal_only(terminal_only):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=iter(()), sync_stream=True)
+    items = [{"type": "function_call", "id": f"fc_item_{i}", "call_id": f"call_tool_{i}",
+              "name": "record_label", "arguments": json.dumps({"name": name})}
+             for i, name in enumerate(("alpha", "beta"))]
+    events = []
+    if not terminal_only:
+        events.extend({"type": "response.output_item.added", "output_index": i + 2,
+                       "item": {**item, "arguments": ""}} for i, item in enumerate(items))
+        events.extend({"type": "response.function_call_arguments.done", "item_id": item["id"],
+                       "arguments": item["arguments"]} for item in reversed(items))
+    events.append({"type": "response.completed", "response": {
+        "output": [{"type": "reasoning"}, {"type": "message"}, *items]}})
+    chunks = [iterator.chunk_parser(event) for event in events]
+    calls = [call for chunk in chunks for call in (chunk.choices[0].delta.tool_calls or [])]
+    assert {i: "".join(c.function.arguments or "" for c in calls if c.index == i) for i in range(2)} == {
+        i: item["arguments"] for i, item in enumerate(items)}
+    assert [c.id for c in calls if c.id] == ["call_tool_0", "call_tool_1"]
+    assert [c.function.name for c in calls if c.function.name] == ["record_label", "record_label"]
+    assert [c.choices[0].finish_reason for c in chunks] == [None] * (len(chunks) - 1) + ["tool_calls"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"output_index": 3, "item_id": "fc_a", "arguments": '{"bad":1}'},
+    {"output_index": 3, "item_id": "fc_other", "arguments": '{"name":"wrong"}'},
+    {"item_id": "unknown", "arguments": '{"name":"wrong"}'},
+    {"arguments": '{"name":"wrong"}'},
+    {"output_index": 4, "item_id": "fc_a", "arguments": '{"name":"wrong"}'},
+])
+def test_stream_argument_snapshots_reject_conflicts_without_poisoning_state(bad):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=iter(()), sync_stream=True)
+    iterator.chunk_parser({"type": "response.output_item.added", "output_index": 3, "item": {
+        "type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "record_label",
+        "arguments": '{"name":'}})
+    rejected = iterator.chunk_parser({"type": "response.function_call_arguments.done", **bad})
+    repaired = iterator.chunk_parser({"type": "response.function_call_arguments.done", "item_id": "fc_a",
+                                      "arguments": '{"name":"alpha"}'})
+    assert not rejected.choices[0].delta.tool_calls
+    assert [(c.index, c.id, c.function.name, c.function.arguments)
+            for c in repaired.choices[0].delta.tool_calls] == [(0, None, None, '"alpha"}')]
+
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_stream_argument_snapshot_missing_index_added_reconciles_once(reasoning):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=iter(()), sync_stream=True)
+    item = {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "record_label",
+            "arguments": '{"name":"alpha"}'}
+    output = [{"type": "reasoning"}, item] if reasoning else [item]
+    events = [
+        {"type": "response.output_item.added", "item": item},
+        {"type": "response.completed", "response": {"output": output}},
+    ]
+    calls = [call for event in events for call in (iterator.chunk_parser(event).choices[0].delta.tool_calls or [])]
+    assert {call.index for call in calls} == {0}
+    assert "".join(call.function.arguments or "" for call in calls) == item["arguments"]
+    assert [call.id for call in calls if call.id] == ["call_a"]
+    assert [call.function.name for call in calls if call.function.name] == ["record_label"]
+
+
+@pytest.mark.parametrize("first", ["done", "delta"])
+@pytest.mark.parametrize("identity_source", ["item", "terminal"])
+def test_stream_argument_snapshot_late_identity_is_emitted_once(first, identity_source):
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    iterator = OpenAiResponsesToChatCompletionStreamIterator(streaming_response=iter(()), sync_stream=True)
+    item = {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "record_label",
+            "arguments": '{"name":"alpha"}'}
+    events = [{"type": "response.function_call_arguments." + first, "output_index": 1, "item_id": "fc_a",
+               "arguments" if first == "done" else "delta": item["arguments"]}]
+    if identity_source == "item":
+        events.extend([{"type": "response.output_item.done", "output_index": 1, "item": item}] * 2)
+    events.append({"type": "response.completed", "response": {"output": [{"type": "reasoning"}, item]}})
+    calls = [call for event in events for call in (iterator.chunk_parser(event).choices[0].delta.tool_calls or [])]
+    assert {call.index for call in calls} == {0}
+    assert "".join(call.function.arguments or "" for call in calls) == item["arguments"]
+    assert [call.id for call in calls if call.id] == ["call_a"]
+    assert [call.function.name for call in calls if call.function.name] == ["record_label"]
