@@ -1329,7 +1329,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         json_mode: bool | None = False,
     ):
         super().__init__(streaming_response, sync_stream, json_mode)
-        self._function_arguments: dict[int, tuple[str | None, str | None, str | None, str]] = {}  # mutable-ok: stream state
+        self._function_arguments: Mapping[int, tuple[str | None, str | None, str | None, str]] = MappingProxyType({})
         self._chat_completion_id: str | None = None
         self._tool_call_index_map: dict[int, int] = {}  # mutable-ok: per-stream accumulator state
 
@@ -1370,7 +1370,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
 
     @staticmethod
     def translate_responses_chunk_to_openai_stream(
-        parsed_chunk: dict | BaseModel,
+        parsed_chunk: Mapping | BaseModel,
         tool_call_index_map: dict[int, int] | None = None,  # mutable-ok: per-stream state, remapped in place
     ) -> "ModelResponseStream":
         """
@@ -1399,7 +1399,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
 
         if isinstance(parsed_chunk, BaseModel):
             parsed_chunk = parsed_chunk.model_dump()
-        if not isinstance(parsed_chunk, dict):
+        if not isinstance(parsed_chunk, Mapping):
             raise ValueError(f"Chat provider: Invalid chunk type {type(parsed_chunk)}")
 
         # Handle different event types from responses API
@@ -1666,17 +1666,24 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                     for index, item in enumerate(output)
                     if isinstance(item, dict) and item.get("type") == "function_call"
                     for call in self._function_argument_chunk(
-                        {"type": "response.output_item.done", "output_index": index, "item": item}
-                    ).choices[0].delta.tool_calls or ()
+                        MappingProxyType({"type": "response.output_item.done", "output_index": index, "item": item})
+                    )
+                    .choices[0]
+                    .delta.tool_calls
+                    or ()
                 )
                 if calls:
-                    translated.choices[0].delta.tool_calls = list(calls)
+                    translated.choices[0].delta.tool_calls = list(calls)  # mutable-ok: Delta requires list
         return self._with_stream_scoped_id(translated)
 
-    def _function_argument_chunk(self, chunk: dict[str, object]) -> "ModelResponseStream":
+    def _function_argument_chunk(self, chunk: Mapping[str, object]) -> "ModelResponseStream":
         from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 
-        empty: Final = ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=None)])
+        empty: Final = ModelResponseStream(
+            choices=[  # mutable-ok: constructor requires list choices
+                StreamingChoices(index=0, delta=Delta(), finish_reason=None)
+            ]
+        )
         item: Final = chunk.get("item")
         fields: Final = item if isinstance(item, dict) else chunk
         item_id: Final = fields.get("id") if isinstance(item, dict) else chunk.get("item_id")
@@ -1684,9 +1691,9 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         name: Final = fields.get("name")
         explicit_index: Final = chunk.get("output_index")
         matches: Final = tuple(
-            index for index, state in self._function_arguments.items()
-            if (isinstance(item_id, str) and item_id == state[0])
-            or (isinstance(call_id, str) and call_id == state[1])
+            index
+            for index, state in self._function_arguments.items()
+            if (isinstance(item_id, str) and item_id == state[0]) or (isinstance(call_id, str) and call_id == state[1])
         )
         if len(matches) > 1:
             return empty
@@ -1708,35 +1715,58 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         emitted: Final = previous[3] if previous else ""
         if not is_delta and not arguments.startswith(emitted):
             return empty
-        suffix: Final = arguments if is_delta else arguments[len(emitted):]
+        suffix: Final = arguments if is_delta else arguments[len(emitted) :]
         identity: Final = tuple(
             value if isinstance(value, str) else (previous[position] if previous else None)
             for position, value in enumerate((item_id, call_id, name))
         )
-        self._function_arguments[output_index] = (identity[0], identity[1], identity[2], emitted + suffix)
+        self._function_arguments = MappingProxyType(
+            {**self._function_arguments, output_index: (identity[0], identity[1], identity[2], emitted + suffix)}
+        )
         if previous is None and isinstance(item, dict):
             return self.translate_responses_chunk_to_openai_stream(
-                {"type": "response.output_item.added", "output_index": output_index,
-                 "item": {**item, "arguments": arguments}},
+                MappingProxyType(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": MappingProxyType({**item, "arguments": arguments}),
+                    }
+                ),
                 tool_call_index_map=self._tool_call_index_map,
             )
-        if previous is not None and isinstance(item, dict) and any(
-            previous[position] is None and identity[position] is not None for position in (1, 2)
+        if (
+            previous is not None
+            and isinstance(item, dict)
+            and any(previous[position] is None and identity[position] is not None for position in (1, 2))
         ):
             converted: Final = tool_call_dict_from_output_item(item, output_index)
-            return ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(tool_calls=[{
-                "index": self._sequential_tool_call_index(self._tool_call_index_map, output_index),
-                "type": "function",
-                "id": converted["id"] if previous[1] is None else None,
-                "function": {
-                    "name": converted["function"]["name"] if previous[2] is None else None,
-                    "arguments": suffix,
-                },
-            }]), finish_reason=None)])
+            return ModelResponseStream(
+                choices=[  # mutable-ok: constructor requires list choices
+                    StreamingChoices(
+                        index=0,
+                        delta=Delta(
+                            tool_calls=(
+                                ChatCompletionToolCallChunk(
+                                    index=self._sequential_tool_call_index(self._tool_call_index_map, output_index),
+                                    type="function",
+                                    id=converted["id"] if previous[1] is None else None,
+                                    function=ChatCompletionToolCallFunctionChunk(
+                                        name=converted["function"]["name"] if previous[2] is None else None,
+                                        arguments=suffix,
+                                    ),
+                                ),
+                            )
+                        ),
+                        finish_reason=None,
+                    )
+                ]
+            )
         if not suffix:
             return empty
         return self.translate_responses_chunk_to_openai_stream(
-            {"type": "response.function_call_arguments.delta", "output_index": output_index, "delta": suffix},
+            MappingProxyType(
+                {"type": "response.function_call_arguments.delta", "output_index": output_index, "delta": suffix}
+            ),
             tool_call_index_map=self._tool_call_index_map,
         )
 
