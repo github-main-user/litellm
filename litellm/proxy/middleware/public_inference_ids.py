@@ -275,6 +275,8 @@ class PublicInferenceIds:
 
     async def _resolve_identifier(self, kind: str, value: str) -> str | None:
         stored: Final = await self.store().resolve(cast(str, self.owner), kind, value)
+        if kind == "tool" and stored is None:
+            return value
         if kind != "response" or stored is None or not stored.startswith("{"):
             return stored
         record: Final = json.loads(stored)
