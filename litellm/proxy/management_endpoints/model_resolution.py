@@ -24,7 +24,7 @@ def resolve_identity(
     base_model: str, provider_connection: str | None, provider: str | None, known_models: Sequence[str] = ()
 ) -> ModelResolution:
     lab, _, model = base_model.partition("/")
-    native: Final = provider in ("anthropic", "openai", "chatgpt")
+    native: Final = provider in ("anthropic", "openai", "chatgpt", "deepseek")
     expected_lab: Final = "openai" if provider == "chatgpt" else provider
     if native and lab != expected_lab:
         return ModelResolution(provider_connection=provider_connection, status="incompatible")
