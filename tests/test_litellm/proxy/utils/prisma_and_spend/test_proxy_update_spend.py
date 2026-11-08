@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
-from typing import Any, Dict, List
+from collections.abc import Callable, Iterator, Mapping
+from typing import Any, Dict, Final, List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +26,45 @@ def reset_spend_log_queue_bytes() -> Iterator[None]:
     PrismaClient.spend_log_queue_bytes = 0
     yield
     PrismaClient.spend_log_queue_bytes = 0
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_requeues_whole_batch_when_postgres_is_out_of_connections(
+    mock_prisma_client: MagicMock,
+    make_spend_log_row: Callable[..., Mapping[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prisma.errors import DataError
+
+    sleep: Final = AsyncMock(return_value=None)
+    monkeypatch.setattr(utils_mod.asyncio, "sleep", sleep)
+    error: Final = DataError(
+        data=json.loads('{"user_facing_error":{"message":"FATAL: sorry, too many clients already"}}')
+    )
+    mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock(side_effect=error)
+    proxy_logging: Final = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+    mock_prisma_client.spend_log_transactions = list((make_spend_log_row(request_id="existing"),))
+    rows: Final = tuple(make_spend_log_row(request_id=f"r{i}") for i in range(4))
+
+    with pytest.raises(DataError):
+        await ProxyUpdateSpend.update_spend_logs(
+            n_retry_times=2,
+            prisma_client=mock_prisma_client,
+            db_writer_client=None,
+            proxy_logging_obj=proxy_logging,
+            logs_to_process=list(rows),
+        )
+
+    assert mock_prisma_client.db.litellm_spendlogs.create_many.await_count == 1
+    sleep.assert_not_awaited()
+    assert tuple(row["request_id"] for row in mock_prisma_client.spend_log_transactions) == (
+        "r0",
+        "r1",
+        "r2",
+        "r3",
+        "existing",
+    )
 
 
 class _AsyncCM:

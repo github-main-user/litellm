@@ -29,6 +29,51 @@ from litellm.proxy._types import ProxyErrorTypes, ProxyException
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 
 
+@pytest.mark.parametrize(
+    "error",
+    (
+        DataError(data=json.loads('{"user_facing_error":{"message":"FATAL: too many clients already"}}')),
+        DataError(
+            data=json.loads('{"user_facing_error":{"meta":{"code":"53300"},"message":"zu viele Verbindungen"}}')
+        ),
+        DataError(
+            data=json.loads('{"user_facing_error":{"message":"FATAL: remaining connection slots are reserved"}}')
+        ),
+        DataError(data=json.loads('{"user_facing_error":{"message":"FATAL: too many connections for role"}}')),
+        DataError(data=json.loads('{"user_facing_error":{"message":"FATAL: too many connections for database"}}')),
+        DataError(
+            data=json.loads(
+                r'{"user_facing_error":{"message":"PostgresError { code: \"53300\", message: \"zu viele Verbindungen\" }"}}'
+            )
+        ),
+    ),
+)
+def test_connection_capacity_refusal_is_unavailable_without_reconnect_or_auth_fallback(error: DataError) -> None:
+    assert PrismaDBExceptionHandler.is_database_capacity_error(error) is True
+    assert PrismaDBExceptionHandler.is_database_service_unavailable_error(error) is True
+    assert PrismaDBExceptionHandler.is_database_transport_error(error) is False
+    assert PrismaDBExceptionHandler.is_database_connection_error(error) is False
+    assert PrismaDBExceptionHandler.is_prisma_data_error(error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        DataError(
+            data=json.loads('{"user_facing_error":{"message":"invalid byte sequence for encoding UTF8: 0x00"}}')
+        ),
+        UniqueViolationError(
+            data=json.loads('{"user_facing_error":{"error_code":"P2002","meta":{"table":"t"}}}')
+        ),
+        PrismaError("can't reach database server"),
+        httpx.ConnectError("connection refused"),
+        RuntimeError("too many clients already"),
+    ),
+)
+def test_connection_capacity_classification_excludes_other_failures(error: Exception) -> None:
+    assert PrismaDBExceptionHandler.is_database_capacity_error(error) is False
+
+
 # Test is_database_connection_error method
 @pytest.mark.parametrize(
     "prisma_error",
