@@ -6,13 +6,14 @@ Documentation: [CometAPI Documentation Link]
 """
 
 from collections.abc import AsyncIterator, Iterator
-from typing import Any, Final
+from typing import Any, Final, get_args
 
 import httpx
 
+from litellm.exceptions import BadRequestError
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
-from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
+from litellm.types.llms.openai import REASONING_EFFORT, AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
@@ -27,9 +28,12 @@ class CometAPIConfig(OpenAIGPTConfig):
     and only need to override necessary methods to handle CometAPI-specific features
     """
 
+    def get_supported_openai_params(self, model: str) -> list[str]:  # mutable-ok: inherited contract
+        return super().get_supported_openai_params(model) + ["reasoning_effort"]  # mutable-ok: inherited contract
+
     def map_openai_params(
         self,
-        non_default_params: dict,
+        non_default_params: dict[str, object],
         optional_params: dict,
         model: str,
         drop_params: bool,
@@ -37,6 +41,13 @@ class CometAPIConfig(OpenAIGPTConfig):
         """
         Map OpenAI format parameters to CometAPI format
         """
+        reasoning_effort: Final = non_default_params.get("reasoning_effort")
+        if reasoning_effort is not None and reasoning_effort not in get_args(REASONING_EFFORT):
+            raise BadRequestError(
+                message=f"Invalid reasoning_effort: {reasoning_effort!r}. Must be one of: {get_args(REASONING_EFFORT)}",
+                model=model,
+                llm_provider="cometapi",
+            )
         mapped_openai_params: Final = super().map_openai_params(non_default_params, optional_params, model, drop_params)
 
         # CometAPI-specific parameters (if any)

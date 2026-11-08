@@ -141,7 +141,7 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
     def get_config(cls):
         return super().get_config()
 
-    def get_supported_openai_params(self, model: str) -> list:
+    def get_supported_openai_params(self, model: str) -> list[str]:
         base_params: Final = [
             "frequency_penalty",
             "logit_bias",
@@ -175,7 +175,7 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
             "store",
         ]  # works across all models
 
-        model_specific_params: Final = []
+        model_specific_params: Final = list[str]()
         if model != "gpt-3.5-turbo-16k" and model != "gpt-4":  # gpt-4 does not support 'response_format'
             model_specific_params.append("response_format")
 

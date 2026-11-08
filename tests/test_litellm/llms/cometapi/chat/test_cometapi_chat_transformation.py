@@ -5,9 +5,12 @@ Tests the CometAPIChatConfig class methods using mocks
 """
 
 import os
+from typing import Final
 
 import pytest
 
+from litellm.exceptions import BadRequestError
+from litellm.utils import get_optional_params
 
 from litellm.llms.cometapi.chat.transformation import (
     CometAPIChatCompletionStreamingHandler,
@@ -84,6 +87,47 @@ class TestCometAPIChatCompletionStreamingHandler:
 
 
 class TestCometAPIConfig:
+    @pytest.mark.parametrize(
+        "model",
+        ("claude-haiku-4-5-20251001", "claude-opus-5-5", "claude-sonnet-5-5"),
+    )
+    @pytest.mark.parametrize("effort", ("low", "medium", "high"))
+    @pytest.mark.parametrize("drop_params", (False, True))
+    def test_reasoning_effort_reaches_request_unchanged(
+        self, model: str, effort: str, drop_params: bool
+    ) -> None:
+        optional_params: Final = get_optional_params(
+            model=model,
+            custom_llm_provider="cometapi",
+            reasoning_effort=effort,
+            max_tokens=128,
+            drop_params=drop_params,
+        )
+        request: Final = CometAPIConfig().transform_request(
+            model=model,
+            messages=[{"role": "user", "content": "Hello"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+
+        assert request == {
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": effort,
+            "max_tokens": 128,
+            "stream": False,
+        }
+
+    @pytest.mark.parametrize("effort", ("invalid-effort", 123, {"effort": "low"}))
+    def test_invalid_reasoning_effort_is_rejected(self, effort: object) -> None:
+        with pytest.raises(BadRequestError, match="Invalid reasoning_effort"):
+            get_optional_params(
+                model="claude-sonnet-5-5",
+                custom_llm_provider="cometapi",
+                reasoning_effort=effort,
+            )
+
     def test_transform_request_basic(self):
         """Test basic request transformation"""
         config = CometAPIConfig()
