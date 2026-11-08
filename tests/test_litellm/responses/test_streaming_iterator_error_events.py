@@ -20,7 +20,9 @@ Pydantic ValidationError (previously typed as Optional[str]).
 """
 
 import json
+from collections.abc import AsyncIterator
 from importlib import import_module
+from typing import Final
 from unittest.mock import Mock, patch
 
 import pytest
@@ -30,6 +32,7 @@ import litellm
 from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.responses.streaming_iterator import (
     _ERROR_CODE_HTTP_STATUS,
     BaseResponsesAPIStreamingIterator,
@@ -596,3 +599,74 @@ def test_request_eligibility_errors_are_non_retriable(code):
     assert error.value.status_code == 400
     assert error.value.body["code"] == code
     assert not isinstance(error.value, MidStreamFallbackError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["missing", None, "error"])
+@pytest.mark.parametrize(
+    ("error_type", "code", "status", "exception_type", "fallback"),
+    [
+        ("server_error", "service_unavailable", 500, litellm.InternalServerError, True),
+        ("invalid_request_error", "insufficient_quota", 429, litellm.RateLimitError, True),
+        ("rate_limit_error", "unknown_error", 429, litellm.RateLimitError, True),
+        ("authentication_error", "401", 401, litellm.AuthenticationError, False),
+        ("invalid_request_error", "invalid_prompt", 400, litellm.BadRequestError, False),
+        ("invalid_request_error", "content_policy_violation", 400, litellm.ContentPolicyViolationError, True),
+    ],
+)
+async def test_untyped_stream_errors_preserve_fork_classification_and_partial_output(
+    event_type: str | None,
+    error_type: str,
+    code: str,
+    status: int,
+    exception_type: type[Exception],
+    fallback: bool,
+) -> None:
+    error: Final = {"type": error_type, "code": code, "message": "Provider rejected the request", "param": "input"}
+    events: Final = (
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_partial",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial ",
+            "sequence_number": 1,
+            "error": None,
+        },
+        {"error": error, **({} if event_type == "missing" else {"type": event_type})},
+    )
+    payload: Final = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events)
+
+    async def aiter_bytes() -> AsyncIterator[bytes]:
+        yield payload
+
+    response: Final = Mock(headers={}, aiter_bytes=aiter_bytes)
+    logging_obj: Final = Mock(spec=LiteLLMLoggingObj)
+    logging_obj.model_call_details = {"litellm_params": {}}
+    logging_obj.completion_start_time = None
+    iterator: Final = ResponsesAPIStreamingIterator(
+        response=response,
+        model="test-model",
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=logging_obj,
+        custom_llm_provider="openai",
+    )
+    stream: Final = aiter(iterator)
+    first: Final = await anext(stream)
+    assert first.type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA
+    assert first.delta == "partial "
+    with pytest.raises(MidStreamFallbackError if fallback else exception_type) as caught:
+        await anext(stream)
+    raised: Final = caught.value
+    mapped: Final = raised.original_exception if isinstance(raised, MidStreamFallbackError) else raised
+    assert type(mapped) is exception_type
+    assert mapped.status_code == status
+    assert mapped.body == (None if exception_type is litellm.AuthenticationError else error)
+    assert error["message"] in str(mapped)
+    assert isinstance(raised, MidStreamFallbackError) is fallback
+    assert raised.status_code == status
+    assert (
+        (raised.generated_content, raised.is_pre_first_chunk)
+        if isinstance(raised, MidStreamFallbackError)
+        else None
+    ) == (("partial ", False) if fallback else None)
