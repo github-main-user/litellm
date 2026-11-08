@@ -57,12 +57,25 @@ def test_cometapi_preserves_saved_deepseek_alias():
     )
 
 
-@pytest.mark.parametrize("base_model", ["deepseek/not-a-known-model", "openai/deepseek-flash"])
-def test_cometapi_does_not_guess_unknown_or_other_lab_bindings(base_model):
+@pytest.mark.parametrize(
+    "base_model",
+    ["anthropic/claude-fable-5.1", "openai/gpt-6-sol", "google/gemini-test", "custom/new-model"],
+)
+def test_cometapi_allows_bindings_for_any_model_family(base_model):
     assert resolve_identity(base_model, "comet", "cometapi").model_dump() == {
         "provider_connection": "comet",
-        "status": "unknown",
-        "provider_model": None,
+        "status": "resolved",
+        "provider_model": f"cometapi/{base_model.partition('/')[2]}",
+    }
+
+
+def test_cometapi_preserves_saved_fable_alias_instead_of_default():
+    assert resolve_identity(
+        "anthropic/claude-fable-5.1", "comet", "cometapi", ("cometapi/fable-custom",)
+    ).model_dump() == {
+        "provider_connection": "comet",
+        "status": "resolved",
+        "provider_model": "cometapi/fable-custom",
     }
 
 
