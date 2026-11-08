@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+import asyncio
 from contextlib import ExitStack
 from typing import Final
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import litellm
 import pytest
 import yaml
+from redis.asyncio import Redis
 from fastapi.testclient import TestClient
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -35,6 +37,7 @@ from litellm.proxy._types import (
     RegenerateKeyRequest,
     ResetSpendRequest,
     UpdateKeyRequest,
+    hash_token,
 )
 from litellm.models.object_permission import LiteLLM_ObjectPermissionTable
 from litellm.proxy.auth.auth_checks import (
@@ -42,6 +45,7 @@ from litellm.proxy.auth.auth_checks import (
     jwt_key_mapping_cache_key,
 )
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AuthCacheInvalidationSubscriber
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, project_cache_key
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.proxy.management_endpoints.key_management_endpoints import (
@@ -69,6 +73,7 @@ from litellm.proxy.management_endpoints.key_management_endpoints import (
     check_org_key_model_specific_limits,
     check_team_key_model_specific_limits,
     delete_verification_tokens,
+    delete_key_aliases,
     generate_key_fn,
     generate_key_helper_fn,
     key_aliases,
@@ -5427,6 +5432,119 @@ class _CascadingJWTMappingTable:
 
     def cascade(self, deleted_tokens):
         self.rows = [row for row in self.rows if row.token not in deleted_tokens]
+
+
+class _KeyDeletionChannel:
+    namespace = None
+
+    def __init__(self) -> None:
+        self.messages: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.ready: Final = asyncio.Event()
+        self.holding_message = False
+        self.published: tuple[str, ...] = ()
+
+    def init_async_client(self) -> MagicMock:
+        return MagicMock(spec=Redis, pubsub=self.pubsub, publish=self.publish)
+
+    def pubsub(self) -> "_KeyDeletionChannel":
+        return self
+
+    async def subscribe(self, *channels: str) -> None:
+        self.ready.set()
+
+    async def publish(self, channel: str, message: str) -> int:
+        self.published = (*self.published, message)
+        await self.messages.put({"type": "message", "data": message.encode()})
+        return 1
+
+    async def get_message(self, *, ignore_subscribe_messages: bool, timeout: float) -> dict[str, object]:
+        if self.holding_message:
+            self.messages.task_done()
+        self.holding_message = True
+        return await self.messages.get()
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key_form", ["raw", "hash", "alias"])
+@pytest.mark.parametrize("role", [LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.INTERNAL_USER])
+async def test_key_deletion_revokes_local_and_peer_keys_without_evicting_unrelated_entries(
+    monkeypatch: pytest.MonkeyPatch, key_form: str, role: LitellmUserRoles
+) -> None:
+    raw_key: Final = "sk-deletion-live-key"
+    live_token: Final = hash_token(raw_key)
+    gone_key: Final = "sk-deletion-stale-key"
+    gone_token: Final = hash_token(gone_key)
+    unrelated_key: Final = "spend:team:other-team"
+    unrelated_token: Final = hash_token("sk-unrelated-key")
+    local_cache: Final = UserApiKeyCache()
+    peer_cache: Final = UserApiKeyCache()
+    for cache in (local_cache, peer_cache):
+        for token in (live_token, gone_token, unrelated_token):
+            cache.set_cache(key=token, value=UserAPIKeyAuth(token=token, user_id="owner"))
+        cache.set_cache(key=unrelated_key, value=42.0)
+    key_row: Final = LiteLLM_VerificationToken(token=live_token, user_id="owner", key_alias="delete-me")
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[key_row])
+    prisma_client.db.litellm_jwtkeymapping = _CascadingJWTMappingTable([])
+    prisma_client.delete_data = AsyncMock(return_value=[live_token])
+    channel: Final = _KeyDeletionChannel()
+    subscriber: Final = AuthCacheInvalidationSubscriber(redis_cache=channel, user_api_key_cache=peer_cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.redis_usage_cache", channel)
+    deleter: Final = UserAPIKeyAuth(user_id="owner", user_role=role.value)
+    subscriber.start()
+    try:
+        await asyncio.wait_for(channel.ready.wait(), 2)
+        if key_form == "alias":
+            await delete_key_aliases(
+                key_aliases=["delete-me"], user_api_key_cache=local_cache,
+                prisma_client=prisma_client, user_api_key_dict=deleter,
+            )
+        else:
+            await delete_verification_tokens(
+                tokens=[raw_key if key_form == "raw" else live_token, gone_key, unrelated_key],
+                user_api_key_cache=local_cache, user_api_key_dict=deleter,
+            )
+        await asyncio.wait_for(channel.messages.join(), 2)
+    finally:
+        await subscriber.stop()
+    expected_evictions: Final = (live_token,) if key_form == "alias" else (live_token, gone_token)
+    for cache in (local_cache, peer_cache):
+        assert tuple(cache.get_cache(key=token) for token in expected_evictions) == (None,) * len(expected_evictions)
+        assert cache.get_cache(key=unrelated_key) == 42.0
+        assert cache.get_cache(key=unrelated_token) is not None
+    assert {json.loads(message)["cache_key"] for message in channel.published} == set(expected_evictions)
+
+
+@pytest.mark.asyncio
+async def test_key_deletion_rejects_unowned_key_before_deleting_or_broadcasting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned_token: Final = hash_token("sk-owned-key")
+    unowned_token: Final = hash_token("sk-unowned-key")
+    cache: Final = UserApiKeyCache()
+    for token in (owned_token, unowned_token):
+        cache.set_cache(key=token, value=UserAPIKeyAuth(token=token))
+    prisma_client: Final = AsyncMock()
+    prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[
+        LiteLLM_VerificationToken(token=owned_token, user_id="owner"),
+        LiteLLM_VerificationToken(token=unowned_token, user_id="someone-else"),
+    ])
+    channel: Final = _KeyDeletionChannel()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.redis_usage_cache", channel)
+    with pytest.raises(HTTPException) as denied:
+        await delete_verification_tokens(
+            tokens=[owned_token, unowned_token], user_api_key_cache=cache,
+            user_api_key_dict=UserAPIKeyAuth(user_id="owner", user_role=LitellmUserRoles.INTERNAL_USER.value),
+        )
+    assert denied.value.status_code == 403
+    prisma_client.delete_data.assert_not_awaited()
+    assert channel.published == ()
+    assert all(cache.get_cache(key=token) is not None for token in (owned_token, unowned_token))
 
 
 class _RecordingEvict:
