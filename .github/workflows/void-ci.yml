@@ -69,6 +69,7 @@ jobs:
             tests/test_litellm/llms/chatgpt/test_chatgpt_oauth_client.py \
             tests/test_litellm/llms/anthropic/test_credential_proxy_inference.py
           uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/test_litellm/proxy/management_endpoints/test_model_resolution.py \
             tests/test_litellm/proxy/credential_endpoints/test_anthropic_oauth.py \
             tests/test_litellm/proxy/credential_endpoints/test_chatgpt_oauth.py \
             tests/test_litellm/proxy/credential_endpoints/test_subscription_usage.py \

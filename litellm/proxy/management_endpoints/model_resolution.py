@@ -24,11 +24,12 @@ def resolve_identity(
     base_model: str, provider_connection: str | None, provider: str | None, known_models: Sequence[str] = ()
 ) -> ModelResolution:
     lab, _, model = base_model.partition("/")
+    comet_deepseek: Final = provider == "cometapi" and lab == "deepseek"
     native: Final = provider in ("anthropic", "openai", "chatgpt", "deepseek")
     expected_lab: Final = "openai" if provider == "chatgpt" else provider
     if native and lab != expected_lab:
         return ModelResolution(provider_connection=provider_connection, status="incompatible")
-    if not native:
+    if not native and not comet_deepseek:
         return ModelResolution(provider_connection=provider_connection, status="unknown")
     saved: Final = frozenset(item for item in known_models if item.partition("/")[0] == provider)
     if saved:
@@ -38,6 +39,8 @@ def resolve_identity(
             provider_model=next(iter(saved)) if len(saved) == 1 else None,
         )
     candidate: Final = f"{provider}/{model}"
+    if comet_deepseek and model in ("deepseek-flash", "deepseek-v4-pro"):
+        return ModelResolution(provider_connection=provider_connection, status="resolved", provider_model=candidate)
     metadata: Final = litellm.model_cost.get(candidate) or litellm.model_cost.get(model)
     if metadata and metadata.get("litellm_provider") == provider and metadata.get("mode") in ("chat", "responses"):
         return ModelResolution(provider_connection=provider_connection, status="resolved", provider_model=candidate)
