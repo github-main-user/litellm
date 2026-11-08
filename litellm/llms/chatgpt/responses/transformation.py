@@ -96,6 +96,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "prompt_cache_key",
             "truncation",
             "text",
+            "max_output_tokens",
         }
 
         return {k: v for k, v in request.items() if k in allowed_keys}
@@ -179,7 +180,10 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 record_recovery_text_chunk(parsed_chunk, text_chunks)
                 continue
 
-            if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+            if event_type in (
+                ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+                ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,
+            ):
                 # Real OUTPUT_ITEM_DONE events take precedence at any given
                 # output_index, but text-only items at indices without a
                 # matching OUTPUT_ITEM_DONE must still be preserved (e.g.

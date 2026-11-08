@@ -1601,9 +1601,10 @@ class LiteLLMCompletionResponsesConfig:
                     part_type = part.get("type")
                     if part_type in ("input_text", "output_text", "text"):
                         txt = part.get("text")
-                        if isinstance(txt, str) and txt:
+                        if isinstance(txt, str):
                             text_acc.append(txt)
-                            normalized_blocks.append({"type": "text", "text": txt})
+                            if txt:
+                                normalized_blocks.append({"type": "text", "text": txt})
                     elif part_type in ("input_image", "image_url"):
                         image_url_val = part.get("image_url") or part.get("url")
                         if isinstance(image_url_val, dict):
@@ -1622,7 +1623,7 @@ class LiteLLMCompletionResponsesConfig:
                 if any(b.get("type") == "image_url" for b in normalized_blocks):
                     # Ensure we include any accumulated text as text blocks too
                     return normalized_blocks
-                if text_acc:
+                if any(text_acc) or len(text_acc) == len(output):
                     return "".join(text_acc)
                 try:
                     # last resort: keep something meaningful for providers that require a string

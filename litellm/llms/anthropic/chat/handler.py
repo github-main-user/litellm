@@ -600,7 +600,9 @@ class AnthropicChatCompletion(BaseLLM):
                     response: Final = client.post(
                         api_base,
                         headers=headers,
-                        data=serialize_anthropic_subscription_request(data) if subscription_request else json.dumps(data),
+                        data=serialize_anthropic_subscription_request(data)
+                        if subscription_request
+                        else json.dumps(data),
                         timeout=timeout,
                         logging_obj=logging_obj,
                     )
@@ -801,11 +803,7 @@ class ModelResponseIterator:
                 thinking_blocks = [
                     ChatCompletionThinkingBlock(
                         type="thinking",
-                        thinking="".join(
-                            cast(str, block["delta"].get("thinking"))
-                            for block in self.content_blocks
-                            if isinstance(block["delta"].get("thinking"), str)
-                        ),
+                        thinking="",
                         signature=signature,
                     )
                 ]

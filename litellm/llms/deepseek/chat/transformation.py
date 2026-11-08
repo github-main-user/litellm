@@ -16,6 +16,8 @@ from litellm.utils import supports_reasoning, supports_vision
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
+SUPPORTED_REASONING_EFFORTS: Final = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
 
 class DeepSeekChatConfig(OpenAIGPTConfig):
     def get_supported_openai_params(self, model: str) -> list:
@@ -32,7 +34,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         optional_params: dict,
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         """
         Map OpenAI params to DeepSeek params.
 
@@ -58,6 +60,16 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         # Otherwise fall back to reasoning_effort: "none" disables, anything else enables
         elif reasoning_effort is not None:
             optional_params["thinking"] = {"type": "disabled" if reasoning_effort == "none" else "enabled"}
+
+        if (
+            isinstance(reasoning_effort, str)
+            and reasoning_effort in SUPPORTED_REASONING_EFFORTS
+            and optional_params["thinking"].get("type") == "enabled"
+        ):
+            return {  # mutable-ok: provider params require a JSON dict
+                **optional_params,
+                "reasoning_effort": reasoning_effort,
+            }
 
         return optional_params
 
@@ -363,10 +375,9 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         """
         If api_base is not provided, use the default DeepSeek /chat/completions endpoint.
         """
-        if not api_base:
-            api_base = "https://api.deepseek.com/beta"
+        clean_api_base: Final = (api_base or "https://api.deepseek.com/beta").rstrip("/")
 
-        if not api_base.endswith("/chat/completions"):
-            api_base = f"{api_base}/chat/completions"
+        if not clean_api_base.endswith("/chat/completions"):
+            return f"{clean_api_base}/chat/completions"
 
-        return api_base
+        return clean_api_base

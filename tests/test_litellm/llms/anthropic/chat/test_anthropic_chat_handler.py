@@ -10,6 +10,7 @@ import pytest
 import litellm
 from litellm._uuid import uuid
 from litellm.constants import RESPONSE_FORMAT_TOOL_NAME
+from litellm.litellm_core_utils.prompt_templates.factory import anthropic_messages_pt
 from litellm.llms.anthropic.chat.handler import ModelResponseIterator, make_call
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.types.llms.openai import (
@@ -458,18 +459,86 @@ def test_streaming_thinking_blocks_are_replayable_after_signature_delta():
     )
     expected_thinking_block = {
         "type": "thinking",
-        "thinking": "Step 1. Step 2.",
+        "thinking": "",
         "signature": "sig-final",
     }
 
     assert reasoning_content == "Step 1. Step 2."
     assert thinking_blocks == (*expected_delta_blocks, expected_thinking_block)
+    assert "".join(block.get("thinking") or "" for block in thinking_blocks) == reasoning_content
     assert parsed_chunks[1].choices[0].delta.provider_specific_fields == {
         "thinking_blocks": [expected_delta_blocks[0]]
     }
     assert parsed_chunks[-1].choices[0].delta.provider_specific_fields == {
         "thinking_blocks": [expected_thinking_block]
     }
+
+
+def test_streamed_signed_thinking_round_trips_to_the_next_turn_once() -> None:
+    iterator: Final = ModelResponseIterator(streaming_response=MagicMock(), sync_stream=True, json_mode=False)
+    thinking_parts: Final = ("Check the weather. ", "Use the weather tool.")
+    thinking_text: Final = "".join(thinking_parts)
+    events: Final = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_weather",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [],
+                "stop_reason": None,
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking_parts[0]}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking_parts[1]}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-weather"}},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_weather", "name": "get_weather", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": '{"city": "Paris"}'},
+        },
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 30}},
+        {"type": "message_stop"},
+    )
+    user_message: Final = {"role": "user", "content": "What's the weather in Paris?"}
+    streamed: Final = litellm.stream_chunk_builder(
+        chunks=[iterator.chunk_parser(event) for event in events], messages=[user_message]
+    )
+    assistant: Final = streamed.choices[0].message
+    assert assistant.reasoning_content == thinking_text
+    assert assistant.thinking_blocks == [{"type": "thinking", "thinking": thinking_text, "signature": "sig-weather"}]
+    saved_history: Final = json.loads(
+        json.dumps(
+            [
+                user_message,
+                assistant.model_dump(),
+                {"role": "tool", "tool_call_id": "toolu_weather", "content": "22C and sunny"},
+            ]
+        )
+    )
+    replayed: Final = anthropic_messages_pt(messages=saved_history, model="claude-sonnet-4-5", llm_provider="anthropic")
+    assert replayed == [
+        {"role": "user", "content": [{"type": "text", "text": user_message["content"]}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": thinking_text, "signature": "sig-weather"},
+                {"type": "text", "text": "[System: Empty message content sanitised to satisfy protocol]"},
+                {"type": "tool_use", "id": "toolu_weather", "name": "get_weather", "input": {"city": "Paris"}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_weather", "content": "22C and sunny"}]},
+    ]
 
 
 def test_streaming_unsigned_thinking_deltas_keep_reasoning_content():

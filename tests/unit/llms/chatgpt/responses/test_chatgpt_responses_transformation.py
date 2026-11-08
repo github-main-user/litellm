@@ -407,10 +407,10 @@ class TestChatGPTResponsesAPITransformation:
                     {"type": "compaction", "compact_threshold": 200000}
                 ],
                 "metadata": {"foo": "bar"},
-                "max_output_tokens": 123,
                 "stream_options": {"include_usage": True},
                 "prompt_cache_retention": "24h",
                 # supported and should be preserved
+                "max_output_tokens": 123,
                 "truncation": "auto",
                 "previous_response_id": "resp_123",
                 "reasoning": {"effort": "medium"},
@@ -426,7 +426,7 @@ class TestChatGPTResponsesAPITransformation:
         assert "top_p" not in request
         assert "context_management" not in request
         assert "metadata" not in request
-        assert "max_output_tokens" not in request
+        assert request["max_output_tokens"] == 123
         assert "stream_options" not in request
         assert "prompt_cache_retention" not in request
 
@@ -610,7 +610,7 @@ class TestChatGPTResponsesAPITransformation:
 
 
 @pytest.mark.parametrize("terminal", [None, "response.failed", "response.incomplete", "response.completed"])
-def test_chatgpt_delta_only_recovery_requires_completed(terminal):
+def test_chatgpt_delta_only_recovery_requires_terminal_response(terminal):
     events = [
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text}
         for text in ("Hel", "lo")
@@ -631,8 +631,9 @@ def test_chatgpt_delta_only_recovery_requires_completed(terminal):
         )
     body = "\n".join(f"data: {json.dumps(event)}" for event in events)
     response, error = ChatGPTResponsesAPIConfig()._extract_completed_response_from_sse(body)
-    if terminal == "response.completed":
+    if terminal in ("response.completed", "response.incomplete"):
         assert response is not None
+        assert response.status == terminal.split(".")[1]
         assert response.output_text == "Hello"
         assert len(response.output) == 1
     else:
@@ -641,7 +642,8 @@ def test_chatgpt_delta_only_recovery_requires_completed(terminal):
 
 
 @pytest.mark.parametrize("source", ["terminal", "item_done", "text_done"])
-def test_chatgpt_completed_recovery_prefers_full_text_over_deltas(source):
+@pytest.mark.parametrize("status", ["completed", "incomplete"])
+def test_chatgpt_terminal_recovery_prefers_full_text_over_deltas(source, status):
     item = {
         "type": "message",
         "id": "msg_full",
@@ -656,13 +658,14 @@ def test_chatgpt_completed_recovery_prefers_full_text_over_deltas(source):
         events.append({"type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": "Full text"})
     events.append(
         {
-            "type": "response.completed",
+            "type": f"response.{status}",
             "response": {
                 "id": "resp_full",
                 "object": "response",
                 "created_at": 1,
                 "model": "gpt-5.4",
-                "status": "completed",
+                "status": status,
+                "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
                 "output": [item] if source == "terminal" else [],
             },
         }
@@ -671,6 +674,10 @@ def test_chatgpt_completed_recovery_prefers_full_text_over_deltas(source):
         "\n".join(f"data: {json.dumps(event)}" for event in events)
     )
     assert response is not None
+    assert response.status == status
+    assert (response.incomplete_details.model_dump() if response.incomplete_details is not None else None) == (
+        {"reason": "max_output_tokens"} if status == "incomplete" else None
+    )
     assert response.output_text == "Full text"
     assert len(response.output) == 1
     assert error is None
@@ -972,8 +979,14 @@ async def test_schema_non_success_semantics(
         200, headers={"content-type": "text/event-stream"}, text=event_body("partial", kind)
     )
     if kind == "incomplete":
-        with pytest.raises(litellm.APIError, match=r"response\.incomplete"):
-            await invoke(api, asynchronous, False, True, managed_credential)
+        partial: Final = await invoke(api, asynchronous, False, True, managed_credential)
+        if api == "chat":
+            assert partial.choices[0].message.content == "partial"
+            assert partial.choices[0].finish_reason == "length"
+        else:
+            assert partial.output_text == "partial"
+            assert partial.status == "incomplete"
+            assert partial.incomplete_details.model_dump() == {"reason": "max_output_tokens"}
         assert route.call_count == 1
         assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
         return
@@ -987,6 +1000,36 @@ async def test_schema_non_success_semantics(
     assert not result.output_text
     assert route.call_count == 1
     assert json.loads(route.calls[0].request.content)["text"] == text_format(True)
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_max_output_tokens_reaches_codex_and_returns_partial_answer(
+    api: str, respx_mock: respx.MockRouter, local_model_cost_map: None, managed_credential: str
+) -> None:
+    limit: Final = 300
+    route: Final = respx_mock.post(URL).respond(
+        200, headers={"content-type": "text/event-stream"}, text=event_body("partial", "incomplete")
+    )
+    params: Final = {
+        "model": "chatgpt/gpt-6.1-sol",
+        "api_key": ManagedChatGPTAccessToken("managed-token"),
+        "api_base": "https://chatgpt.test/backend-api/codex",
+        "litellm_credential_name": managed_credential,
+        "num_retries": 0,
+    }
+    if api == "chat":
+        completion: Final = litellm.completion(
+            messages=[{"role": "user", "content": "Hello"}], max_tokens=limit, **params
+        )
+        assert completion.choices[0].message.content == "partial"
+        assert completion.choices[0].finish_reason == "length"
+    else:
+        response: Final = litellm.responses(input="Hello", max_output_tokens=limit, **params)
+        assert response.output_text == "partial"
+        assert response.status == "incomplete"
+        assert response.incomplete_details.model_dump() == {"reason": "max_output_tokens"}
+    assert route.call_count == 1
+    assert json.loads(route.calls[0].request.content)["max_output_tokens"] == limit
 
 
 @pytest.mark.parametrize("api", ["chat", "responses"])

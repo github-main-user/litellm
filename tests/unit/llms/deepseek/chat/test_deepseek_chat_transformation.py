@@ -1,3 +1,7 @@
+from typing import Final
+
+import pytest
+
 import litellm
 from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
 
@@ -385,6 +389,44 @@ class TestDeepSeekVisionMultimodalContent:
         content = body["messages"][0]["content"]
         assert isinstance(content, list)
         assert any(block.get("type") == "image_url" for block in content)
+
+
+@pytest.mark.parametrize("effort", ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"))
+@pytest.mark.parametrize("thinking", (None, "enabled"))
+def test_deepseek_preserves_requested_reasoning_effort(effort: str, thinking: str | None) -> None:
+    params: Final = {"reasoning_effort": effort, **({"thinking": {"type": thinking}} if thinking else {})}
+    result: Final = DeepSeekChatConfig().map_openai_params(params, {}, "deepseek-reasoner", False)
+    assert result == {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
+
+
+@pytest.mark.parametrize(
+    "thinking,effort,expected_thinking",
+    (
+        (None, None, None),
+        (None, "none", "disabled"),
+        ("enabled", "none", "enabled"),
+        ("disabled", "max", "disabled"),
+        ("enabled", None, "enabled"),
+        (None, "default", "enabled"),
+        (None, "bogus", "enabled"),
+        (None, {"effort": "high"}, "enabled"),
+    ),
+)
+def test_deepseek_does_not_forward_disabled_or_unsupported_effort(
+    thinking: str | None, effort: str | dict[str, str] | None, expected_thinking: str | None
+) -> None:
+    params: Final = {"reasoning_effort": effort, **({"thinking": {"type": thinking}} if thinking else {})}
+    result: Final = DeepSeekChatConfig().map_openai_params(params, {}, "deepseek-reasoner", False)
+    assert result == ({"thinking": {"type": expected_thinking}} if expected_thinking else {})
+
+
+@pytest.mark.parametrize("suffix", ("", "/", "///", "/chat/completions", "/chat/completions/"))
+def test_deepseek_normalizes_trailing_slashes_without_duplicating_route(suffix: str) -> None:
+    base: Final = "https://deepseek.example.test/v1"
+    result: Final = DeepSeekChatConfig().get_complete_url(
+        api_base=f"{base}{suffix}", api_key=None, model="deepseek-reasoner", optional_params={}, litellm_params={}
+    )
+    assert result == f"{base}/chat/completions"
 
 
 class TestDeepSeekThinkingParams:
