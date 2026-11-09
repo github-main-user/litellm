@@ -1737,8 +1737,69 @@ class TestRequestContainsImageContent:
 class TestEncryptedReasoningReplay:
     """Regression for https://github.com/BerriAI/litellm/issues/40288."""
 
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"type": "thinking", "thinking": "plan", "signature": encrypted_reasoning_signature("g1")},
+            {"type": "redacted_thinking", "data": encrypted_reasoning_signature("g2")},
+        ],
+    )
+    def test_strip_removes_newly_empty_assistants_in_shared_fallback_history(self, block: dict[str, str]) -> None:
+        tool_use: Final = {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+        tool_result: Final = {"type": "tool_result", "tool_use_id": "call_1", "content": "found"}
+        readable_content: Final = [block, {"type": "text", "text": "answer"}]
+        tool_content: Final = [block, tool_use]
+        messages: Final = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": [block]},
+            {"role": "assistant", "content": []},
+            {"role": "assistant", "content": readable_content},
+            {"role": "assistant", "content": [block]},
+            {"role": "assistant", "content": tool_content},
+            {"role": "user", "content": [tool_result]},
+        ]
+        fallback: Final = {"messages": messages}
+        expected: Final = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": []},
+            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+            {"role": "assistant", "content": [tool_use]},
+            {"role": "user", "content": [tool_result]},
+        ]
+
+        strip_encrypted_reasoning_from_messages(messages)
+
+        assert messages == expected
+        assert fallback["messages"] == expected
+        assert messages[2]["content"] is readable_content
+        assert messages[3]["content"] is tool_content
+
+        strip_encrypted_reasoning_from_messages(messages)
+
+        assert fallback["messages"] == expected
+
     def test_signature_round_trips_the_encrypted_content(self):
         assert encrypted_content_from_signature(encrypted_reasoning_signature("gAAAA_bytes")) == "gAAAA_bytes"
+
+    @pytest.mark.parametrize("call_field", ["tool_calls", "function_call"])
+    def test_strip_preserves_assistant_with_top_level_tool_call(self, call_field: str) -> None:
+        function_call: Final = {"name": "lookup", "arguments": "{}"}
+        call: Final = (
+            [{"id": "call_1", "type": "function", "function": function_call}]
+            if call_field == "tool_calls"
+            else function_call
+        )
+        messages: Final = [
+            {
+                "role": "assistant",
+                "content": [{"type": "redacted_thinking", "data": encrypted_reasoning_signature("g")}],
+                call_field: call,
+            }
+        ]
+
+        strip_encrypted_reasoning_from_messages(messages)
+
+        assert messages == [{"role": "assistant", "content": [], call_field: call}]
 
     @pytest.mark.parametrize(
         "signature", [None, "", "ErcBCkgIValidAnthropicSignature", "litellm_encrypted_reasoning:", 7]

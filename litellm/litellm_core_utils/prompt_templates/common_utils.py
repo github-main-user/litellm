@@ -2014,8 +2014,21 @@ def strip_encrypted_reasoning_from_messages(messages: object) -> None:
     """
     if not isinstance(messages, list):
         return
-    for content in _anthropic_content_lists(cast(list[object], messages)):  # cast-ok: untyped client json
+    history: Final = cast(list[object], messages)  # cast-ok: untyped client json
+    reasoning_only_indices: Final = frozenset(
+        index
+        for index, message in enumerate(history)
+        if isinstance(message, Mapping)
+        for mapping in (cast(Mapping[str, object], message),)  # cast-ok: narrowed by isinstance
+        if mapping.get("role") == "assistant" and not mapping.get("tool_calls") and not mapping.get("function_call")
+        for content in (mapping.get("content"),)
+        if isinstance(content, list) and content and all(is_encrypted_reasoning_block(block) for block in content)
+    )
+    for content in _anthropic_content_lists(history):
         _strip_encrypted_reasoning_from_blocks(content)
+    history[:] = tuple(  # rebind-ok: shared with fallback snapshot
+        message for index, message in enumerate(history) if index not in reasoning_only_indices
+    )
 
 
 def _anthropic_content_lists(messages: Sequence[object]) -> Iterator[object]:

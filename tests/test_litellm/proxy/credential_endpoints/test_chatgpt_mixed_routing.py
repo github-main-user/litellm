@@ -1,6 +1,8 @@
 import json
 import time
 from collections.abc import Iterator
+from copy import deepcopy
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -8,6 +10,7 @@ import pytest
 
 import litellm
 from litellm.llms.chatgpt.oauth_client import ChatGPTTokens
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.models.credentials import CredentialItem
 from litellm.proxy.credential_endpoints.chatgpt_oauth import (
     CHATGPT_CREDENTIAL_VALUE_KEY,
@@ -166,13 +169,15 @@ async def test_expired_managed_credentials_fail_over_to_third_account(
         requests.append(request)
         response = _response(3).model_dump()
         response["object"] = "response"
-        response["output"] = [{
-            "type": "message",
-            "id": "msg-third",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
-        }]
+        response["output"] = [
+            {
+                "type": "message",
+                "id": "msg-third",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+            }
+        ]
         return httpx.Response(
             200,
             request=request,
@@ -291,52 +296,169 @@ async def test_initial_subscription_failure_fails_over_to_api_key(
 
 
 @pytest.mark.asyncio
-async def test_encrypted_follow_up_pins_or_fails_without_crossing_accounts(
+@pytest.mark.parametrize("origin_state", ["healthy", "cooled", "quota"])
+@pytest.mark.parametrize("alternate", [CHATGPT_B, OPENAI_API])
+async def test_encrypted_follow_up_preserves_history_when_origin_fails_over(
     mixed_router: litellm.Router,
+    origin_state: str,
+    alternate: str,
 ) -> None:
-    encoded_id = ResponsesAPIRequestUtils._build_encrypted_item_id(
+    encoded_id: Final = ResponsesAPIRequestUtils._build_encrypted_item_id(
         CHATGPT_A,
         "rs-origin",
     )
-    request_input = [
+    readable_history: Final = [
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "I will check the forecast."},
+        {
+            "type": "function_call",
+            "call_id": "call-weather",
+            "name": "weather",
+            "arguments": '{"city":"Paris"}',
+        },
+        {"type": "function_call_output", "call_id": "call-weather", "output": "18 C, sunny"},
+        {"role": "user", "content": "Should I bring an umbrella?"},
+    ]
+    request_input: Final = [
+        *readable_history[:1],
         {
             "type": "reasoning",
             "id": encoded_id,
             "encrypted_content": "encrypted-origin",
-        }
+        },
+        *readable_history[1:],
     ]
+    attempts: Final = []
+    dispatched_inputs: Final = []
 
-    with patch(
-        "litellm.router_strategy.simple_shuffle.random.choice",
-        side_effect=AssertionError("affinity must bypass normal selection"),
-    ):
-        selected = await mixed_router.async_get_available_deployment(
-            model=MODEL_GROUP,
-            request_kwargs={"input": request_input, "litellm_metadata": {}},
-            input=request_input,
+    def select(deployments: list[dict]) -> dict:
+        assert origin_state != "healthy", "healthy affinity must bypass normal selection"
+        return _deployment_by_id(deployments, alternate)
+
+    async def respond(**call) -> ResponsesAPIResponse:
+        attempt: Final = _attempt(call)
+        attempts.append(attempt)
+        dispatched_inputs.append(deepcopy(call["input"]))
+        if origin_state == "quota" and attempt[1] == "access-a":
+            raise litellm.RateLimitError(
+                message="subscription quota exhausted",
+                llm_provider="chatgpt",
+                model="gpt-5.4",
+                response=httpx.Response(
+                    status_code=429,
+                    request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+                ),
+            )
+        return _response(len(attempts))
+
+    if origin_state == "cooled":
+        mixed_router.cooldown_cache.add_deployment_to_cooldown(
+            model_id=CHATGPT_A,
+            original_exception=Exception("subscription quota exhausted"),
+            exception_status=429,
+            cooldown_time=60,
         )
-
-    assert selected["model_info"]["id"] == CHATGPT_A
-
-    mixed_router.cooldown_cache.add_deployment_to_cooldown(
-        model_id=CHATGPT_A,
-        original_exception=Exception("subscription throttled"),
-        exception_status=429,
-        cooldown_time=60,
-    )
 
     with (
         patch(
             "litellm.router_strategy.simple_shuffle.random.choice",
-            side_effect=AssertionError("unavailable affinity must fail closed"),
+            side_effect=select,
         ),
-        pytest.raises(litellm.RateLimitError) as exc_info,
+        patch(
+            "litellm.llms.custom_httpx.llm_http_handler.BaseLLMHTTPHandler.async_response_api_handler",
+            new=AsyncMock(side_effect=respond),
+        ),
     ):
-        await mixed_router.async_get_available_deployment(
+        response: Final = await mixed_router.aresponses(
             model=MODEL_GROUP,
-            request_kwargs={"input": request_input, "litellm_metadata": {}},
-            input=request_input,
+            input=deepcopy(request_input),
         )
 
-    assert exc_info.value.status_code == 429
-    assert exc_info.value.response.headers["retry-after"]
+    origin_attempt: Final = ("chatgpt", "access-a", "account-a")
+    alternate_attempt: Final = (
+        ("chatgpt", "access-b", "account-b") if alternate == CHATGPT_B else ("openai", "openai-key", None)
+    )
+    expected_attempts: Final = {
+        "healthy": [origin_attempt],
+        "cooled": [alternate_attempt],
+        "quota": [origin_attempt, alternate_attempt],
+    }
+    origin_input: Final = [
+        *readable_history[:1],
+        {"type": "reasoning", "id": "rs-origin", "encrypted_content": "encrypted-origin"},
+        *readable_history[1:],
+    ]
+    expected_inputs: Final = {
+        "healthy": [origin_input],
+        "cooled": [readable_history],
+        "quota": [origin_input, readable_history],
+    }
+    assert response._hidden_params["model_id"] == (CHATGPT_A if origin_state == "healthy" else alternate)
+    assert attempts == expected_attempts[origin_state]
+    assert dispatched_inputs == expected_inputs[origin_state]
+
+
+@pytest.mark.asyncio
+async def test_streaming_encrypted_follow_up_retries_exhausted_origin_with_readable_history(
+    mixed_router: litellm.Router,
+) -> None:
+    readable_history: Final = [
+        {"role": "user", "content": "Check the weather"},
+        {"type": "function_call", "call_id": "weather-1", "name": "weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "weather-1", "output": "sunny"},
+        {"role": "user", "content": "Do I need an umbrella?"},
+    ]
+    request_input: Final = [
+        *readable_history[:1],
+        {
+            "type": "reasoning",
+            "id": ResponsesAPIRequestUtils._build_encrypted_item_id(CHATGPT_A, "rs-stream-origin"),
+            "encrypted_content": "encrypted-origin",
+        },
+        *readable_history[1:],
+    ]
+    requests: Final = []
+
+    def select(deployments: list[dict]) -> dict:
+        return _deployment_by_id(deployments, CHATGPT_B)
+
+    def upstream(request: httpx.Request, **_kwargs: object) -> httpx.Response:
+        requests.append(request)
+        if request.headers["authorization"] == "Bearer access-a":
+            return httpx.Response(
+                429,
+                request=request,
+                json={"error": {"type": "usage_limit_reached", "message": "subscription quota exhausted"}},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                "data: " + json.dumps({"type": "response.completed", "response": _response(2).model_dump()}) + "\n\n"
+            ).encode(),
+        )
+
+    injected_client: Final = AsyncHTTPHandler()
+    await injected_client.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as raw_client:
+        injected_client.client = raw_client
+        with (
+            patch("litellm.router_strategy.simple_shuffle.random.choice", side_effect=select),
+            patch(
+                "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+                return_value=injected_client,
+            ),
+        ):
+            stream: Final = await mixed_router.aresponses(
+                model=MODEL_GROUP, input=request_input, stream=True, client=injected_client
+            )
+            events: Final = [event async for event in stream]
+
+    assert [request.headers["authorization"] for request in requests] == ["Bearer access-a", "Bearer access-b"]
+    assert [request.headers["chatgpt-account-id"] for request in requests] == ["account-a", "account-b"]
+    assert [json.loads(request.content)["stream"] for request in requests] == [True, True]
+    assert json.loads(requests[1].content)["input"] == readable_history
+    assert len(events) == 1
+    assert events[0].type == "response.completed"
+    assert events[0].response.status == "completed"
