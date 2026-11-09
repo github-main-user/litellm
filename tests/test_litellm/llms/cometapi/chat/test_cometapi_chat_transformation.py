@@ -4,12 +4,17 @@ Unit tests for CometAPI Chat Configuration
 Tests the CometAPIChatConfig class methods using mocks
 """
 
+import json
 import os
+from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Final
 
 import pytest
 
-from litellm.exceptions import BadRequestError
+from litellm.exceptions import BadRequestError, MidStreamFallbackError
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.utils import get_optional_params
 
 from litellm.llms.cometapi.chat.transformation import (
@@ -20,6 +25,51 @@ from litellm.llms.cometapi.common_utils import CometAPIException
 
 
 class TestCometAPIChatCompletionStreamingHandler:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sync_stream", (True, False))
+    async def test_symbolic_error_code_preserves_stream_failure(self, sync_stream: bool) -> None:
+        payload: Final = {"error": {"message": "Upstream returned an invalid response", "code": "bad_response"}}
+        line: Final = "data: " + json.dumps(payload)
+
+        async def lines() -> AsyncIterator[str]:
+            yield line
+
+        handler: Final = CometAPIChatCompletionStreamingHandler(
+            streaming_response=iter((line,)) if sync_stream else lines(), sync_stream=sync_stream
+        )
+        stream: Final = CustomStreamWrapper(
+            completion_stream=handler,
+            model="test-model",
+            custom_llm_provider="cometapi",
+            logging_obj=Logging(
+                model="test-model",
+                messages=[],
+                stream=True,
+                call_type="completion",
+                start_time=datetime.now(),
+                litellm_call_id="test-stream-error",
+                function_id="test-stream-error",
+            ),
+        )
+        with pytest.raises(MidStreamFallbackError) as caught:
+            next(stream) if sync_stream else await anext(stream)
+
+        assert caught.value.status_code == 500
+        assert "Upstream returned an invalid response" in str(caught.value)
+        assert getattr(caught.value.original_exception, "body", None) == payload["error"]
+        assert getattr(caught.value.original_exception, "code", None) == "bad_response"
+        assert caught.value.is_pre_first_chunk is True
+
+    @pytest.mark.parametrize("code, expected", (("429", 429), (700, 500)))
+    def test_error_chunk_uses_http_error_status(self, code: str | int, expected: int) -> None:
+        handler: Final = CometAPIChatCompletionStreamingHandler(streaming_response=iter(()), sync_stream=True)
+        payload: Final = {"error": {"message": "Provider failed", "code": code}}
+        with pytest.raises(CometAPIException) as caught:
+            handler.chunk_parser(payload)
+        assert caught.value.status_code == expected
+        assert caught.value.body == payload["error"]
+        assert caught.value.headers == {"Content-Type": "application/json"}
+
     def test_chunk_parser_successful(self):
         handler = CometAPIChatCompletionStreamingHandler(
             streaming_response=None, sync_stream=True

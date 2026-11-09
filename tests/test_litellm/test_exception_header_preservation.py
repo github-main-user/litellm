@@ -8,6 +8,8 @@ This is important for debugging and observability - headers like x-request-id,
 x-ms-region, rate limit headers, etc. should be available even when errors occur.
 """
 
+from typing import Final
+
 import httpx
 import pytest
 
@@ -24,6 +26,30 @@ from litellm.exceptions import (
 
 class TestExceptionHeaderPreservation:
     """Test that exception classes preserve headers from provider responses."""
+
+    @pytest.mark.parametrize("status_code, expected", (("bad_response", 503), ("429", 429), (700, 503)))
+    def test_midstream_invalid_status_preserves_original_error(self, status_code: str | int, expected: int) -> None:
+        class ProviderError(Exception):
+            def __init__(self) -> None:
+                super().__init__("Original upstream failure: bad_response")
+                self.status_code = status_code
+
+        original: Final = ProviderError()
+        response: Final = httpx.Response(
+            502, headers={"x-request-id": "req-stream-error"}, request=httpx.Request("POST", "https://provider.test")
+        )
+        error: Final = MidStreamFallbackError(
+            message=str(original),
+            model="test-model",
+            llm_provider="cometapi",
+            original_exception=original,
+            response=response,
+        )
+        assert error.status_code == expected
+        assert error.original_exception is original
+        assert "Original upstream failure: bad_response" in str(error)
+        assert error.response is response
+        assert error.response.headers["x-request-id"] == "req-stream-error"
 
     @pytest.fixture
     def mock_response_with_headers(self) -> httpx.Response:
