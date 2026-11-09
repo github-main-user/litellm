@@ -10,7 +10,7 @@ from typing import Any, Final, get_args
 
 import httpx
 
-from litellm.exceptions import BadRequestError
+from litellm.exceptions import BadRequestError, normalize_error_status_code
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.openai import REASONING_EFFORT, AllMessageValues, ChatCompletionToolParam
@@ -172,12 +172,13 @@ class CometAPIChatCompletionStreamingHandler(BaseModelResponseIterator):
         try:
             # Handle error in chunk
             if "error" in chunk:
-                error_chunk: Final = chunk["error"]
+                error_chunk: Final[dict[str, object]] = chunk["error"]  # mutable-ok: exception body contract
                 error_message: Final = "CometAPI Error: {}".format(error_chunk.get("message", "Unknown error"))
                 raise CometAPIException(
                     message=error_message,
-                    status_code=error_chunk.get("code", 400),
+                    status_code=normalize_error_status_code(error_chunk.get("code"), 500),
                     headers={"Content-Type": "application/json"},
+                    body=error_chunk,
                 )
 
             # Process choices
