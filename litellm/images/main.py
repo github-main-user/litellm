@@ -1,8 +1,9 @@
 import asyncio
 import contextvars
 import importlib
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from functools import partial
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Final, Literal, Optional, cast, overload
 
 if TYPE_CHECKING:
@@ -17,6 +18,11 @@ from litellm import client
 from litellm.constants import DEFAULT_IMAGE_ENDPOINT_MODEL
 from litellm.constants import request_timeout as DEFAULT_REQUEST_TIMEOUT
 from litellm.exceptions import LiteLLMUnknownProvider
+from litellm.litellm_core_utils.credential_proxy import (
+    pop_request_proxy_url,
+    require_proxy_provider_support,
+    validate_credential_proxy_route,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.llm_request_utils import flatten_form_field_values
@@ -130,6 +136,41 @@ async def aimage_generation(*args, **kwargs) -> ImageResponse:
         )
 
 
+def _run_image_generation(
+    operation: Callable[..., ImageResponse | Coroutine[object, object, ImageResponse]],
+    proxy_url: str | None,
+    credential_name: object,
+    is_async: bool,
+) -> ImageResponse | Coroutine[object, object, ImageResponse]:
+    validate_credential_proxy_route(proxy_url, credential_name)
+
+    def run_without_proxy() -> ImageResponse | Coroutine[object, object, ImageResponse]:
+        validate_credential_proxy_route(proxy_url, credential_name)
+        return operation()
+
+    async def run_async() -> ImageResponse:
+        validate_credential_proxy_route(proxy_url, credential_name)
+        if proxy_url is None:
+            result: Final = await asyncio.to_thread(run_without_proxy)
+            return await result if isawaitable(result) else result
+        handler: Final = AsyncHTTPHandler(proxy_url=proxy_url)
+        try:
+            response: Final = operation(client=handler)
+            return await response if isawaitable(response) else response
+        finally:
+            await handler.close()
+
+    if is_async and (proxy_url is not None or credential_name):
+        return run_async()
+    if proxy_url is None:
+        return operation()
+    handler: Final = HTTPHandler(proxy_url=proxy_url)
+    try:
+        return operation(client=handler)
+    finally:
+        handler.close()
+
+
 # fmt: off
 
 # Overload for when aimg_generation=True (returns Coroutine)
@@ -204,8 +245,10 @@ def image_generation(
     Currently supports just Azure + OpenAI.
     """
     try:
-        args: Final = locals()
-        aimg_generation: Final = kwargs.get("aimg_generation", False)
+        proxy_kwargs: Final = cast(dict[str, object], kwargs)  # cast-ok: untyped keyword values stay opaque objects
+        proxy_url: Final = pop_request_proxy_url(proxy_kwargs)
+        credential_name: Final = proxy_kwargs.get("litellm_credential_name")
+        aimg_generation: Final = kwargs.get("aimg_generation", False) is True
         litellm_call_id: Final = kwargs.get("litellm_call_id", None)
         logger_fn: Final = kwargs.get("logger_fn", None)
         mock_response: Final[str | None] = kwargs.get("mock_response", None)
@@ -220,7 +263,7 @@ def image_generation(
         base_model: Final = kwargs.get("base_model", None)
         if extra_headers is not None:
             headers.update(extra_headers)
-        model_response: ImageResponse = litellm.utils.ImageResponse()
+        model_response: ImageResponse | Coroutine[object, object, ImageResponse] = litellm.utils.ImageResponse()
         dynamic_api_key: str | None = None
         if model is not None or custom_llm_provider is not None:
             model, custom_llm_provider, dynamic_api_key, api_base = get_llm_provider(
@@ -231,6 +274,10 @@ def image_generation(
         else:
             model = "dall-e-2"
             custom_llm_provider = "openai"  # default to dall-e-2 on openai
+        if proxy_url is not None:
+            require_proxy_provider_support(custom_llm_provider)
+            if custom_llm_provider not in ("azure", "openai", "openrouter", "custom_openai", "chatgpt"):
+                raise ValueError("Connection proxies are not supported for this image generation transport")
         model_response._hidden_params["model"] = model
         openai_params: Final = [
             "user",
@@ -356,22 +403,28 @@ def image_generation(
                 if k not in headers:
                     headers[k] = v
 
-            model_response = azure_chat_completions.image_generation(
-                model=model,
-                prompt=prompt,
-                timeout=timeout,
-                api_key=api_key,
-                api_base=api_base,
-                azure_ad_token=azure_ad_token,
-                azure_ad_token_provider=azure_ad_token_provider,
-                logging_obj=litellm_logging_obj,
-                optional_params=optional_params,
-                model_response=model_response,
-                api_version=api_version,
-                aimg_generation=aimg_generation,
-                client=client,
-                headers=headers,
-                litellm_params=litellm_params_dict,
+            model_response = _run_image_generation(
+                partial(
+                    azure_chat_completions.image_generation,
+                    model=model,
+                    prompt=prompt,
+                    timeout=timeout,
+                    api_key=api_key,
+                    api_base=api_base,
+                    azure_ad_token=azure_ad_token,
+                    azure_ad_token_provider=azure_ad_token_provider,
+                    logging_obj=litellm_logging_obj,
+                    optional_params=optional_params,
+                    model_response=model_response,
+                    api_version=api_version,
+                    aimg_generation=aimg_generation,
+                    client=client,
+                    headers=headers,
+                    litellm_params=litellm_params_dict,
+                ),
+                proxy_url,
+                credential_name,
+                aimg_generation,
             )
         #########################################################
         # Providers using llm_http_handler
@@ -396,17 +449,24 @@ def image_generation(
             _api_base: Final = api_base or litellm.api_base
             litellm_params_dict["api_base"] = _api_base
 
-            return llm_http_handler.image_generation_handler(
-                api_key=api_key,
-                model=model,
-                prompt=prompt,
-                image_generation_provider_config=image_generation_config,
-                image_generation_optional_request_params=optional_params,
-                custom_llm_provider=custom_llm_provider,
-                litellm_params=litellm_params_dict,
-                logging_obj=litellm_logging_obj,
-                timeout=timeout,
-                client=client,
+            return _run_image_generation(
+                partial(
+                    llm_http_handler.image_generation_handler,
+                    api_key=api_key,
+                    model=model,
+                    prompt=prompt,
+                    image_generation_provider_config=image_generation_config,
+                    image_generation_optional_request_params=optional_params,
+                    custom_llm_provider=custom_llm_provider,
+                    litellm_params=litellm_params_dict,
+                    logging_obj=litellm_logging_obj,
+                    timeout=timeout,
+                    client=client,
+                    _is_async=aimg_generation if proxy_url is not None else False,
+                ),
+                proxy_url,
+                credential_name,
+                aimg_generation,
             )
         elif custom_llm_provider == "black_forest_labs":
             # Route to BFL-specific handler (polling required)
@@ -478,19 +538,25 @@ def image_generation(
                 optional_params["extra_headers"] = extra_headers
             # Forward OpenAI organization if present (set by proxy pre-call utils)
             organization: Final[str | None] = kwargs.get("organization", None)
-            model_response = openai_chat_completions.image_generation(
-                model=model,
-                prompt=prompt,
-                timeout=timeout,
-                api_key=api_key or dynamic_api_key,
-                api_base=api_base,
-                logging_obj=litellm_logging_obj,
-                optional_params=optional_params,
-                model_response=model_response,
-                organization=organization,
-                aimg_generation=aimg_generation,
-                client=client,
-                headers=headers,
+            model_response = _run_image_generation(
+                partial(
+                    openai_chat_completions.image_generation,
+                    model=model,
+                    prompt=prompt,
+                    timeout=timeout,
+                    api_key=api_key or dynamic_api_key,
+                    api_base=api_base,
+                    logging_obj=litellm_logging_obj,
+                    optional_params=optional_params,
+                    model_response=model_response,
+                    organization=organization,
+                    aimg_generation=aimg_generation,
+                    client=client,
+                    headers=headers,
+                ),
+                proxy_url,
+                credential_name,
+                aimg_generation,
             )
         elif custom_llm_provider == "bedrock":
             if model is None:
@@ -556,11 +622,13 @@ def image_generation(
         return model_response
     except Exception as e:
         ## Map to OpenAI Exception
+        completion_kwargs: Final = locals()
+        completion_kwargs.pop("proxy_url", None)
         raise exception_type(
             model=model,
             custom_llm_provider=custom_llm_provider,
             original_exception=e,
-            completion_kwargs=locals(),
+            completion_kwargs=completion_kwargs,
             extra_kwargs=kwargs,
         )
 
