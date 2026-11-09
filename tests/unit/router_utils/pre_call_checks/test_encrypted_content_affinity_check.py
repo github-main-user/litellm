@@ -16,6 +16,8 @@ The mechanism works without any cache and supports two encoding strategies:
 """
 
 import time
+from copy import deepcopy
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1327,10 +1329,12 @@ def _make_router_mock_with_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_affinity_raises_service_unavailable_when_origin_cooled_for_non_429():
+@pytest.mark.parametrize("server_history", [False, True])
+async def test_affinity_raises_service_unavailable_when_origin_cooled_for_non_429(server_history: bool):
     """
     Originating deployment is in the router config, in cooldown for a non-429
-    cause (e.g. a 500), and no boundary peer is configured. The check must
+    cause (e.g. a 500), and no boundary peer is configured. With no healthy
+    alternate or with upstream-stored history, the check must
     surface this as a 503 (transient, but not rate-limit-specific) rather than
     dispatching to a non-peer deployment.
     """
@@ -1371,12 +1375,13 @@ async def test_affinity_raises_service_unavailable_when_origin_cooled_for_non_42
     ]
     request_kwargs = {
         "input": [{"id": encoded_id, "type": "reasoning"}],
+        "previous_response_id": "resp_history" if server_history else None,
     }
 
     with pytest.raises(ServiceUnavailableError) as excinfo:
         await check.async_filter_deployments(
             model="gpt-5.4",
-            healthy_deployments=healthy_only_b,
+            healthy_deployments=healthy_only_b if server_history else [],
             messages=None,
             request_kwargs=request_kwargs,
         )
@@ -1388,10 +1393,12 @@ async def test_affinity_raises_service_unavailable_when_origin_cooled_for_non_42
 
 
 @pytest.mark.asyncio
-async def test_affinity_raises_rate_limit_with_retry_after_when_origin_cooled_for_429():
+@pytest.mark.parametrize("server_history", [False, True])
+async def test_affinity_raises_rate_limit_with_retry_after_when_origin_cooled_for_429(server_history: bool):
     """
     Originating deployment is in cooldown specifically because of a 429.
-    The check must surface this as a 429 RateLimitError with a Retry-After
+    With no healthy alternate or with upstream-stored history, the check must
+    surface this as a 429 RateLimitError with a Retry-After
     header derived from the cooldown's remaining window, so OpenAI-compatible
     clients respect the backoff instead of giving up on a 503.
     """
@@ -1433,12 +1440,13 @@ async def test_affinity_raises_rate_limit_with_retry_after_when_origin_cooled_fo
     ]
     request_kwargs = {
         "input": [{"id": encoded_id, "type": "reasoning"}],
+        "previous_response_id": "resp_history" if server_history else None,
     }
 
     with pytest.raises(RateLimitError) as excinfo:
         await check.async_filter_deployments(
             model="gpt-5.4",
-            healthy_deployments=healthy_only_b,
+            healthy_deployments=healthy_only_b if server_history else [],
             messages=None,
             request_kwargs=request_kwargs,
         )
@@ -1451,7 +1459,8 @@ async def test_affinity_raises_rate_limit_with_retry_after_when_origin_cooled_fo
 
 
 @pytest.mark.asyncio
-async def test_affinity_raises_service_unavailable_when_origin_filtered_without_cooldown_entry():
+@pytest.mark.parametrize("server_history", [False, True])
+async def test_affinity_raises_service_unavailable_when_origin_filtered_without_cooldown_entry(server_history: bool):
     """
     Originating deployment is configured but absent from healthy_deployments
     with no active cooldown entry. Surface as 503 (we cannot prove the cause
@@ -1482,17 +1491,66 @@ async def test_affinity_raises_service_unavailable_when_origin_filtered_without_
     ]
     request_kwargs = {
         "input": [{"id": encoded_id, "type": "reasoning"}],
+        "previous_response_id": "resp_history" if server_history else None,
     }
 
     with pytest.raises(ServiceUnavailableError) as excinfo:
         await check.async_filter_deployments(
             model="gpt-5.4",
-            healthy_deployments=healthy_only_b,
+            healthy_deployments=healthy_only_b if server_history else [],
             messages=None,
             request_kwargs=request_kwargs,
         )
 
     assert excinfo.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_origin", [False, True])
+async def test_server_history_error_does_not_reveal_out_of_route_origin_cooldown(known_origin: bool) -> None:
+    from litellm.exceptions import ServiceUnavailableError
+
+    originating: Final = _make_originating_mock("https://private.example/v1", "private-key") if known_origin else None
+    router: Final = _make_router_mock_with_cooldown(
+        originating,
+        cooldown_entries=[
+            (
+                "private-origin",
+                {"status_code": "429", "timestamp": 0.0, "cooldown_time": 60.0},
+            )
+        ] if known_origin else [],
+        routed_group_model_ids=["public-alternate"],
+    )
+    check: Final = EncryptedContentAffinityCheck(router=router)
+    request_kwargs: Final = {
+        "previous_response_id": "resp_private_history",
+        "input": [
+            {
+                "type": "reasoning",
+                "encrypted_content": ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id(
+                    "ciphertext", "private-origin"
+                ),
+            },
+            {"role": "user", "content": "Continue"},
+        ],
+    }
+    original: Final = deepcopy(request_kwargs)
+
+    with pytest.raises(ServiceUnavailableError) as error:
+        await check.async_filter_deployments(
+            model="public-route",
+            healthy_deployments=[{"model_info": {"id": "public-alternate"}}],
+            messages=None,
+            request_kwargs=request_kwargs,
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.message == (
+        "litellm.ServiceUnavailableError: "
+        "The upstream history referenced by previous_response_id is unavailable for this route."
+    )
+    assert request_kwargs == original
+    router.cooldown_cache.async_get_active_cooldowns.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1985,13 +2043,13 @@ async def test_affinity_strips_encrypted_reasoning_when_routed_to_another_model_
 
 
 @pytest.mark.asyncio
-async def test_affinity_fails_fast_within_the_origins_own_group():
+async def test_affinity_fails_fast_within_the_origins_own_group_with_server_history():
     """
     Negative class for the tier-change discriminator: the routed group IS the
     origin's group (a same-group cooldown, not a tier change), so even with a
     healthy non-origin sibling that cannot decrypt the content, the request
-    still fails fast and the encrypted reasoning is left intact rather than
-    stripped. Preserves the LIT-3051 cooldown contract.
+    still fails fast when previous_response_id requires upstream-stored history,
+    and the encrypted reasoning is left intact rather than stripped.
     """
     from litellm.exceptions import ServiceUnavailableError
     from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import (
@@ -2017,6 +2075,7 @@ async def test_affinity_fails_fast_within_the_origins_own_group():
         }
     ]
     request_kwargs = _cross_group_request_kwargs()
+    request_kwargs["previous_response_id"] = "resp_history"
 
     with pytest.raises(ServiceUnavailableError):
         await check.async_filter_deployments(
@@ -2030,15 +2089,15 @@ async def test_affinity_fails_fast_within_the_origins_own_group():
 
 
 @pytest.mark.asyncio
-async def test_affinity_does_not_strip_when_group_is_spelled_differently_but_same_by_id():
+async def test_affinity_does_not_strip_server_history_when_group_is_spelled_differently_but_same_by_id():
     """
     The discriminator must key on deployment-id membership, not on the model-group
     name string. Here the origin's configured group is spelled ``openai/gpt-5.4-mini``
     while the routed group is the canonical ``gpt-5.4-mini``: same group, different
     spelling. A name compare (``originating.model_name != model``) would read this as
     a tier change and strip the reasoning it did not have to. Because the origin's id
-    is a member of the routed group, this is a same-group cooldown instead: the request
-    fails fast and the encrypted reasoning is left intact.
+    is a member of the routed group and previous_response_id requires upstream-stored
+    history, the request fails fast and the encrypted reasoning is left intact.
     """
     from litellm.exceptions import ServiceUnavailableError
     from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import (
@@ -2064,6 +2123,7 @@ async def test_affinity_does_not_strip_when_group_is_spelled_differently_but_sam
     ]
     request_kwargs = {
         "litellm_metadata": {},
+        "previous_response_id": "resp_history",
         "input": [
             {"role": "user", "content": "why is the sky blue?"},
             {
@@ -2093,8 +2153,8 @@ async def test_affinity_honors_router_candidate_ids_for_team_and_pattern_routes(
     same-group cooldown reached only through one of those would be misread as a tier change
     and stripped. The check asks the router for the candidate ids it resolves for the route
     (`get_candidate_model_ids_for_route`), which covers those paths, rather than the bare
-    index. Here that set marks the origin as a candidate, so the request fails fast with its
-    reasoning intact, and the routed group and team are passed through to the router.
+    index. Here previous_response_id requires upstream-stored history, so the request
+    fails fast with its reasoning intact, and the routed group and team reach the router.
     """
     from litellm.exceptions import ServiceUnavailableError
     from litellm.router_utils.pre_call_checks.encrypted_content_affinity_check import (
@@ -2120,6 +2180,7 @@ async def test_affinity_honors_router_candidate_ids_for_team_and_pattern_routes(
     ]
     request_kwargs = {
         "litellm_metadata": {"user_api_key_team_id": "teamA"},
+        "previous_response_id": "resp_history",
         "input": [
             {"role": "user", "content": "why is the sky blue?"},
             {
@@ -2141,3 +2202,95 @@ async def test_affinity_honors_router_candidate_ids_for_team_and_pattern_routes(
 
     assert request_kwargs["input"][1].get("encrypted_content")
     mock_router.get_candidate_model_ids_for_route.assert_called_once_with(model="team-public-model", team_id="teamA")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin_provider", "alternate_provider"),
+    [("openai", "openai"), ("chatgpt", "openai"), ("openai", "anthropic"), ("anthropic", "openai")],
+)
+@pytest.mark.parametrize("surface", ["responses", "messages", "messages_kwarg"])
+@pytest.mark.parametrize("server_history", [False, True])
+@pytest.mark.parametrize("exclusion_key", [None, "_excluded_deployment_ids", "_retry_skipped_deployment_ids"])
+async def test_same_group_failover_preserves_readable_history_across_accounts_and_providers(
+    origin_provider: str, alternate_provider: str, surface: str, server_history: bool, exclusion_key: str | None
+) -> None:
+    from litellm.exceptions import ServiceUnavailableError
+
+    deployments: Final = [
+        {
+            "model_name": "compatible-models",
+            "litellm_params": {
+                "model": f"{provider}/test-model",
+                "api_key": f"key-{account}",
+                "api_base": f"https://{account}.example/v1",
+            },
+            "model_info": {"id": account},
+        }
+        for provider, account in ((origin_provider, "origin"), (alternate_provider, "alternate"))
+    ]
+    router: Final = litellm.Router(model_list=deployments)
+    check: Final = EncryptedContentAffinityCheck(router=router)
+    wrapped: Final = ResponsesAPIRequestUtils._wrap_encrypted_content_with_model_id("ciphertext", "origin")
+    readable: Final = {"role": "user", "content": "Continue from the tool result"}
+    request_input: Final = [
+        {"type": "reasoning", "encrypted_content": wrapped},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+        readable,
+    ]
+    messages: Final = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Private", "signature": f"litellm_encrypted_reasoning:{wrapped}"},
+                {"type": "redacted_thinking", "data": f"litellm_encrypted_reasoning:{wrapped}"},
+                {"type": "text", "text": "The answer is 42"},
+            ],
+        },
+        readable,
+    ]
+    request_kwargs: Final = {
+        "_encrypted_content_affinity_pinned": True,
+        "previous_response_id": "resp_history" if server_history else None,
+        **({"input": request_input} if surface == "responses" else {}),
+        **({"messages": messages} if surface == "messages_kwarg" else {}),
+        **({exclusion_key: ["origin"]} if exclusion_key else {}),
+    }
+    original_input: Final = deepcopy(request_input)
+    original_messages: Final = deepcopy(messages)
+    healthy: Final = deployments if exclusion_key else [deployments[1]]
+    try:
+        if server_history:
+            with pytest.raises(ServiceUnavailableError):
+                await check.async_filter_deployments(
+                    model="compatible-models",
+                    healthy_deployments=healthy,
+                    messages=messages if surface == "messages" else None,
+                    request_kwargs=request_kwargs,
+                )
+            assert request_input == original_input
+            assert messages == original_messages
+            assert request_kwargs["previous_response_id"] == "resp_history"
+            return
+
+        result: Final = await check.async_filter_deployments(
+            model="compatible-models",
+            healthy_deployments=healthy,
+            messages=messages if surface == "messages" else None,
+            request_kwargs=request_kwargs,
+        )
+
+        assert result == [deployments[1]]
+        if exclusion_key is None:
+            assert result is healthy
+        assert "_encrypted_content_affinity_pinned" not in request_kwargs
+        if surface == "responses":
+            assert request_input == original_input[1:]
+        else:
+            assert messages == [
+                {"role": "assistant", "content": [{"type": "text", "text": "The answer is 42"}]},
+                readable,
+            ]
+    finally:
+        router.discard()

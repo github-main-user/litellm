@@ -78,7 +78,14 @@ jobs:
             tests/unit/litellm_core_utils/test_credential_proxy.py \
             tests/unit/router_utils/pre_call_checks/test_prompt_caching_deployment_check.py::test_responses_auto_cached_prefix_reuses_completion_affinity \
             tests/unit/router_utils/pre_call_checks/test_prompt_caching_deployment_check.py::test_responses_success_normalizes_input_and_preserves_prefix_parameters \
-            tests/unit/router_utils/pre_call_checks/test_session_id_affinity.py
+             tests/unit/router_utils/pre_call_checks/test_session_id_affinity.py
+          uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/unit/router_utils/pre_call_checks/test_encrypted_content_affinity_check.py \
+            tests/unit/router_utils/pre_call_checks/test_deployment_affinity_check.py \
+            tests/test_litellm/proxy/credential_endpoints/test_chatgpt_mixed_routing.py \
+            tests/test_litellm/litellm_core_utils/prompt_templates/test_litellm_core_utils_prompt_templates_common_utils.py \
+            tests/test_litellm/llms/anthropic/test_subscription_rate_limits.py \
+            tests/test_litellm/test_router_weighted_failover.py
       - name: Validate deployment script
         run: |
           bash -n deploy/void/ci-deploy.sh

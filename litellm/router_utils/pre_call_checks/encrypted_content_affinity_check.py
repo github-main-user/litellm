@@ -37,7 +37,7 @@ Safe to enable globally:
 """
 
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Optional, Protocol, cast
 
 import httpx
@@ -186,7 +186,7 @@ class EncryptedContentAffinityCheck(CustomLogger):
         )
 
     @staticmethod
-    def _find_deployment_by_model_id(healthy_deployments: list[dict], model_id: str) -> dict | None:
+    def _find_deployment_by_model_id(healthy_deployments: Sequence[dict], model_id: str) -> dict | None:
         for deployment in healthy_deployments:
             model_info = deployment.get("model_info")
             if not isinstance(model_info, dict):
@@ -257,7 +257,7 @@ class EncryptedContentAffinityCheck(CustomLogger):
 
     def _find_deployments_on_same_encryption_boundary(
         self,
-        healthy_deployments: list[dict],
+        healthy_deployments: Sequence[dict],
         model_id: str,
     ) -> tuple[list[dict], Deployment | None]:
         """
@@ -268,18 +268,18 @@ class EncryptedContentAffinityCheck(CustomLogger):
         so the caller can reuse the looked-up ``originating`` rather than
         re-querying the router.
         """
-        if self.router is None:
-            return [], None
-        originating: Final = self.router.get_deployment(model_id=model_id)
-        if originating is None:
-            return [], None
-        boundary: Final = self._encryption_boundary_key(originating.litellm_params.model_dump(exclude_none=True))
-        if boundary is None:
-            return [], originating
-        matches: Final = [
-            d for d in healthy_deployments if self._encryption_boundary_key(d.get("litellm_params", {})) == boundary
-        ]
-        return matches, originating
+        originating: Final = self.router.get_deployment(model_id=model_id) if self.router is not None else None
+        boundary: Final = (
+            self._encryption_boundary_key(originating.litellm_params.model_dump(exclude_none=True))
+            if originating is not None
+            else None
+        )
+        matches: Final = tuple(
+            d
+            for d in healthy_deployments
+            if boundary is not None and self._encryption_boundary_key(d.get("litellm_params")) == boundary
+        )
+        return list(matches), originating
 
     # ------------------------------------------------------------------
     # Request routing  (pre-call filter)
@@ -297,12 +297,9 @@ class EncryptedContentAffinityCheck(CustomLogger):
         If the request ``input`` contains litellm-encoded item IDs, or its Anthropic
         ``messages`` replay a bridge-tagged thinking block, decode the embedded
         ``model_id`` and pin the request to that deployment. Raises
-        ``RateLimitError`` / ``ServiceUnavailableError`` when the originating
-        deployment is a member of the routed model group but currently unavailable
-        and no encryption-boundary peer exists, rather than dispatching a doomed
-        request to a non-peer deployment. When the origin is not a member of the
-        routed group (an auto-router tier change, a model switch with no peer, a
-        removed deployment, or an unknown/forged marker), the encrypted reasoning is
+        ``RateLimitError`` / ``ServiceUnavailableError`` when no healthy alternate
+        exists or a ``previous_response_id`` requires upstream-stored history.
+        Otherwise, when no encryption-boundary peer exists, encrypted reasoning is
         stripped and the request dispatches with its readable history instead. The
         429/503 split mirrors the originating cooldown's status:
         a 429-induced cooldown surfaces as 429 (with ``Retry-After`` set to the
@@ -310,6 +307,7 @@ class EncryptedContentAffinityCheck(CustomLogger):
         retry after the deployment is eligible again.
         """
         request_kwargs = request_kwargs or {}
+        request_kwargs.pop("_encrypted_content_affinity_pinned", None)
         typed_healthy_deployments: Final = cast(list[dict], healthy_deployments)
         if not self._is_enabled_for_model_group(model):
             return typed_healthy_deployments
@@ -332,13 +330,32 @@ class EncryptedContentAffinityCheck(CustomLogger):
         if not model_id:
             return typed_healthy_deployments
 
+        excluded_ids: Final = frozenset(
+            deployment_id
+            for key in ("_excluded_deployment_ids", "_retry_skipped_deployment_ids")
+            for values in (request_kwargs.get(key),)
+            if isinstance(values, (list, tuple, set, frozenset))
+            for deployment_id in values
+            if isinstance(deployment_id, str)
+        )
+        eligible_deployments: Final = (
+            tuple(
+                d
+                for d in typed_healthy_deployments
+                if not isinstance(model_info := d.get("model_info"), Mapping)
+                or str(model_info.get("id")) not in excluded_ids
+            )
+            if excluded_ids
+            else typed_healthy_deployments
+        )
+
         verbose_router_logger.debug(
             "EncryptedContentAffinityCheck: decoded model_id=%s from the request's encrypted content markers",
             model_id,
         )
 
         deployment: Final = self._find_deployment_by_model_id(
-            healthy_deployments=typed_healthy_deployments,
+            healthy_deployments=eligible_deployments,
             model_id=model_id,
         )
         if deployment is not None:
@@ -351,7 +368,7 @@ class EncryptedContentAffinityCheck(CustomLogger):
 
         # Follow-up switched model_name (LIT-2531): pin by Azure resource instead.
         boundary_matches, originating = self._find_deployments_on_same_encryption_boundary(
-            healthy_deployments=typed_healthy_deployments,
+            healthy_deployments=eligible_deployments,
             model_id=model_id,
         )
         if boundary_matches:
@@ -364,32 +381,29 @@ class EncryptedContentAffinityCheck(CustomLogger):
             request_kwargs["_encrypted_content_affinity_pinned"] = True
             return boundary_matches
 
-        # The origin cannot serve this turn's routed group and no peer shares the boundary, so its
-        # encrypted reasoning can never decrypt here. Strip it, keep the readable history, and dispatch
-        # to the routed group instead of failing. Membership is tested by deployment id against the set
-        # the router actually resolved for this route, not by model-group name, so an alias, a
-        # provider-qualified spelling, a team-public name, or a pattern route of the same group is not
-        # mistaken for a tier change. An unknown origin (a removed deployment, or a forged marker) is
-        # treated the same as a cross-group one, which also denies an authenticated caller a
-        # deployment-id existence oracle: a real cross-group id and a nonexistent id both strip and
-        # dispatch rather than returning distinguishable responses. Only a genuine same-group member
-        # that is currently unavailable falls through to the fail-fast, preserving the cooldown contract.
         routed_group_model_ids: Final = (
             self._routed_group_candidate_model_ids(request_kwargs, model) if originating is not None else frozenset()
         )
-        if str(model_id) not in routed_group_model_ids:
+        if not request_kwargs.get("previous_response_id") and (
+            eligible_deployments or str(model_id) not in routed_group_model_ids
+        ):
             verbose_router_logger.debug(
-                "EncryptedContentAffinityCheck: model_id=%s is not a candidate for the routed group %s; "
+                "EncryptedContentAffinityCheck: model_id=%s has no healthy encryption-boundary peer in group %s; "
                 "forwarding without its encrypted reasoning",
                 model_id,
                 model,
             )
             ResponsesAPIRequestUtils.strip_encrypted_reasoning_from_input(request_input)
             strip_encrypted_reasoning_from_messages(anthropic_messages)
-            return typed_healthy_deployments
+            return list(eligible_deployments) if excluded_ids else typed_healthy_deployments
 
-        # The origin is a member of the routed group but currently unavailable (cooled down); fail fast
-        # rather than dispatching to a non-peer, which would guarantee an upstream 400.
+        if str(model_id) not in routed_group_model_ids:
+            raise ServiceUnavailableError(
+                message="The upstream history referenced by previous_response_id is unavailable for this route.",
+                llm_provider="",
+                model=model,
+            )
+
         raise await self._unavailable_origin_error(
             model=model,
             model_id=model_id,
