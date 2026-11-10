@@ -1,6 +1,7 @@
 name: Void LiteLLM CI/CD
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main]
   push:
@@ -64,6 +65,8 @@ jobs:
           uv run --no-sync python scripts/type_check_gate.py --base "$BASE_REF"
       - name: Run offline fork regressions
         run: |
+          uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
+            tests/test_litellm/llms/cometapi/chat/test_cometapi_chat_transformation.py -k TestCometAPI
           uv run --no-sync pytest --allow-hosts=127.0.0.1,::1 --allow-unix-socket --timeout=60 -q \
             tests/test_litellm/llms/anthropic/test_anthropic_oauth_client.py \
             tests/test_litellm/llms/chatgpt/test_chatgpt_oauth_client.py \

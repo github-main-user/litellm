@@ -6,13 +6,21 @@ Documentation: [CometAPI Documentation Link]
 """
 
 from collections.abc import AsyncIterator, Iterator
+from types import MappingProxyType
 from typing import Any, Final, get_args
 
 import httpx
+from pydantic import TypeAdapter
 
 from litellm.exceptions import BadRequestError, normalize_error_status_code
+from litellm.llms.anthropic.chat.transformation import (
+    REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT,
+    AnthropicConfig,
+)
+from litellm.llms.anthropic.common_utils import AnthropicModelInfo
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.types.llms.anthropic import AnthropicOutputConfig, AnthropicThinkingParam
 from litellm.types.llms.openai import REASONING_EFFORT, AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import ModelResponse, ModelResponseStream
 
@@ -29,15 +37,24 @@ class CometAPIConfig(OpenAIGPTConfig):
     """
 
     def get_supported_openai_params(self, model: str) -> list[str]:  # mutable-ok: inherited contract
-        return super().get_supported_openai_params(model) + ["reasoning_effort"]  # mutable-ok: inherited contract
+        supports_thinking: Final = model.removeprefix("cometapi/").startswith("claude-") and (
+            AnthropicModelInfo._supports_model_capability(  # pyright: ignore[reportPrivateUsage]  # shared capability
+                model, "supports_reasoning", "cometapi"
+            )
+        )
+        return [  # mutable-ok: inherited contract
+            *super().get_supported_openai_params(model),
+            "reasoning_effort",
+            *(("thinking",) if supports_thinking else ()),
+        ]
 
     def map_openai_params(
         self,
         non_default_params: dict[str, object],
-        optional_params: dict,
+        optional_params: dict[str, object],
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         """
         Map OpenAI format parameters to CometAPI format
         """
@@ -48,7 +65,51 @@ class CometAPIConfig(OpenAIGPTConfig):
                 model=model,
                 llm_provider="cometapi",
             )
-        mapped_openai_params: Final = super().map_openai_params(non_default_params, optional_params, model, drop_params)
+        mapped_openai_params: Final = TypeAdapter(dict[str, object]).validate_python(
+            super().map_openai_params(non_default_params, optional_params, model, drop_params)
+        )
+
+        if "thinking" in self.get_supported_openai_params(model):
+            thinking: Final = non_default_params.get("thinking")
+            thinking_params: Final = (
+                TypeAdapter(dict[str, object]).validate_python(thinking) if isinstance(thinking, dict) else None
+            )
+            if thinking_params is not None and thinking_params.get("type") == "disabled":
+                disabled_params: Final = {  # mutable-ok: shared Anthropic normalization takes a mutable out-param
+                    key: value for key, value in mapped_openai_params.items() if key != "reasoning_effort"
+                }
+                AnthropicModelInfo.maybe_drop_disabled_thinking(model, disabled_params, "cometapi")
+                return disabled_params
+            if isinstance(reasoning_effort, str) and (
+                AnthropicModelInfo._is_adaptive_thinking_model(  # pyright: ignore[reportPrivateUsage]  # capability API
+                    model, "cometapi"
+                )
+            ):
+                wire: Final = AnthropicConfig._map_reasoning_effort(  # pyright: ignore[reportPrivateUsage]  # API reuse
+                    reasoning_effort, model, "cometapi", llm_provider="cometapi"
+                )
+                adaptive_params: Final = MappingProxyType(
+                    {key: value for key, value in mapped_openai_params.items() if key != "reasoning_effort"}
+                )
+                output_config: Final = (
+                    TypeAdapter(AnthropicOutputConfig).validate_python(
+                        MappingProxyType({"effort": REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT[reasoning_effort]})
+                    )
+                    if wire is not None
+                    else None
+                )
+                reasoning_params: Final = {  # mutable-ok: shared Anthropic normalization takes a mutable out-param
+                    **adaptive_params,
+                    "thinking": wire or AnthropicThinkingParam(type="disabled"),
+                    **(
+                        MappingProxyType({"output_config": output_config})
+                        if output_config is not None
+                        else MappingProxyType({})
+                    ),
+                }
+                AnthropicModelInfo.maybe_drop_disabled_thinking(model, reasoning_params, "cometapi")
+                return reasoning_params
+            AnthropicModelInfo.translate_legacy_thinking_for_adaptive_model(model, mapped_openai_params, "cometapi")
 
         # CometAPI-specific parameters (if any)
         extra_body: Final[dict[str, Any]] = {}
