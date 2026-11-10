@@ -12,7 +12,7 @@ from typing import Final
 
 import pytest
 
-from litellm.exceptions import BadRequestError, MidStreamFallbackError
+from litellm.exceptions import BadRequestError, MidStreamFallbackError, UnsupportedParamsError
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.utils import get_optional_params
@@ -138,10 +138,96 @@ class TestCometAPIChatCompletionStreamingHandler:
 
 class TestCometAPIConfig:
     @pytest.mark.parametrize(
-        "model",
-        ("claude-haiku-4-5-20251001", "claude-opus-5-5", "claude-sonnet-5-5"),
+        "model, params, expected",
+        (
+            (
+                "claude-sonnet-5",
+                {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+            ),
+            (
+                "claude-sonnet-5",
+                {"reasoning_effort": "low"},
+                {"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "low"}},
+            ),
+            (
+                "claude-haiku-4-5-20251001",
+                {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+                {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            ),
+            ("claude-sonnet-5", {"thinking": {"type": "disabled"}}, {"thinking": {"type": "disabled"}}),
+            ("claude-haiku-4-5-20251001", {"thinking": {"type": "disabled"}}, {"thinking": {"type": "disabled"}}),
+            (
+                "claude-sonnet-5",
+                {"thinking": {"type": "disabled"}, "reasoning_effort": "low"},
+                {"thinking": {"type": "disabled"}},
+            ),
+            ("claude-sonnet-5", {"reasoning_effort": "none"}, {"thinking": {"type": "disabled"}}),
+            (
+                "claude-sonnet-5",
+                {"thinking": {"type": "enabled", "budget_tokens": 1024}, "reasoning_effort": "none"},
+                {"thinking": {"type": "disabled"}},
+            ),
+            ("claude-sonnet-5", {"thinking": {"type": "adaptive"}}, {"thinking": {"type": "adaptive"}}),
+            ("claude-sonnet-5", {}, {}),
+            (
+                "claude-sonnet-5",
+                {"thinking": {"type": "disabled", "budget_tokens": 1024}, "reasoning_effort": "low"},
+                {"thinking": {"type": "disabled", "budget_tokens": 1024}},
+            ),
+            (
+                "claude-sonnet-5",
+                {"thinking": {"type": "disabled", "display": "summarized"}, "reasoning_effort": "low"},
+                {"thinking": {"type": "disabled", "display": "summarized"}},
+            ),
+            ("claude-fable-5", {"thinking": {"type": "disabled"}}, {}),
+            (
+                "claude-fable-5",
+                {"thinking": {"type": "disabled", "budget_tokens": 1024}, "reasoning_effort": "low"},
+                {},
+            ),
+            ("claude-fable-5", {"reasoning_effort": "none"}, {}),
+            (
+                "claude-fable-5",
+                {"thinking": {"type": "enabled", "budget_tokens": 1024}, "reasoning_effort": "none"},
+                {},
+            ),
+        ),
     )
-    @pytest.mark.parametrize("effort", ("low", "medium", "high"))
+    @pytest.mark.parametrize("drop_params", (False, True))
+    def test_claude_thinking_reaches_cometapi_request(
+        self, model: str, params: dict[str, object], expected: dict[str, object], drop_params: bool
+    ) -> None:
+        optional_params: Final = get_optional_params(
+            model=model, custom_llm_provider="cometapi", max_tokens=4096, drop_params=drop_params, **params
+        )
+        request: Final = CometAPIConfig().transform_request(
+            model=model,
+            messages=[{"role": "user", "content": "Hello"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+        assert request == {
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 4096,
+            "stream": False,
+            **expected,
+        }
+
+    @pytest.mark.parametrize("model", ("gpt-4.1", "deepseek-chat", "claude-3-haiku-20240307"))
+    def test_thinking_remains_unsupported_for_other_models(self, model: str) -> None:
+        with pytest.raises(UnsupportedParamsError, match="thinking"):
+            get_optional_params(
+                model=model, custom_llm_provider="cometapi", thinking={"type": "enabled", "budget_tokens": 1024}
+            )
+
+    @pytest.mark.parametrize(
+        "model",
+        ("claude-haiku-4-5-20251001", "gpt-4.1", "deepseek-chat"),
+    )
+    @pytest.mark.parametrize("effort", ("low", "medium", "high", "none"))
     @pytest.mark.parametrize("drop_params", (False, True))
     def test_reasoning_effort_reaches_request_unchanged(
         self, model: str, effort: str, drop_params: bool
@@ -170,12 +256,15 @@ class TestCometAPIConfig:
         }
 
     @pytest.mark.parametrize("effort", ("invalid-effort", 123, {"effort": "low"}))
-    def test_invalid_reasoning_effort_is_rejected(self, effort: object) -> None:
+    @pytest.mark.parametrize("model", ("claude-sonnet-5", "claude-haiku-4-5-20251001", "gpt-4.1"))
+    @pytest.mark.parametrize("drop_params", (False, True))
+    def test_invalid_reasoning_effort_is_rejected(self, effort: object, model: str, drop_params: bool) -> None:
         with pytest.raises(BadRequestError, match="Invalid reasoning_effort"):
             get_optional_params(
-                model="claude-sonnet-5-5",
+                model=model,
                 custom_llm_provider="cometapi",
                 reasoning_effort=effort,
+                drop_params=drop_params,
             )
 
     def test_transform_request_basic(self):
