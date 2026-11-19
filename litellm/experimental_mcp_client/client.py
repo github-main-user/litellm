@@ -387,7 +387,7 @@ class MCPClient:
         # HTTP transport (default)
         headers = self._get_auth_headers()
         httpx_client_factory = self._create_httpx_client_factory()
-        verbose_logger.debug("litellm headers for streamable_http_client: %s", headers)
+        verbose_logger.debug("Creating streamable HTTP MCP transport")
         http_client = httpx_client_factory(
             headers=headers,
             timeout=httpx2.Timeout(self.timeout),

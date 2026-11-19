@@ -24,6 +24,9 @@ def resolve_identity(
     base_model: str, provider_connection: str | None, provider: str | None, known_models: Sequence[str] = ()
 ) -> ModelResolution:
     lab, _, model = base_model.partition("/")
+    if provider == 'kling' or lab == 'kling':
+        matches: Final = lab == provider and provider_connection is not None
+        return ModelResolution(provider_connection=provider_connection, status='resolved' if matches else 'incompatible', provider_model=base_model if matches else None)
     comet: Final = provider == "cometapi"
     native: Final = provider in ("anthropic", "openai", "chatgpt", "deepseek")
     expected_lab: Final = "openai" if provider == "chatgpt" else provider

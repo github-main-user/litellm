@@ -4154,6 +4154,7 @@ class LlmProviders(str, Enum):
     HEROKU = "heroku"
     AIML = "aiml"
     COMETAPI = "cometapi"
+    KLING = "kling"
     OCI = "oci"
     AUTO_ROUTER = "auto_router"
     VERCEL_AI_GATEWAY = "vercel_ai_gateway"

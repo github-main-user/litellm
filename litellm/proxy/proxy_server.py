@@ -475,6 +475,7 @@ from litellm.proxy.config_resolvers.settings_rules import (
 from litellm.proxy.container_endpoints.endpoints import router as container_router
 from litellm.proxy.credential_endpoints.anthropic_oauth import register_anthropic_oauth_credential_hook
 from litellm.proxy.credential_endpoints.anthropic_oauth import router as anthropic_oauth_credential_router
+from litellm.proxy.credential_endpoints.kling_oauth import router as kling_oauth_credential_router
 from litellm.proxy.credential_endpoints.chatgpt_oauth import register_chatgpt_oauth_credential_hook
 from litellm.proxy.credential_endpoints.chatgpt_oauth import router as chatgpt_oauth_credential_router
 from litellm.proxy.credential_endpoints.endpoints import router as credential_router
@@ -10109,6 +10110,8 @@ class ProxyStartupEvent:
         ### PROXY WORKER HEARTBEAT ###
         worker_heartbeat: Final = ProxyWorkerHeartbeat(prisma_client=prisma_client)
         await worker_heartbeat.beat()
+        from litellm.proxy.video_endpoints.kling_jobs import reconcile_jobs
+        scheduler.add_job(reconcile_jobs, 'interval', seconds=10, id='video_generation_reconcile', replace_existing=True, max_instances=1, coalesce=True)
         scheduler.add_job(
             worker_heartbeat.beat,
             "interval",
@@ -19310,6 +19313,7 @@ app.include_router(credential_router)
 app.include_router(credential_subscription_usage_router)
 app.include_router(openai_passthrough_router)
 app.include_router(anthropic_oauth_credential_router)
+app.include_router(kling_oauth_credential_router)
 app.include_router(chatgpt_oauth_credential_router)
 app.include_router(batches_router)
 app.include_router(openai_files_router)

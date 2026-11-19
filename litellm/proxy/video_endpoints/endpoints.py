@@ -81,6 +81,9 @@ async def video_generation(
 
     # Read request body
     data: Final = await _read_request_body(request=request)
+    from litellm.proxy.video_endpoints import kling_jobs
+    if llm_router and kling_jobs.is_configured(llm_router, data.get('model')):
+        return await kling_jobs.submit(data, user_api_key_dict, llm_router)
     if input_reference is not None:
         input_reference_file: Final = await batch_to_bytesio([input_reference])
         if input_reference_file:
@@ -245,6 +248,9 @@ async def video_status(
         version,
     )
 
+    if video_id.startswith('video_kg_'):
+        from litellm.proxy.video_endpoints.kling_jobs import status
+        return await status(video_id, user_api_key_dict)
     # Create data with video_id
     data: Final[dict[str, object]] = {"video_id": video_id}
 
@@ -344,6 +350,9 @@ async def video_content(
         version,
     )
 
+    if video_id.startswith('video_kg_'):
+        from litellm.proxy.video_endpoints.kling_jobs import content
+        return await content(video_id, user_api_key_dict)
     # Create data with video_id
     data: Final[dict[str, object]] = {"video_id": video_id}
 

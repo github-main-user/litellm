@@ -50,6 +50,29 @@ model LiteLLM_CredentialsTable {
   updated_at    DateTime               @default(now()) @updatedAt @map("updated_at")
   updated_by String
   canonical_connections LiteLLM_CanonicalModelConnection[]
+  video_jobs LiteLLM_VideoGenerationJob[]
+}
+
+model LiteLLM_VideoGenerationJob {
+  id String @id
+  credential String?
+  archived_credential String?
+  connection LiteLLM_CredentialsTable? @relation(fields: [credential], references: [credential_name], onUpdate: Cascade, onDelete: NoAction)
+  provider_id String?
+  api_key String
+  user_id String?
+  team_id String?
+  model_name String
+  model_id String
+  provider_model String
+  requested_seconds Int
+  usd_per_second Decimal @client.Decimal(24,12)
+  status String @default("submitting")
+  output_url String?
+  created_at DateTime @default(now()) @client.Timestamptz(6)
+  next_poll DateTime @default(now()) @client.Timestamptz(6)
+  @@unique([credential, provider_id])
+  @@index([credential], map: "video_job_connection_idx")
 }
 
 model LiteLLM_CanonicalModel {
@@ -57,10 +80,11 @@ model LiteLLM_CanonicalModel {
   name String @unique
   group String?
   base_model String
-  input_price_per_million_tokens Decimal @client.Decimal(24, 12)
-  output_price_per_million_tokens Decimal @client.Decimal(24, 12)
-  cache_read_price_per_million_tokens Decimal @client.Decimal(24, 12)
-  cache_write_price_per_million_tokens Decimal @client.Decimal(24, 12)
+  video_price_per_second Decimal? @client.Decimal(24, 12)
+  input_price_per_million_tokens Decimal? @client.Decimal(24, 12)
+  output_price_per_million_tokens Decimal? @client.Decimal(24, 12)
+  cache_read_price_per_million_tokens Decimal? @client.Decimal(24, 12)
+  cache_write_price_per_million_tokens Decimal? @client.Decimal(24, 12)
   created_at DateTime @default(now())
   created_by String
   updated_at DateTime @default(now()) @updatedAt

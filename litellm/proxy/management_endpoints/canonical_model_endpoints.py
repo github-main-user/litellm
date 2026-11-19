@@ -35,14 +35,22 @@ class CanonicalWrite(BaseModel):
     base_model: str = Field(
         min_length=3, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
     )
-    input_price_per_million_tokens: Decimal = Field(gt=0, max_digits=24, decimal_places=12)
-    output_price_per_million_tokens: Decimal = Field(gt=0, max_digits=24, decimal_places=12)
+    video_price_per_second: Decimal | None = Field(default=None, gt=0, max_digits=24, decimal_places=12)
+    input_price_per_million_tokens: Decimal | None = Field(default=None, gt=0, max_digits=24, decimal_places=12)
+    output_price_per_million_tokens: Decimal | None = Field(default=None, gt=0, max_digits=24, decimal_places=12)
     cache_read_price_per_million_tokens: Decimal | None = Field(default=None, gt=0, max_digits=24, decimal_places=12)
     cache_write_price_per_million_tokens: Decimal | None = Field(default=None, gt=0, max_digits=24, decimal_places=12)
     connections: list[ConnectionWrite]
 
     @model_validator(mode="after")
     def unique_connections(self) -> "CanonicalWrite":
+        if self.video_price_per_second is None:
+            if self.input_price_per_million_tokens is None or self.output_price_per_million_tokens is None:
+                raise ValueError('Input and output prices are required for token pricing')
+        elif any(v is not None for v in (self.input_price_per_million_tokens, self.output_price_per_million_tokens, self.cache_read_price_per_million_tokens, self.cache_write_price_per_million_tokens)):
+            raise ValueError('Token prices and video prices are mutually exclusive')
+        if any((c.provider_model.startswith('kling/')) != (self.video_price_per_second is not None) for c in self.connections):
+            raise ValueError('Pricing unit does not match the connection')
         ids: Final = [connection.id for connection in self.connections if connection.id is not None]
         bindings: Final = [
             (connection.provider_connection, connection.provider_model) for connection in self.connections
@@ -56,7 +64,7 @@ class ConnectionRead(BaseModel):
     id: str
     provider_connection: str | None
     provider_model: str
-    mode: Literal["chat", "responses"]
+    mode: Literal["chat", "responses", "video_generation"]
 
 
 class CanonicalRead(BaseModel):
@@ -64,10 +72,11 @@ class CanonicalRead(BaseModel):
     name: str
     group: str | None
     base_model: str
-    input_price_per_million_tokens: Decimal
-    output_price_per_million_tokens: Decimal
-    cache_read_price_per_million_tokens: Decimal
-    cache_write_price_per_million_tokens: Decimal
+    video_price_per_second: Decimal | None = None
+    input_price_per_million_tokens: Decimal | None
+    output_price_per_million_tokens: Decimal | None
+    cache_read_price_per_million_tokens: Decimal | None
+    cache_write_price_per_million_tokens: Decimal | None
     connections: list[ConnectionRead]
 
 
@@ -108,6 +117,7 @@ def _read(row: object) -> CanonicalRead:
         name=row.name,
         group=row.group,
         base_model=row.base_model,
+        video_price_per_second=getattr(row, 'video_price_per_second', None),
         input_price_per_million_tokens=row.input_price_per_million_tokens,
         output_price_per_million_tokens=row.output_price_per_million_tokens,
         cache_read_price_per_million_tokens=row.cache_read_price_per_million_tokens,
@@ -136,6 +146,7 @@ def _fields(body: CanonicalWrite, actor: str) -> dict[str, object]:
         "name": body.name,
         "group": body.group,
         "base_model": body.base_model,
+        "video_price_per_second": body.video_price_per_second,
         "input_price_per_million_tokens": body.input_price_per_million_tokens,
         "output_price_per_million_tokens": body.output_price_per_million_tokens,
         "cache_read_price_per_million_tokens": body.cache_read_price_per_million_tokens
@@ -146,7 +157,9 @@ def _fields(body: CanonicalWrite, actor: str) -> dict[str, object]:
     }
 
 
-def _mode(provider_model: str) -> Literal["chat", "responses"]:
+def _mode(provider_model: str) -> Literal["chat", "responses", "video_generation"]:
+    if provider_model.startswith('kling/'):
+        return 'video_generation'
     if provider_model.startswith("chatgpt/"):
         return "responses"
     direct: Final = litellm.model_cost.get(provider_model)
@@ -164,6 +177,9 @@ def _mode(provider_model: str) -> Literal["chat", "responses"]:
 
 
 def _model_info(body: CanonicalWrite, deployment_id: str, mode: str) -> dict[str, object]:
+    if body.video_price_per_second is not None:
+        return {'id': deployment_id, 'mode': mode, 'group': body.group, 'output_cost_per_second': float(body.video_price_per_second)}
+    assert body.input_price_per_million_tokens is not None and body.output_price_per_million_tokens is not None
     return {
         "id": deployment_id,
         "mode": mode,
@@ -218,6 +234,11 @@ async def _validate_credential(tx: object, connection: ConnectionWrite) -> None:
 
 
 def _deployment_params(body: CanonicalWrite, connection: ConnectionWrite) -> dict[str, object]:
+    if body.video_price_per_second is not None:
+        if not connection.provider_connection:
+            raise _error(400, 'invalid_connection', 'A video model needs a provider connection')
+        return {'model': connection.provider_model, 'litellm_credential_name': connection.provider_connection, 'output_cost_per_second': float(body.video_price_per_second)}
+    assert body.input_price_per_million_tokens is not None and body.output_price_per_million_tokens is not None
     million: Final = Decimal(1_000_000)
     read_cost: Final = float(
         (body.cache_read_price_per_million_tokens or body.input_price_per_million_tokens) / million
