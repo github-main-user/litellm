@@ -11060,6 +11060,7 @@ async def model_list(
 
         canonical_rows: Final = TypeAdapter(tuple[CatalogRecord, ...]).validate_python(
             await prisma_client.db.litellm_canonicalmodel.find_many(
+                where={"video_price_per_second": None},
                 include={"connections": {"include": {"deployment": True}}}, order={"name": "asc"}
             )
             if prisma_client is not None

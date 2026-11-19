@@ -81,10 +81,25 @@ def catalog_proxy(monkeypatch):
         ModelsDevCatalog(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={}))),
     )
     records = (_record("public"), _record("other"), _record("paused", (True,)), _record("unbound", ()))
+    video = SimpleNamespace(
+        name="Kling 4.0",
+        base_model="kling/kling-video-v4_0",
+        created_at=records[0].created_at,
+        video_price_per_second=Decimal(1),
+        input_price_per_million_tokens=None,
+        output_price_per_million_tokens=None,
+        cache_read_price_per_million_tokens=None,
+        cache_write_price_per_million_tokens=None,
+        connections=[SimpleNamespace(deployment=SimpleNamespace(blocked=False))],
+    )
 
     class CatalogTable:
         async def find_many(self, **kwargs):
-            return records
+            return tuple(
+                row for row in (*records, video)
+                if "video_price_per_second" not in kwargs.get("where", {})
+                or getattr(row, "video_price_per_second", None) == kwargs["where"]["video_price_per_second"]
+            )
 
     router = Router(
         model_list=[
