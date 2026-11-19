@@ -69,6 +69,7 @@ def _prepare_proxy_config(
 def _public_credential_parts(credential: CredentialItem) -> tuple[dict[str, object], dict[str, object]]:
     values: Final = dict(credential.credential_values or {})
     configured: Final = bool(values.pop(_CREDENTIAL_PROXY_KEY, None))
+    values.pop('litellm_internal_kling_oauth', None)
     info: Final = dict(credential.credential_info or {})
     info[_PROXY_CONFIGURED_KEY] = configured
     return values, info
@@ -359,6 +360,13 @@ async def delete_credential(
             )
             if credential_row is None:
                 raise HTTPException(status_code=404, detail="Credential not found. Got credential name: " + credential_name)
+            if (credential_row.credential_info or {}).get('provider') == 'kling':
+                pending: Final = await transaction.query_raw('''SELECT 1 FROM "LiteLLM_VideoGenerationJob"
+                    WHERE credential=$1 AND status NOT IN ('completed','failed') LIMIT 1''', credential_name)
+                if pending:
+                    raise HTTPException(409, detail={'code':'video_job_pending','message':'Video jobs still require this connection'})
+                await transaction.execute_raw('''UPDATE "LiteLLM_VideoGenerationJob" SET archived_credential=credential, credential=NULL
+                    WHERE credential=$1 AND status IN ('completed','failed')''',credential_name)
             connections: Final = await transaction.litellm_canonicalmodelconnection.find_many(
                 where={"provider_connection": credential_name}
             )
@@ -377,6 +385,10 @@ async def delete_credential(
         ## DELETE FROM LITELLM ##
         litellm.credential_list = [cred for cred in litellm.credential_list if cred.credential_name != credential_name]
         return {"success": True, "message": "Credential deleted successfully"}
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise
+        raise handle_exception_on_proxy(exc)
     except Exception as e:
         mapped = _credential_write_error(e)
         if mapped is not None:

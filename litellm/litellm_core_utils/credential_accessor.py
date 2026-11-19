@@ -19,7 +19,9 @@ class CredentialAccessor:
         """Safe accessor for credentials."""
 
         credential: Final = CredentialAccessor.find_credential(credential_name)
-        return {} if credential is None else credential.credential_values.copy()
+        if credential is None or credential.credential_info.get('provider') == 'kling':
+            return {}
+        return credential.credential_values.copy()
 
     @staticmethod
     def upsert_credentials(credentials: list[CredentialItem]):
