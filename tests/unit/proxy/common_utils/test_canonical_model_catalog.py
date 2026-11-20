@@ -105,7 +105,7 @@ def catalog_proxy(monkeypatch):
             return tuple(
                 row
                 for row in (*records, video)
-                if "video_price_per_second" not in kwargs.get("where", {})
+                if not kwargs.get("where")
                 or getattr(row, "video_price_per_second", None) == kwargs["where"]["video_price_per_second"]
             )
 

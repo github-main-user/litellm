@@ -11072,7 +11072,7 @@ async def model_list(
 
         canonical_rows: Final = TypeAdapter(tuple[CatalogRecord | VideoCatalogRecord, ...]).validate_python(
             await prisma_client.db.litellm_canonicalmodel.find_many(
-                where={"video_price_per_second": None} if wants_anthropic_format else {},
+                where={"video_price_per_second": None} if wants_anthropic_format else None,
                 include={"connections": {"include": {"deployment": True}}},
                 order={"name": "asc"},
             )
