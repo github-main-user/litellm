@@ -200,3 +200,10 @@ async def list_models(name: str, user: Admin) -> list[str]:
     client: Final = await video_client(name)
     capabilities: Final = await client.capabilities()
     return sorted({model.model for model in capabilities.text_to_video()})
+
+
+@router.get("/{name}/video-capabilities")
+async def video_capabilities(name: str, user: Admin) -> list[dict]:
+    client = await video_client(name)
+    capabilities = await client.capabilities()
+    return [entry.model_dump() for entry in capabilities.text_to_video()]

@@ -54,6 +54,8 @@ model LiteLLM_CredentialsTable {
 }
 
 model LiteLLM_VideoGenerationJob {
+  request_hash String?
+  prepaid Boolean @default(false)
   id String @id
   credential String?
   archived_credential String?
