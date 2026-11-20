@@ -18,16 +18,24 @@ class CatalogConnection(BaseModel):
     deployment: CatalogDeployment | None
 
 
-class CatalogRecord(BaseModel):
+class CatalogIdentity(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     name: str
     base_model: str
     created_at: datetime
+    connections: list[CatalogConnection]
+
+
+class CatalogRecord(CatalogIdentity):
+    video_price_per_second: None = None
     input_price_per_million_tokens: Decimal
     output_price_per_million_tokens: Decimal
     cache_read_price_per_million_tokens: Decimal
     cache_write_price_per_million_tokens: Decimal
-    connections: list[CatalogConnection]
+
+
+class VideoCatalogRecord(CatalogIdentity):
+    video_price_per_second: Decimal
 
 
 class CatalogPricing(BaseModel):
@@ -38,17 +46,22 @@ class CatalogPricing(BaseModel):
     cache_write: str
 
 
+class VideoCatalogPricing(BaseModel):
+    unit: Literal["USD_per_second"] = "USD_per_second"
+    per_second: str
+
+
 class CatalogEntry(CatalogMetadata):
     id: str
     base_model: str
     object: Literal["model"] = "model"
     created: int
     owned_by: str
-    pricing: CatalogPricing
+    pricing: CatalogPricing | VideoCatalogPricing
 
 
 def catalog_entries(
-    records: tuple[CatalogRecord, ...],
+    records: tuple[CatalogRecord | VideoCatalogRecord, ...],
     owner: str,
     available_names: Container[str] | None,
     hidden_names: Container[str],
@@ -71,7 +84,9 @@ def catalog_entries(
             created=int(row.created_at.timestamp()),
             owned_by=owner,
             **(metadata.metadata(row.base_model).model_dump(exclude_none=True) if metadata is not None else {}),
-            pricing=CatalogPricing(
+            pricing=VideoCatalogPricing(per_second=format(row.video_price_per_second, "f"))
+            if isinstance(row, VideoCatalogRecord)
+            else CatalogPricing(
                 input=format(row.input_price_per_million_tokens, "f"),
                 output=format(row.output_price_per_million_tokens, "f"),
                 cache_read=format(row.cache_read_price_per_million_tokens, "f"),
