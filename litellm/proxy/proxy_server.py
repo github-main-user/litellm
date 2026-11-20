@@ -1915,8 +1915,7 @@ class _ExceptionRow(TypedDict, total=False):
 async def otel_request_validation_exception_handler(request: Request, exc: RequestValidationError):
     if request.url.path == "/credentials" or request.url.path.startswith("/credentials/"):
         credential_errors: Final = [
-            {key: value for key, value in error.items() if key in {"type", "loc", "msg"}}
-            for error in exc.errors()
+            {key: value for key, value in error.items() if key in {"type", "loc", "msg"}} for error in exc.errors()
         ]
         _close_dangling_otel_server_span(
             request, 422, exc=HTTPException(status_code=422, detail="Invalid credential request")
@@ -10111,7 +10110,16 @@ class ProxyStartupEvent:
         worker_heartbeat: Final = ProxyWorkerHeartbeat(prisma_client=prisma_client)
         await worker_heartbeat.beat()
         from litellm.proxy.video_endpoints.kling_jobs import reconcile_jobs
-        scheduler.add_job(reconcile_jobs, 'interval', seconds=10, id='video_generation_reconcile', replace_existing=True, max_instances=1, coalesce=True)
+
+        scheduler.add_job(
+            reconcile_jobs,
+            "interval",
+            seconds=10,
+            id="video_generation_reconcile",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
         scheduler.add_job(
             worker_heartbeat.beat,
             "interval",
@@ -11055,13 +11063,18 @@ async def model_list(
         and http_request.url.path == "/v1/models"
         and (user_api_key_dict is None or not wants_anthropic_format)
     ):
-        from litellm.proxy.common_utils.canonical_model_catalog import CatalogRecord, catalog_entries
+        from litellm.proxy.common_utils.canonical_model_catalog import (
+            CatalogRecord,
+            VideoCatalogRecord,
+            catalog_entries,
+        )
         from litellm.proxy.common_utils.models_dev_catalog import models_dev_catalog
 
-        canonical_rows: Final = TypeAdapter(tuple[CatalogRecord, ...]).validate_python(
+        canonical_rows: Final = TypeAdapter(tuple[CatalogRecord | VideoCatalogRecord, ...]).validate_python(
             await prisma_client.db.litellm_canonicalmodel.find_many(
-                where={"video_price_per_second": None},
-                include={"connections": {"include": {"deployment": True}}}, order={"name": "asc"}
+                where={"video_price_per_second": None} if wants_anthropic_format else None,
+                include={"connections": {"include": {"deployment": True}}},
+                order={"name": "asc"},
             )
             if prisma_client is not None
             else ()
@@ -11082,10 +11095,9 @@ async def model_list(
                 else None
             )
             catalog_hidden: Final = (
-                (llm_router.get_fully_blocked_model_names() if llm_router is not None else set())
-                | await get_hidden_unhealthy_model_names(
-                    healthy_only=healthy_only, general_settings=settings, llm_router=llm_router
-                )
+                llm_router.get_fully_blocked_model_names() if llm_router is not None else set()
+            ) | await get_hidden_unhealthy_model_names(
+                healthy_only=healthy_only, general_settings=settings, llm_router=llm_router
             )
             catalog_data: Final = catalog_entries(
                 canonical_rows,
@@ -11097,7 +11109,9 @@ async def model_list(
             if wants_anthropic_format:
                 return create_anthropic_model_list_response(
                     tuple(
-                        ModelInfoResponse(id=entry.id, object=entry.object, created=entry.created, owned_by=entry.owned_by)
+                        ModelInfoResponse(
+                            id=entry.id, object=entry.object, created=entry.created, owned_by=entry.owned_by
+                        )
                         for entry in catalog_data
                     )
                 )
@@ -13349,15 +13363,11 @@ def _get_provider_token_counter(
 
     except Exception:
         # If provider detection fails, fall back to manual checks
-        if configured_provider == "anthropic" or (
-            configured_provider is None and full_model.startswith("anthropic/")
-        ):
+        if configured_provider == "anthropic" or (configured_provider is None and full_model.startswith("anthropic/")):
             from litellm.llms.anthropic.common_utils import AnthropicModelInfo
 
             anthropic_model_info: Final = AnthropicModelInfo()
-            resolved_model: Final = (
-                full_model.split("/", 1)[1] if full_model.startswith("anthropic/") else model_to_use
-            )
+            resolved_model: Final = full_model.split("/", 1)[1] if full_model.startswith("anthropic/") else model_to_use
             return anthropic_model_info.get_token_counter(), resolved_model, "anthropic"
 
     return None, None, None
@@ -13407,7 +13417,9 @@ async def _try_provider_token_count(
         )
         if litellm.disable_token_counter is True or named_anthropic_connection:
             raw_retry_after: Final = getattr(result, "retry_after", None)
-            result_retry_after: Final = sanitize_retry_after(raw_retry_after) if isinstance(raw_retry_after, str) else None
+            result_retry_after: Final = (
+                sanitize_retry_after(raw_retry_after) if isinstance(raw_retry_after, str) else None
+            )
             raise ProxyException(
                 message=result.error_message or "Token counting failed",
                 type="token_counting_error",

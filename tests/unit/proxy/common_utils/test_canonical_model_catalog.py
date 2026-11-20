@@ -46,6 +46,15 @@ def _expected(row: CatalogRecord) -> dict[str, object]:
     }
 
 
+def _expected_video(row: CatalogRecord) -> dict[str, object]:
+    return {
+        **_expected(row),
+        "id": "Kling 4.0",
+        "base_model": "kling/kling-video-v4_0",
+        "pricing": {"unit": "USD_per_second", "per_second": "1"},
+    }
+
+
 def test_catalog_filters_unbound_paused_wildcard_and_unauthorized_records() -> None:
     visible: Final = _record("public", (True, False))
     records: Final = (
@@ -66,9 +75,7 @@ def test_catalog_exposes_saved_identity_without_metadata_or_alias_matching() -> 
         _record("another-alias").model_copy(update={"base_model": "other-lab/canonical-b"}),
     )
     entries: Final = catalog_entries(records, "catalog-brand", None, ())
-    assert [(entry.id, entry.base_model) for entry in entries] == [
-        (row.name, row.base_model) for row in records
-    ]
+    assert [(entry.id, entry.base_model) for entry in entries] == [(row.name, row.base_model) for row in records]
 
 
 @pytest.fixture
@@ -96,15 +103,16 @@ def catalog_proxy(monkeypatch):
     class CatalogTable:
         async def find_many(self, **kwargs):
             return tuple(
-                row for row in (*records, video)
-                if "video_price_per_second" not in kwargs.get("where", {})
+                row
+                for row in (*records, video)
+                if not kwargs.get("where")
                 or getattr(row, "video_price_per_second", None) == kwargs["where"]["video_price_per_second"]
             )
 
     router = Router(
         model_list=[
             {"model_name": name, "litellm_params": {"model": "openai/example", "api_key": "unused"}}
-            for name in ("public", "other", "internal-deployment", "openai/*")
+            for name in ("public", "other", "Kling 4.0", "internal-deployment", "openai/*")
         ]
     )
     monkeypatch.setattr(ps, "llm_router", router)
@@ -130,7 +138,10 @@ def test_anonymous_catalog_never_exposes_generic_routes_or_metadata(catalog_prox
     before = router.get_model_names()
     response = TestClient(ps.app).get("/v1/models" + query)
     assert response.status_code == 200, response.text
-    assert response.json() == {"object": "list", "data": [_expected(records[0]), _expected(records[1])]}
+    assert response.json() == {
+        "object": "list",
+        "data": [_expected(records[0]), _expected(records[1]), _expected_video(records[0])],
+    }
     assert router.get_model_names() == before
 
 
@@ -168,7 +179,10 @@ def test_ordinary_browser_cookies_do_not_require_catalog_authentication(catalog_
     records, _ = catalog_proxy
     response = TestClient(ps.app).get("/v1/models", headers={"Cookie": "locale=en; analytics=anonymous"})
     assert response.status_code == 200, response.text
-    assert response.json() == {"object": "list", "data": [_expected(records[0]), _expected(records[1])]}
+    assert response.json() == {
+        "object": "list",
+        "data": [_expected(records[0]), _expected(records[1]), _expected_video(records[0])],
+    }
 
 
 def test_anthropic_anonymous_catalog_keeps_native_envelope(catalog_proxy) -> None:
@@ -187,7 +201,10 @@ def test_authenticated_http_catalog_and_models_route_remains_private(catalog_pro
     client = TestClient(ps.app)
     response = client.get("/v1/models", headers={"Authorization": "Bearer sk-catalog-master"})
     assert response.status_code == 200, response.text
-    assert response.json() == {"object": "list", "data": [_expected(records[0]), _expected(records[1])]}
+    assert response.json() == {
+        "object": "list",
+        "data": [_expected(records[0]), _expected(records[1]), _expected_video(records[0])],
+    }
     private_response = client.get("/models")
     assert private_response.status_code in (401, 403), private_response.text
 
@@ -312,12 +329,15 @@ async def test_metadata_cache_single_flight_and_flat_public_fields() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_response", [
-    httpx.Response(200, content=b"invalid json"),
-    httpx.Response(200, json={}),
-    httpx.Response(200, json={"lab": {"models": {}}}),
-    httpx.Response(200, json={"void-api": {"models": {"cycle": {"name": "ignored"}}}}),
-])
+@pytest.mark.parametrize(
+    "invalid_response",
+    [
+        httpx.Response(200, content=b"invalid json"),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"lab": {"models": {}}}),
+        httpx.Response(200, json={"void-api": {"models": {"cycle": {"name": "ignored"}}}}),
+    ],
+)
 async def test_metadata_cache_stale_failure_cooldown_and_recovery(invalid_response: httpx.Response) -> None:
     now = [0.0]
     responses = [
@@ -437,7 +457,7 @@ def test_public_endpoint_enriches_flat_fields_without_exposing_base(catalog_prox
     expected_metadata = {key: value for key, value in native.items() if key != "reasoning_options"}
     assert response.json() == {
         "object": "list",
-        "data": [{**_expected(row), **expected_metadata} for row in records[:2]],
+        "data": [{**_expected(row), **expected_metadata} for row in records[:2]] + [_expected_video(records[0])],
     }
 
 
