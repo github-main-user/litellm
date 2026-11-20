@@ -83,42 +83,72 @@ async def submit(data: dict, auth: UserAPIKeyAuth, router: Router) -> VideoObjec
     cost: Final = Decimal(binding["rate"]) * body.seconds
     if body.amount_usd is not None and body.amount_usd != cost:
         raise HTTPException(409, "Video price changed; confirm the new price")
-    job: Final = "video_kg_" + (hashlib.sha256(f"{key}:{body.request_id}".encode()).hexdigest()[:32] if body.request_id else secrets.token_hex(16))
-    fingerprint: Final = hashlib.sha256(json.dumps({"model": body.model, "prompt": body.prompt, "seconds": body.seconds}, sort_keys=True).encode()).hexdigest()
+    job: Final = "video_kg_" + (
+        hashlib.sha256(f"{key}:{body.request_id}".encode()).hexdigest()[:32]
+        if body.request_id
+        else secrets.token_hex(16)
+    )
+    fingerprint: Final = hashlib.sha256(
+        json.dumps({"model": body.model, "prompt": body.prompt, "seconds": body.seconds}, sort_keys=True).encode()
+    ).hexdigest()
     if not auth.user_id or auth.team_id:
         raise HTTPException(403, "Kling video requires an individual user key")
     async with db.tx(timeout=timedelta(seconds=15)) as tx:
-        budgets: Final = await tx.query_raw('SELECT max_budget,spend FROM "LiteLLM_UserTable" WHERE user_id=$1 FOR UPDATE', auth.user_id)
+        budgets: Final = await tx.query_raw(
+            'SELECT max_budget,spend FROM "LiteLLM_UserTable" WHERE user_id=$1 FOR UPDATE', auth.user_id
+        )
         await tx.query_raw('SELECT token FROM "LiteLLM_VerificationToken" WHERE token=$1 FOR UPDATE', key)
-        previous: Final = await tx.query_raw('SELECT status,model_name,requested_seconds,request_hash FROM "LiteLLM_VideoGenerationJob" WHERE id=$1 AND api_key=$2', job, key)
+        previous: Final = await tx.query_raw(
+            'SELECT status,model_name,requested_seconds,request_hash FROM "LiteLLM_VideoGenerationJob" WHERE id=$1 AND api_key=$2',
+            job,
+            key,
+        )
         if previous:
             if previous[0]["request_hash"] != fingerprint:
                 raise HTTPException(409, "Request ID belongs to another video request")
-            return VideoObject(id=job, object="video", status=previous[0]["status"], seconds=str(previous[0]["requested_seconds"]), model=previous[0]["model_name"])
+            return VideoObject(
+                id=job,
+                object="video",
+                status=previous[0]["status"],
+                seconds=str(previous[0]["requested_seconds"]),
+                model=previous[0]["model_name"],
+            )
         keys: Final = await tx.query_raw('SELECT max_budget,spend FROM "LiteLLM_VerificationToken" WHERE token=$1', key)
         if not budgets or not keys or budgets[0]["max_budget"] is None:
             raise HTTPException(503, "Video budget cannot be verified")
-        if Decimal(str(budgets[0]["spend"])) + cost > Decimal(str(budgets[0]["max_budget"])) or (keys[0]["max_budget"] is not None and Decimal(str(keys[0]["spend"])) + cost > Decimal(str(keys[0]["max_budget"]))):
+        if Decimal(str(budgets[0]["spend"])) + cost > Decimal(str(budgets[0]["max_budget"])) or (
+            keys[0]["max_budget"] is not None
+            and Decimal(str(keys[0]["spend"])) + cost > Decimal(str(keys[0]["max_budget"]))
+        ):
             raise HTTPException(402, "Insufficient balance for video generation")
         # Debit before submission, keep uncertain submissions charged until reconciliation.
-        await tx.execute_raw('UPDATE "LiteLLM_UserTable" SET spend=spend+$2 WHERE user_id=$1', auth.user_id, float(cost))
-        await tx.execute_raw('UPDATE "LiteLLM_VerificationToken" SET spend=spend+$2,total_spend=total_spend+$2 WHERE token=$1', key, float(cost))
         await tx.execute_raw(
-        """INSERT INTO "LiteLLM_VideoGenerationJob"(id,credential,api_key,user_id,team_id,model_name,model_id,provider_model,requested_seconds,usd_per_second)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::numeric)""",
-        job,
-        name,
-        key,
-        auth.user_id,
-        auth.team_id,
-        body.model,
-        dep_id,
-        model,
-        body.seconds,
-        binding["rate"],
+            'UPDATE "LiteLLM_UserTable" SET spend=spend+$2 WHERE user_id=$1', auth.user_id, float(cost)
         )
-        await tx.execute_raw('UPDATE "LiteLLM_VideoGenerationJob" SET request_hash=$2,prepaid=true WHERE id=$1', job, fingerprint)
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_VerificationToken" SET spend=spend+$2,total_spend=total_spend+$2 WHERE token=$1',
+            key,
+            float(cost),
+        )
+        await tx.execute_raw(
+            """INSERT INTO "LiteLLM_VideoGenerationJob"(id,credential,api_key,user_id,team_id,model_name,model_id,provider_model,requested_seconds,usd_per_second)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::text::numeric)""",
+            job,
+            name,
+            key,
+            auth.user_id,
+            auth.team_id,
+            body.model,
+            dep_id,
+            model,
+            body.seconds,
+            binding["rate"],
+        )
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_VideoGenerationJob" SET request_hash=$2,prepaid=true WHERE id=$1', job, fingerprint
+        )
     from litellm.proxy.proxy_server import increment_spend_counters
+
     await increment_spend_counters(token=key, user_id=auth.user_id, team_id=None, response_cost=float(cost))
     try:
         result: Final = await client.submit(model, {"prompt": body.prompt, "duration": str(body.seconds)})
@@ -230,12 +260,22 @@ async def _settle(job: str, url: str) -> None:
 
 async def _refund_failed(job: str) -> None:
     async with _client().db.tx(timeout=timedelta(seconds=10)) as tx:
-        rows = await tx.query_raw('UPDATE "LiteLLM_VideoGenerationJob" SET status=\'failed\' WHERE id=$1 AND status=\'in_progress\' RETURNING api_key,user_id,prepaid,(requested_seconds*usd_per_second)::text AS cost', job)
+        rows = await tx.query_raw(
+            "UPDATE \"LiteLLM_VideoGenerationJob\" SET status='failed' WHERE id=$1 AND status='in_progress' RETURNING api_key,user_id,prepaid,(requested_seconds*usd_per_second)::text AS cost",
+            job,
+        )
         if not rows or not rows[0]["prepaid"]:
             return
         row = rows[0]
         cost = float(Decimal(row["cost"]))
-        await tx.execute_raw('UPDATE "LiteLLM_VerificationToken" SET spend=GREATEST(0,spend-$2),total_spend=GREATEST(0,total_spend-$2) WHERE token=$1', row["api_key"], cost)
-        await tx.execute_raw('UPDATE "LiteLLM_UserTable" SET spend=GREATEST(0,spend-$2) WHERE user_id=$1', row["user_id"], cost)
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_VerificationToken" SET spend=GREATEST(0,spend-$2),total_spend=GREATEST(0,total_spend-$2) WHERE token=$1',
+            row["api_key"],
+            cost,
+        )
+        await tx.execute_raw(
+            'UPDATE "LiteLLM_UserTable" SET spend=GREATEST(0,spend-$2) WHERE user_id=$1', row["user_id"], cost
+        )
     from litellm.proxy.proxy_server import increment_spend_counters
+
     await increment_spend_counters(token=row["api_key"], user_id=row["user_id"], team_id=None, response_cost=-cost)
