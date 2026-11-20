@@ -84,20 +84,21 @@ async def test_virtual_key_video_access(monkeypatch):
             uid,
             json.dumps({KEY: bundle}),
         )
-        await db.db.execute_raw(
-            """INSERT INTO "LiteLLM_ProxyModelTable"(model_id,model_name,litellm_params,created_by,updated_by) VALUES($1,$2,'{}','test','test')""",
-            uid,
-            model,
-        )
-        await db.db.execute_raw(
-            """INSERT INTO "LiteLLM_CanonicalModel"(id,name,base_model,video_price_per_second,created_by,updated_by) VALUES($1,$2,'kling/demo',0.123,'test','test')""",
-            uid,
-            model,
-        )
-        await db.db.execute_raw(
-            """INSERT INTO "LiteLLM_CanonicalModelConnection"(id,canonical_model_id,provider_connection,provider_model,mode,deployment_id) VALUES($1,$1,$1,'kling/demo','video_generation',$1)""",
-            uid,
-        )
+        async with db.db.tx() as tx:
+            await tx.execute_raw(
+                """INSERT INTO "LiteLLM_ProxyModelTable"(model_id,model_name,litellm_params,created_by,updated_by) VALUES($1,$2,'{}','test','test')""",
+                uid,
+                model,
+            )
+            await tx.execute_raw(
+                """INSERT INTO "LiteLLM_CanonicalModel"(id,name,base_model,video_price_per_second,created_by,updated_by) VALUES($1,$2,'kling/demo',0.123,'test','test')""",
+                uid,
+                model,
+            )
+            await tx.execute_raw(
+                """INSERT INTO "LiteLLM_CanonicalModelConnection"(id,canonical_model_id,provider_connection,provider_model,mode,deployment_id) VALUES($1,$1,$1,'kling/demo','video_generation',$1)""",
+                uid,
+            )
         for token, allowed in zip(tokens, [model, "other-" + uid]):
             await db.db.execute_raw(
                 """INSERT INTO "LiteLLM_VerificationToken"(token,models) VALUES($1,ARRAY[$2]::text[])""", token, allowed
@@ -108,6 +109,10 @@ async def test_virtual_key_video_access(monkeypatch):
             mounts={"https://media.test": httpx.MockTransport(download)},
         ) as client:
             owner, denied = [{"Authorization": "Bearer " + k} for k in keys]
+            for headers, expected in ((owner, [model]), (denied, [])):
+                listed = await client.get("/v1/models", headers=headers)
+                assert listed.status_code == 200, listed.text
+                assert [row["id"] for row in listed.json()["data"]] == expected
             payload = {"model": model, "seconds": "5", "prompt": "a tree"}
             forbidden = await client.post("/v1/videos", headers=denied, json=payload)
             assert forbidden.status_code == 403, forbidden.text
